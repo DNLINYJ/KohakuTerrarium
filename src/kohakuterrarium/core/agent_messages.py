@@ -111,10 +111,15 @@ class AgentMessagesMixin:
             return
 
         async with self._get_message_mutation_lock():
-            await self._regenerate_tail_response(request_id=request_id)
+            rerun = await self._regenerate_tail_response(request_id=request_id)
+        if rerun:
+            try:
+                await self._rerun_from_last()
+            finally:
+                self._branch_request_id = None
 
-    async def _regenerate_tail_response(self, *, request_id: str | None) -> None:
-        """Regenerate the current tail while holding the mutation lock."""
+    async def _regenerate_tail_response(self, *, request_id: str | None) -> bool:
+        """Commit a sibling branch of the current tail, then return whether to rerun."""
         await self._wait_for_history_finalization()
         self._ensure_history_mutation_idle()
         self._ensure_rerun_available()
@@ -122,7 +127,7 @@ class AgentMessagesMixin:
         last_user = conv.find_last_user_index()
         if last_user < 0:
             logger.warning("No user message to regenerate from")
-            return
+            return False
         removed = conv.truncate_from(last_user + 1)
         # Open a new branch of the current turn.
         self._branch_id = self._max_branch_id_for_turn(self._turn_index) + 1
@@ -157,10 +162,7 @@ class AgentMessagesMixin:
             self.session_store, self.config.name, live_branch_path(self)
         )
         self._branch_request_id = request_id
-        try:
-            await self._rerun_from_last()
-        finally:
-            self._branch_request_id = None
+        return True
 
     async def edit_and_rerun(
         self,
@@ -173,9 +175,9 @@ class AgentMessagesMixin:
         request_id: str | None = None,
         target: UserMessageSelector | None = None,
     ) -> bool:
-        """Serialize conversation reconstruction and the resulting rerun turn."""
+        """Serialize conversation reconstruction; the rerun turn runs after the lock."""
         async with self._get_message_mutation_lock():
-            return await self._edit_and_rerun_locked(
+            prepared = await self._edit_and_rerun_locked(
                 message_idx,
                 new_content,
                 turn_index=turn_index,
@@ -184,6 +186,13 @@ class AgentMessagesMixin:
                 request_id=request_id,
                 target=target,
             )
+        if prepared:
+            try:
+                await self._rerun_from_last(new_user_content=new_content)
+            finally:
+                self._branch_request_id = None
+            return True
+        return False
 
     async def _edit_and_rerun_locked(
         self,
@@ -309,10 +318,6 @@ class AgentMessagesMixin:
             self.session_store, self.config.name, live_branch_path(self)
         )
         self._branch_request_id = request_id
-        try:
-            await self._rerun_from_last(new_user_content=new_content)
-        finally:
-            self._branch_request_id = None
         return True
 
     async def rewind_to(self, message_idx: int) -> None:

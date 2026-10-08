@@ -1,5 +1,7 @@
 """Pin the idle-branch continuation failure boundaries from review da90bd28."""
 
+import asyncio
+
 import pytest
 
 from kohakuterrarium import Terrarium
@@ -12,7 +14,7 @@ from kohakuterrarium.core.config_types import AgentConfig
 from kohakuterrarium.errors import AgentNotRunningError, ConflictError
 from kohakuterrarium.session.raw_history import append_user_event_pair
 from kohakuterrarium.session.resume import resume_agent
-from kohakuterrarium.testing.llm import ScriptedLLM
+from kohakuterrarium.testing.llm import ScriptEntry, ScriptedLLM
 
 
 def _user_meta(agent):
@@ -86,7 +88,9 @@ async def test_review_stopped_rejection_is_readonly(tmp_path):
         with pytest.raises(AgentNotRunningError):
             await agent.inject_input("continue-original", branch_view={1: 1})
         assert selected_branch_view(agent) == before_path
-        assert load_persisted_branch_view(agent.session_store, "alice") == before_persisted
+        assert (
+            load_persisted_branch_view(agent.session_store, "alice") == before_persisted
+        )
         assert [
             (m.role, m.content)
             for m in agent.controller.conversation.get_messages()
@@ -138,7 +142,9 @@ async def test_review_continuation_during_rerun_write_is_rejected(tmp_path):
         await engine.__aexit__(None, None, None)
 
 
-async def test_review_reload_read_failure_never_generates_wrong_branch(tmp_path, monkeypatch):
+async def test_review_reload_read_failure_never_generates_wrong_branch(
+    tmp_path, monkeypatch
+):
     engine, creature, agent, provider = await _started(
         tmp_path, ["A1", "A2", "must-not-run"]
     )
@@ -173,7 +179,9 @@ async def test_review_reload_read_failure_never_generates_wrong_branch(tmp_path,
         await engine.__aexit__(None, None, None)
 
 
-async def test_review_persist_failure_does_not_silently_lose_selection(tmp_path, monkeypatch):
+async def test_review_persist_failure_does_not_silently_lose_selection(
+    tmp_path, monkeypatch
+):
     engine, creature, agent, provider = await _started(
         tmp_path, ["A1", "A2", "orig-reply"]
     )
@@ -183,6 +191,7 @@ async def test_review_persist_failure_does_not_silently_lose_selection(tmp_path,
         await creature.run("U2", timeout=8)
         await _open_turn1_sibling(agent, content="U1")
         calls = provider.call_count
+
         def boom(*_args, **_kwargs):
             raise OSError("cannot persist branch view")
 
@@ -225,3 +234,34 @@ async def test_review_persist_failure_does_not_silently_lose_selection(tmp_path,
         assert "continue-original" not in contents
     finally:
         store.close()
+
+
+async def test_review_same_view_input_queues_during_rerun_generation(tmp_path):
+    engine, creature, agent, provider = await _started(
+        tmp_path,
+        [
+            "A1",
+            ScriptEntry(response="A1-rerun", delay_per_chunk=0.05, chunk_size=1),
+            "follow",
+        ],
+    )
+    try:
+        await creature.run("U1", timeout=8)
+        rerun = asyncio.create_task(agent.regenerate_last_response())
+        for _ in range(80):
+            if agent.is_processing and not agent._get_message_mutation_lock().locked():
+                break
+            await asyncio.sleep(0.02)
+        else:
+            await rerun
+            pytest.fail("rerun never reached generation without the mutation lock")
+        live = selected_branch_view(agent)
+        queued = await agent.inject_input("follow-up", branch_view=live)
+        assert queued is True
+        await rerun
+        users = [
+            m.get("content") for m in provider.call_log[-1] if m.get("role") == "user"
+        ]
+        assert users[-1] == "follow-up"
+    finally:
+        await engine.__aexit__(None, None, None)

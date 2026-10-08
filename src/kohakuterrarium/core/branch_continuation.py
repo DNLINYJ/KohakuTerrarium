@@ -63,7 +63,9 @@ def load_persisted_branch_view(store: Any, namespace: str) -> dict[int, int] | N
         return None
 
 
-def persist_branch_view(store: Any, namespace: str, view: dict[int, int] | None) -> None:
+def persist_branch_view(
+    store: Any, namespace: str, view: dict[int, int] | None
+) -> None:
     """Write the selected view into session state, or drop it when empty."""
     if store is None:
         return
@@ -118,7 +120,9 @@ def _require_history_switch_available(agent: Any) -> None:
     if callable(ensure_idle):
         ensure_idle()
     if _history_mutation_in_flight(agent):
-        raise ConflictError("Cannot continue a selected branch while history is mutating")
+        raise ConflictError(
+            "Cannot continue a selected branch while history is mutating"
+        )
     if getattr(agent, "_running", True) is False:
         raise AgentNotRunningError(
             f"Agent {getattr(getattr(agent, 'config', None), 'name', '')!r} is not running — "
