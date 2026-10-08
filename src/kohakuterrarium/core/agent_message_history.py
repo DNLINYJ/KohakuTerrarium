@@ -199,19 +199,13 @@ def reload_conversation_under_branch_view(
     branch_view: dict[int, int],
     *,
     replay: Callable[..., list[dict[str, Any]]] = replay_conversation,
+    events: list[dict[str, Any]] | None = None,
 ) -> None:
     """Replay a selected subtree and align conversation and branch state."""
     if agent.session_store is None:
         return
-    try:
+    if events is None:
         events = agent.session_store.get_events(agent.config.name)
-    except Exception as exc:
-        logger.warning(
-            "Failed to read events for branch_view reload",
-            error=str(exc),
-            exc_info=True,
-        )
-        return
 
     selected = resolve_branch_view_strict(events, branch_view)
     live_event_ids = select_live_event_ids(events, branch_view=branch_view)
@@ -224,38 +218,8 @@ def reload_conversation_under_branch_view(
     messages = replay(
         normalize_tool_call_events(replay_events),
         branch_view=branch_view,
+        include_metadata=True,
     )
-    metadata_by_event_id = {
-        event.get("event_id"): {
-            "event_id": event.get("event_id"),
-            "turn_index": event.get("turn_index"),
-            "branch_id": event.get("branch_id"),
-        }
-        for event in replay_events
-        if event.get("type") == "user_message"
-        and isinstance(event.get("event_id"), int)
-        and isinstance(event.get("turn_index"), int)
-        and selected.get(int(event["turn_index"])) == event.get("branch_id")
-    }
-    for message in messages:
-        if message.get("role") != "user":
-            continue
-        existing = message.get("metadata")
-        event_id = existing.get("event_id") if isinstance(existing, dict) else None
-        if event_id in metadata_by_event_id:
-            message["metadata"] = metadata_by_event_id[event_id]
-            continue
-        for metadata in metadata_by_event_id.values():
-            if message.get("content") == next(
-                (
-                    event.get("content")
-                    for event in replay_events
-                    if event.get("event_id") == metadata.get("event_id")
-                ),
-                None,
-            ):
-                message["metadata"] = metadata
-                break
 
     conversation = agent.controller.conversation
     existing_system = [

@@ -603,7 +603,7 @@ class TestReloadConversationUnderBranchView:
         monkeypatch.setattr(
             agent_messages_module,
             "replay_conversation",
-            lambda events, branch_view=None: [
+            lambda events, branch_view=None, **_kwargs: [
                 {"role": "user", "content": "u1"},
                 {
                     "role": "assistant",
@@ -621,13 +621,13 @@ class TestReloadConversationUnderBranchView:
         )
         assert assistant.extra_fields["reasoning_content"] == "private thought"
 
-    async def test_events_read_failure_no_op(self, agent, monkeypatch):
+    async def test_events_read_failure_raises(self, agent, monkeypatch):
         def boom(name):
             raise RuntimeError("disk read")
 
         monkeypatch.setattr(agent.session_store, "get_events", boom)
-        # Just must not raise.
-        agent._reload_conversation_under_branch_view({1: 1})
+        with pytest.raises(RuntimeError, match="disk read"):
+            agent._reload_conversation_under_branch_view({1: 1})
 
 
 class TestEdgeBranches:
@@ -1041,7 +1041,7 @@ class TestReloadConvBranchViewExtraMetadata:
         # Mock replay_conversation to return messages with extras.
         from kohakuterrarium.core import agent_messages as am
 
-        def fake_replay(events, branch_view=None):
+        def fake_replay(events, branch_view=None, **_kwargs):
             return [
                 {"role": "system", "content": "sys-from-replay"},  # 514-515
                 {"role": "user", "content": "hi"},

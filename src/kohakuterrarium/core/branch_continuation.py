@@ -8,7 +8,7 @@ new user input. Branch selection is persisted so resume restores it.
 from copy import deepcopy
 from typing import Any
 
-from kohakuterrarium.errors import ConflictError
+from kohakuterrarium.errors import AgentNotRunningError, ConflictError
 from kohakuterrarium.session.history import (
     InvalidBranchViewError,
     resolve_branch_view_strict,
@@ -69,13 +69,10 @@ def persist_branch_view(store: Any, namespace: str, view: dict[int, int] | None)
         return
     key = branch_view_state_key(namespace)
     encoded = encode_branch_view(view)
-    try:
-        if encoded is None:
-            store.state.pop(key, None)
-        else:
-            store.state[key] = encoded
-    except Exception:
-        return
+    if encoded is None:
+        store.state.pop(key, None)
+    else:
+        store.state[key] = encoded
 
 
 def live_branch_path(agent: Any) -> dict[int, int]:
@@ -108,18 +105,29 @@ def _events_for(agent: Any) -> list[dict[str, Any]]:
     store = getattr(agent, "session_store", None)
     if store is None:
         return []
-    namespace = agent.config.name
-    try:
-        return list(store.get_events(namespace))
-    except Exception:
-        return []
+    return list(store.get_events(agent.config.name))
+
+
+def _require_history_switch_available(agent: Any) -> None:
+    ensure_idle = getattr(agent, "_ensure_history_mutation_idle", None)
+    if callable(ensure_idle):
+        ensure_idle()
+    mutation_lock = getattr(agent, "_message_mutation_lock", None)
+    if mutation_lock is not None and mutation_lock.locked():
+        raise ConflictError("Cannot continue a selected branch while history is mutating")
+    if getattr(agent, "_running", True) is False:
+        raise AgentNotRunningError(
+            f"Agent {getattr(getattr(agent, 'config', None), 'name', '')!r} is not running — "
+            "start() it before injecting input"
+        )
+    if getattr(agent, "_paused", False):
+        raise ConflictError("Cannot continue a selected branch while paused")
+    if getattr(agent, "is_processing", False):
+        raise ConflictError("Cannot continue a selected branch while a turn is active")
 
 
 async def continue_on_branch(agent: Any, event: Any, view: dict[int, int]) -> bool:
     """Select a persisted subtree when needed, then enqueue the user event."""
-    if getattr(agent, "_paused", False):
-        raise ConflictError("Cannot continue a selected branch while paused")
-
     view = deepcopy(view)
     current = live_branch_path(agent)
     store = getattr(agent, "session_store", None)
@@ -128,23 +136,25 @@ async def continue_on_branch(agent: Any, event: Any, view: dict[int, int]) -> bo
         same = all(current.get(turn) == branch for turn, branch in view.items())
         resolved = dict(current)
         resolved.update(view)
-    else:
-        events = _events_for(agent)
-        try:
-            resolved = resolve_branch_view_strict(events, view)
-        except InvalidBranchViewError as exc:
-            raise ValueError(str(exc)) from exc
-        same = resolved == current
         if not same:
-            if getattr(agent, "is_processing", False):
-                raise ConflictError(
-                    "Cannot continue a selected branch while a turn is active"
-                )
-            reload = getattr(agent, "_reload_conversation_under_branch_view", None)
-            if reload is None:
-                raise ConflictError(
-                    "Cannot continue a selected branch without history reload"
-                )
-            reload(resolved)
+            _require_history_switch_available(agent)
+        persist_branch_view(store, namespace, resolved)
+        return await agent._process_event(event)
+    if getattr(agent, "_running", True) is False:
+        _require_history_switch_available(agent)
+    events = _events_for(agent)
+    try:
+        resolved = resolve_branch_view_strict(events, view)
+    except InvalidBranchViewError as exc:
+        raise ValueError(str(exc)) from exc
+    same = resolved == current
+    if not same:
+        _require_history_switch_available(agent)
+        reload = getattr(agent, "_reload_conversation_under_branch_view", None)
+        if reload is None:
+            raise ConflictError(
+                "Cannot continue a selected branch without history reload"
+            )
+        reload(resolved, events=events)
     persist_branch_view(store, namespace, resolved)
     return await agent._process_event(event)

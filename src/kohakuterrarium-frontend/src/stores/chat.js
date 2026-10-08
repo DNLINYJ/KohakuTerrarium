@@ -1964,6 +1964,8 @@ const _chatStoreOptions = {
      * @type {Object<string, Object<number, number>>}
      */
     branchViewByTab: {},
+    /** Tabs whose branchViewByTab was set by an explicit user chevron. */
+    _browsedBranchByTab: {},
     /** Per-tab branch operation state for regenerate/edit UX. */
     branchOperationByTab: {},
     /** Last branch operation error, keyed by tab. */
@@ -5061,7 +5063,8 @@ const _chatStoreOptions = {
       const normalized = _normalizeBranchView(view)
       if (!tab || !Object.keys(normalized).length) return
       if (this.branchOperationByTab[tab]) return
-      this.branchViewByTab[tab] = { ...(this.branchViewByTab[tab] || {}), ...normalized }
+      if (this._browsedBranchByTab[tab]) return
+      this.branchViewByTab[tab] = { ...normalized }
     },
 
     selectBranch(turnIndex, branchId, tabOverride = null) {
@@ -5069,6 +5072,7 @@ const _chatStoreOptions = {
       if (!tab || this.branchOperationByTab[tab]) return false
       if (!this.branchViewByTab[tab]) this.branchViewByTab[tab] = {}
       this.branchViewByTab[tab][turnIndex] = branchId
+      this._browsedBranchByTab[tab] = true
       this._rebuildMessages(tab)
       // If a stream is still in flight on this tab, an off-branch
       // switch may have missed chunks; the on-branch path back also

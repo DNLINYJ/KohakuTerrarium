@@ -494,6 +494,8 @@ class AgentMessagesMixin:
     def _reload_conversation_under_branch_view(
         self,
         branch_view: dict[int, int],
+        *,
+        events=None,
     ) -> None:
         """Replay ``branch_view`` and align the conversation and agent state.
 
@@ -504,6 +506,7 @@ class AgentMessagesMixin:
             self,
             branch_view,
             replay=replay_conversation,
+            events=events,
         )
 
     def _previous_branch_user_content(self):
