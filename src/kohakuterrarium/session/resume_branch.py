@@ -7,6 +7,7 @@ agent resumes onto, or must be rebuilt from the event log.
 
 from typing import Any
 
+from kohakuterrarium.core.branch_continuation import load_persisted_branch_view
 from kohakuterrarium.core.conversation_elide import TOOL_FEEDBACK_KIND
 from kohakuterrarium.session.history import (
     normalize_resumable_events,
@@ -223,6 +224,9 @@ def replayed_messages_for(
             return []
     if not events:
         return []
+    persisted = load_persisted_branch_view(store, agent_name)
     return replay_conversation(
-        normalize_resumable_events(events), include_metadata=True
+        normalize_resumable_events(events),
+        branch_view=persisted,
+        include_metadata=True,
     )

@@ -31,6 +31,10 @@ from kohakuterrarium.core.agent_tool_options import (
     agent_set_tool_options,
     agent_tool_inventory,
 )
+from kohakuterrarium.core.branch_continuation import (
+    encode_branch_view,
+    selected_branch_view,
+)
 from kohakuterrarium.core.scratchpad import is_reserved_scratchpad_key
 from kohakuterrarium.modules.user_command.base import UserCommandContext
 from kohakuterrarium.session.history import project_branch_metadata
@@ -671,6 +675,7 @@ def chat_history_for(engine: Terrarium, creature_id: str) -> dict[str, Any]:
         "messages": list(getattr(agent, "conversation_history", []) or []),
         "events": events,
         "is_processing": bool(agent.is_processing),
+        "branch_view": encode_branch_view(selected_branch_view(agent)),
     }
 
 

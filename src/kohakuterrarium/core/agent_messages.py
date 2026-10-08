@@ -19,6 +19,10 @@ from kohakuterrarium.core.agent_raw_history import (
     raw_target_content,
     reload_raw_prefix_for_target,
 )
+from kohakuterrarium.core.branch_continuation import (
+    live_branch_path,
+    persist_branch_view,
+)
 from kohakuterrarium.core.events import EventType, TriggerEvent
 from kohakuterrarium.errors import ConflictError
 from kohakuterrarium.llm.message import normalize_content_parts
@@ -148,6 +152,9 @@ class AgentMessagesMixin:
                 self._branch_id,
                 ppath,
             )
+        persist_branch_view(
+            self.session_store, self.config.name, live_branch_path(self)
+        )
         self._branch_request_id = request_id
         try:
             await self._rerun_from_last()
@@ -297,6 +304,9 @@ class AgentMessagesMixin:
                 self._branch_id,
                 ppath,
             )
+        persist_branch_view(
+            self.session_store, self.config.name, live_branch_path(self)
+        )
         self._branch_request_id = request_id
         try:
             await self._rerun_from_last(new_user_content=new_content)

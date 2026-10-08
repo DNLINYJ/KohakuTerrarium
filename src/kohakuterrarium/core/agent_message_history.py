@@ -225,24 +225,31 @@ def reload_conversation_under_branch_view(
         normalize_tool_call_events(replay_events),
         branch_view=branch_view,
     )
-    metadata_by_turn = {
-        int(event["turn_index"]): {
+    metadata_by_event_id = {
+        event.get("event_id"): {
             "event_id": event.get("event_id"),
             "turn_index": event.get("turn_index"),
             "branch_id": event.get("branch_id"),
         }
-        for event in events
+        for event in replay_events
         if event.get("type") == "user_message"
+        and isinstance(event.get("event_id"), int)
         and isinstance(event.get("turn_index"), int)
+        and selected.get(int(event["turn_index"])) == event.get("branch_id")
     }
     for message in messages:
         if message.get("role") != "user":
             continue
-        for metadata in metadata_by_turn.values():
+        existing = message.get("metadata")
+        event_id = existing.get("event_id") if isinstance(existing, dict) else None
+        if event_id in metadata_by_event_id:
+            message["metadata"] = metadata_by_event_id[event_id]
+            continue
+        for metadata in metadata_by_event_id.values():
             if message.get("content") == next(
                 (
                     event.get("content")
-                    for event in events
+                    for event in replay_events
                     if event.get("event_id") == metadata.get("event_id")
                 ),
                 None,

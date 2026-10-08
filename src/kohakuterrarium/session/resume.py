@@ -8,6 +8,7 @@ from kohakuterrarium.builtins.inputs import create_builtin_input
 from kohakuterrarium.builtins.outputs import create_builtin_output
 from kohakuterrarium.core.agent import Agent
 from kohakuterrarium.core.agent_selection import restore_selections
+from kohakuterrarium.core.branch_continuation import load_persisted_branch_view
 from kohakuterrarium.core.config_serde import unpack_agent_config
 from kohakuterrarium.core.conversation_elide import (
     elide_stale_tool_results,
@@ -219,7 +220,8 @@ def _restore_turn_branch_state(
     # Use replay's path-aware selector so restored branch ancestry actually existed.
     events_list = list(events)
     parent_paths = index_parent_paths(events_list)
-    selected = resolve_selected_branches(events_list, parent_paths, None)
+    persisted = load_persisted_branch_view(store, agent_name)
+    selected = resolve_selected_branches(events_list, parent_paths, persisted)
     if not selected:
         return
     max_turn = max(selected.keys())

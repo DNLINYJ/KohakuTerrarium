@@ -8,6 +8,9 @@ from typing import TYPE_CHECKING, Any
 
 from kohakuterrarium.bootstrap.agent_init import AgentInitMixin
 from kohakuterrarium.bootstrap.plugins import init_plugins
+from kohakuterrarium.core.agent_budget_recovery import (
+    sync_emergency_drop_conversation,
+)
 from kohakuterrarium.core.agent_compact import (
     AgentCompactMixin,
     restore_compact_state_from_session,
@@ -15,28 +18,28 @@ from kohakuterrarium.core.agent_compact import (
 from kohakuterrarium.core.agent_construct import AgentConstructMixin
 from kohakuterrarium.core.agent_event_loop import AgentEventLoopMixin
 from kohakuterrarium.core.agent_extensions import AgentExtensionsMixin
-from kohakuterrarium.core.agent_turn import AgentTurnMixin
 from kohakuterrarium.core.agent_handlers import AgentHandlersMixin
-from kohakuterrarium.core.agent_lifecycle import AgentLifecycleMixin
-from kohakuterrarium.core.agent_messages import AgentMessagesMixin
-from kohakuterrarium.core.agent_mcp import init_mcp, inject_mcp_tools_into_prompt
-from kohakuterrarium.core.agent_model import AgentModelMixin
 from kohakuterrarium.core.agent_helpers import attach_session_helpers
+from kohakuterrarium.core.agent_lifecycle import AgentLifecycleMixin
+from kohakuterrarium.core.agent_mcp import init_mcp, inject_mcp_tools_into_prompt
+from kohakuterrarium.core.agent_messages import AgentMessagesMixin
+from kohakuterrarium.core.agent_model import AgentModelMixin
 from kohakuterrarium.core.agent_observability import (
     build_session_info as _build_session_info,
     init_branch_state,
     wire_plugin_hook_timing,
     wire_scratchpad_observer,
 )
-from kohakuterrarium.core.agent_budget_recovery import (
-    sync_emergency_drop_conversation,
+from kohakuterrarium.core.agent_turn import AgentTurnMixin
+from kohakuterrarium.core.branch_continuation import (
+    continue_on_branch,
+    normalize_branch_view,
 )
 from kohakuterrarium.core.compact import CompactConfig, CompactManager
 from kohakuterrarium.core.config import AgentConfig, load_agent_config
-from kohakuterrarium.core.event_inbox import EventInbox, TurnOutcome
 from kohakuterrarium.core.controller_plugins import register_plugin_and_package_commands
+from kohakuterrarium.core.event_inbox import EventInbox, TurnOutcome
 from kohakuterrarium.core.events import TriggerEvent, create_user_input_event
-from kohakuterrarium.modules.output.event import OutputEvent
 from kohakuterrarium.core.job import JobState
 from kohakuterrarium.core.loader import ModuleLoader
 from kohakuterrarium.core.session import Session
@@ -44,6 +47,7 @@ from kohakuterrarium.core.trigger_manager import TriggerManager
 from kohakuterrarium.llm.message import ContentPart
 from kohakuterrarium.modules.input.base import InputModule
 from kohakuterrarium.modules.output.base import OutputModule
+from kohakuterrarium.modules.output.event import OutputEvent
 from kohakuterrarium.modules.plugin.base import PluginContext
 from kohakuterrarium.packages.walk import package_snapshot
 from kohakuterrarium.plugins_context import spawn_child_agent
@@ -810,8 +814,10 @@ class Agent(
         content: str | list[ContentPart],
         source: str = "programmatic",
         pending_id: str | None = None,
+        *,
+        branch_view: dict[int, int] | None = None,
     ) -> bool:
-        """Inject user input programmatically.
+        """Inject user input, optionally continuing a selected persisted branch.
 
         Returns True when the event ran; False when buffered for
         mid-turn drain — callers (WS attach) skip the post-call
@@ -821,7 +827,10 @@ class Agent(
         (UXI-08a) so it can target the message with ``edit_pending`` /
         ``cancel_pending`` the moment the queued ack lands. Ignored when
         the input runs immediately (it was never queued).
+        ``branch_view`` reseats the in-memory conversation onto that
+        persisted subtree before the new turn runs.
         """
+        view = normalize_branch_view(branch_view)
         content = await self._prepare_injected_input(content, source)
         if content is None:
             # Slash-command or filter consumed the input — treat the
@@ -830,6 +839,8 @@ class Agent(
         event = create_user_input_event(content, source=source)
         if pending_id:
             event.context["pending_id"] = pending_id
+        if view:
+            return await continue_on_branch(self, event, view)
         return await self._process_event(event)
 
     async def inject_event(self, event: TriggerEvent) -> bool:

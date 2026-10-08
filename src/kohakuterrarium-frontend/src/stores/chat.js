@@ -571,6 +571,19 @@ function _resolveSelectedBranches(events, parentPaths, branchView) {
   return selected
 }
 
+export function _normalizeBranchView(view) {
+  if (!view || typeof view !== "object" || Array.isArray(view)) return {}
+  const out = {}
+  for (const [rawTurn, rawBranch] of Object.entries(view)) {
+    const turn = Number(rawTurn)
+    const branch = Number(rawBranch)
+    if (Number.isInteger(turn) && turn > 0 && Number.isInteger(branch) && branch > 0) {
+      out[turn] = branch
+    }
+  }
+  return out
+}
+
 export function _collectBranchMetadata(events, branchView = null) {
   const parentPaths = _indexParentPaths(events)
   const branchSelection = _resolveSelectedBranches(events, parentPaths, branchView)
@@ -2741,9 +2754,10 @@ const _chatStoreOptions = {
         }
       } else {
         const target = tab
-        this._ws.send(
-          JSON.stringify({ type: "input", target, content: contentParts, event_id: eventId }),
-        )
+        const payload = { type: "input", target, content: contentParts, event_id: eventId }
+        const branchView = this.branchViewByTab[tab]
+        if (branchView && Object.keys(branchView).length) payload.branch_view = { ...branchView }
+        this._ws.send(JSON.stringify(payload))
         // Flip processing optimistically — the backend's
         // processing_start event will confirm it; this ensures the
         // indicator and interrupt button appear immediately on the
@@ -3430,6 +3444,7 @@ const _chatStoreOptions = {
         if (data.max_context != null) info.maxContext = data.max_context
         if (data.compact_threshold != null) info.compactThreshold = data.compact_threshold
         const tab = source || data.agent_name || ""
+        if (tab && data.branch_view) this._adoptAuthoritativeBranchView(tab, data.branch_view)
         if (tab && Object.keys(info).length) {
           this.modelByTab[tab] = { ...(this.modelByTab[tab] || {}), ...info }
           if (tab === this._rootSourceName && this.tabs.includes("root")) {
@@ -4939,6 +4954,7 @@ const _chatStoreOptions = {
         // wiping ``branchViewByTab`` here was the historical source of
         // "I switched to branch 1 of turn 2, did an unrelated action,
         // and was yanked back to the latest branch."
+        this._adoptAuthoritativeBranchView(tab, data.branch_view)
         if (!this.branchViewByTab[tab]) this.branchViewByTab[tab] = {}
         const prepared = _prepareReplayEvents(data.events, this.branchViewByTab[tab])
         this._setEvents(tab, prepared.events)
@@ -5041,6 +5057,13 @@ const _chatStoreOptions = {
      * by the branch-isolation gate while they were elsewhere get
      * pulled in from the persisted event log.
      */
+    _adoptAuthoritativeBranchView(tab, view) {
+      const normalized = _normalizeBranchView(view)
+      if (!tab || !Object.keys(normalized).length) return
+      if (this.branchOperationByTab[tab]) return
+      this.branchViewByTab[tab] = { ...(this.branchViewByTab[tab] || {}), ...normalized }
+    },
+
     selectBranch(turnIndex, branchId, tabOverride = null) {
       const tab = tabOverride || this.activeTab
       if (!tab || this.branchOperationByTab[tab]) return false
@@ -6264,6 +6287,7 @@ const _chatStoreOptions = {
         return
       }
       const events = this._projectHistoryPageRecords(records || [], stream)
+      this._adoptAuthoritativeBranchView(tab, payload.branch_view)
       const prepared = _prepareReplayEvents(events, this.branchViewByTab[tab] || null)
       this._setEvents(tab, prepared.events)
       if (

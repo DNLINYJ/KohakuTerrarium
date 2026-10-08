@@ -94,6 +94,7 @@ async def _process_input(
     queue: asyncio.Queue,
     source_name: str,
     pending_id: str,
+    branch_view: dict | None = None,
 ) -> None:
     """Inject input without blocking the websocket receive loop.
 
@@ -107,8 +108,9 @@ async def _process_input(
     acknowledgement exposes ``pending_id`` for later edit or cancellation.
     """
     try:
+        options = {"branch_view": branch_view} if branch_view is not None else {}
         processed = await agent.inject_input(
-            content, source="web", pending_id=pending_id
+            content, source="web", pending_id=pending_id, **options
         )
     except asyncio.CancelledError:
         raise
