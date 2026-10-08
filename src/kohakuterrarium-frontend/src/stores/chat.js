@@ -5683,7 +5683,6 @@ const _chatStoreOptions = {
       this._pendingCommandResultContextsByTab = {}
       this._commandResultDispatchSeq = 0
       this.branchViewByTab = {}
-      this._browsedBranchByTab = {}
       this.branchOperationByTab = {}
       this.branchOperationErrorByTab = {}
       this._recentUserInputs = {}

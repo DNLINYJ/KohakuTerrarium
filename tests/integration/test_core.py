@@ -36,6 +36,10 @@ from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
 from kohakuterrarium.builtins.tools.canvas_image import CanvasImageTool
 from kohakuterrarium.builtins.tools.stop_task import StopTaskTool
 from kohakuterrarium.core.agent import Agent
+from kohakuterrarium.core.branch_continuation import (
+    load_persisted_branch_view,
+    selected_branch_view,
+)
 from kohakuterrarium.core.config_types import (
     AgentConfig,
     InputConfig,
@@ -1516,6 +1520,7 @@ class TestCoreIntegration:
                 # A second turn, then a turn-targeted regenerate of it.
                 ScriptEntry("second turn reply", match="second question"),
                 ScriptEntry("turn2 regen reply", match="second question"),
+                ScriptEntry("continued original", match="continue original"),
             ]
         )
         agent = creature.agent
@@ -1743,6 +1748,25 @@ class TestCoreIntegration:
             assert replay_call_id in {
                 call["id"] for call in replay_announcement.tool_calls
             }
+
+            # --- continue the original branch, persist, and resume -----
+            await agent.inject_input("continue original", branch_view={1: 1})
+            continued = [
+                (message.get("role"), message.get("content"))
+                for message in agent.llm.call_log[-1]
+                if message.get("role") != "system"
+            ]
+            assert continued[0] == ("user", "first question")
+            assert ("assistant", "original reply") in continued
+            assert continued[-1] == ("user", "continue original")
+            assert ("assistant", "regenerated reply") not in continued
+            assert ("assistant", "edited reply") not in continued
+            assert ("user", "second question") not in continued
+            assert "continued original" in _assistant_text(agent)
+            persisted = load_persisted_branch_view(store, agent.config.name)
+            assert persisted[1] == 1
+            assert selected_branch_view(agent)[1] == 1
+            assert agent._max_branch_id_for_turn(1) >= 2
 
         for mode in ("native", "bracket"):
             folder = tmp_path / mode

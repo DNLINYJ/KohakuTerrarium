@@ -629,6 +629,45 @@ class TestReloadConversationUnderBranchView:
         with pytest.raises(RuntimeError, match="disk read"):
             agent._reload_conversation_under_branch_view({1: 1})
 
+    async def test_duplicate_text_user_identity_and_assistant_survive_reload(
+        self, agent
+    ):
+        agent._apply_user_input("same")
+        agent._emit_assistant("a1")
+        agent._apply_user_input("same")
+        agent._emit_assistant("a2")
+        for event_type, payload in (
+            ("user_input", {"content": "same"}),
+            ("user_message", {"content": "same"}),
+            ("text_chunk", {"content": "sibling", "chunk_seq": 0}),
+            ("processing_end", {}),
+        ):
+            agent.session_store.append_event(
+                "alice", event_type, payload, turn_index=1, branch_id=2
+            )
+        agent._reload_conversation_under_branch_view({1: 1, 2: 1})
+        users = [
+            message
+            for message in agent.controller.conversation.get_messages()
+            if message.role == "user"
+        ]
+        assistants = [
+            message.content
+            for message in agent.controller.conversation.get_messages()
+            if message.role == "assistant"
+        ]
+        assert [message.content for message in users] == ["same", "same"]
+        assert users[0].metadata["event_id"] != users[1].metadata["event_id"]
+        assert (users[0].metadata["turn_index"], users[0].metadata["branch_id"]) == (
+            1,
+            1,
+        )
+        assert (users[1].metadata["turn_index"], users[1].metadata["branch_id"]) == (
+            2,
+            1,
+        )
+        assert assistants == ["a1", "a2"]
+
 
 class TestEdgeBranches:
     async def test_regenerate_turn_with_missing_position_logs(self, agent):

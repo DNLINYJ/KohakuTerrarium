@@ -7,7 +7,6 @@ import asyncio
 
 from kohakuterrarium.core.agent_lifecycle import wait_for_turn_completion
 from kohakuterrarium.core.agent_message_history import (
-    apply_prepared_branch_view as _apply_prepared_branch_view_state,
     live_user_turns as _live_user_turns,
     max_branch_id_for_turn as _max_branch_id_for_turn,
     previous_branch_user_content as _previous_branch_user_content,
@@ -512,9 +511,6 @@ class AgentMessagesMixin:
             events=events,
             apply=apply,
         )
-
-    def _apply_prepared_branch_view(self, prepared) -> None:
-        _apply_prepared_branch_view_state(self, prepared)
 
     def _previous_branch_user_content(self):
         """Return the ``user_message`` content recorded for the most

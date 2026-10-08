@@ -378,4 +378,37 @@ describe("chat store — branch error classification (mayHaveRun)", () => {
     expect(chat.processingByTab.main).toBe(false)
     chat._clearBranchResyncTimers()
   })
+
+  it("does not override an explicit browsed branch when session info refreshes", () => {
+    const chat = useChatStore()
+    seedInstance(chat, "alice")
+    expect(chat.selectBranch(1, 1, "alice")).toBe(true)
+    expect(chat._browsedBranchByTab.alice).toBe(true)
+    chat._handleActivity("alice", {
+      activity_type: "session_info",
+      branch_view: { 1: 2 },
+    })
+    expect(chat.branchViewByTab.alice).toEqual({ 1: 1 })
+    chat._clearBranchResyncTimers()
+  })
+
+  it("does not retain incompatible old descendants while initializing an authoritative path", () => {
+    const chat = useChatStore()
+    seedInstance(chat, "alice")
+    chat.branchViewByTab = { alice: { 1: 1, 2: 1 } }
+    chat._adoptAuthoritativeBranchView("alice", { 1: 2 })
+    expect(chat.branchViewByTab.alice).toEqual({ 1: 2 })
+  })
+
+  it("clears browsed markers when unbinding so a later same-name tab can restore", () => {
+    const chat = useChatStore()
+    seedInstance(chat, "alice")
+    expect(chat.selectBranch(1, 1, "alice")).toBe(true)
+    chat.unbindFromInstance()
+    expect(chat._browsedBranchByTab).toEqual({})
+    chat.activeTab = "alice"
+    chat.tabs = ["alice"]
+    chat._adoptAuthoritativeBranchView("alice", { 1: 2 })
+    expect(chat.branchViewByTab.alice).toEqual({ 1: 2 })
+  })
 })

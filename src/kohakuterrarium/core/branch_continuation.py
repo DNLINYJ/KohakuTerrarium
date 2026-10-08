@@ -5,9 +5,9 @@ log when the requested view differs from the live path, then enqueues the
 new user input. Branch selection is persisted so resume restores it.
 """
 
-from copy import deepcopy
 from typing import Any
 
+from kohakuterrarium.core.agent_message_history import apply_prepared_branch_view
 from kohakuterrarium.errors import AgentNotRunningError, ConflictError
 from kohakuterrarium.session.history import (
     InvalidBranchViewError,
@@ -103,26 +103,17 @@ def selected_branch_view(agent: Any) -> dict[int, int]:
     return live_branch_path(agent)
 
 
-def _events_for(agent: Any) -> list[dict[str, Any]]:
-    store = getattr(agent, "session_store", None)
-    if store is None:
-        return []
-    return list(store.get_events(agent.config.name))
-
-
 def _history_mutation_in_flight(agent: Any) -> bool:
     mutation_lock = getattr(agent, "_message_mutation_lock", None)
     return mutation_lock is not None and mutation_lock.locked()
 
 
 def _require_history_switch_available(agent: Any) -> None:
-    ensure_idle = getattr(agent, "_ensure_history_mutation_idle", None)
-    if callable(ensure_idle):
-        ensure_idle()
     if _history_mutation_in_flight(agent):
         raise ConflictError(
             "Cannot continue a selected branch while history is mutating"
         )
+    agent._ensure_history_mutation_idle()
     if getattr(agent, "_running", True) is False:
         raise AgentNotRunningError(
             f"Agent {getattr(getattr(agent, 'config', None), 'name', '')!r} is not running — "
@@ -130,48 +121,37 @@ def _require_history_switch_available(agent: Any) -> None:
         )
     if getattr(agent, "_paused", False):
         raise ConflictError("Cannot continue a selected branch while paused")
-    if getattr(agent, "is_processing", False):
-        raise ConflictError("Cannot continue a selected branch while a turn is active")
 
 
 async def continue_on_branch(agent: Any, event: Any, view: dict[int, int]) -> bool:
     """Select a persisted subtree when needed, then enqueue the user event."""
-    view = deepcopy(view)
     current = live_branch_path(agent)
     store = getattr(agent, "session_store", None)
     namespace = getattr(getattr(agent, "config", None), "name", "") or ""
     if store is None:
         same = all(current.get(turn) == branch for turn, branch in view.items())
-        resolved = dict(current)
-        resolved.update(view)
-        if not same or _history_mutation_in_flight(agent):
+        if not same:
+            raise ConflictError(
+                "Cannot continue a selected branch without a session store"
+            )
+        if _history_mutation_in_flight(agent):
             _require_history_switch_available(agent)
-        persist_branch_view(store, namespace, resolved)
         return await agent._process_event(event)
-    if getattr(agent, "_running", True) is False:
+    if getattr(agent, "_running", True) is False or _history_mutation_in_flight(agent):
         _require_history_switch_available(agent)
-    events = _events_for(agent)
+    events = list(store.get_events(agent.config.name))
     try:
         resolved = resolve_branch_view_strict(events, view)
     except InvalidBranchViewError as exc:
         raise ValueError(str(exc)) from exc
     same = resolved == current
-    if _history_mutation_in_flight(agent):
-        _require_history_switch_available(agent)
     if not same:
         _require_history_switch_available(agent)
-        reload = getattr(agent, "_reload_conversation_under_branch_view", None)
-        if reload is None:
-            raise ConflictError(
-                "Cannot continue a selected branch without history reload"
-            )
-        prepared = reload(resolved, events=events, apply=False)
+        prepared = agent._reload_conversation_under_branch_view(
+            resolved, events=events, apply=False
+        )
         persist_branch_view(store, namespace, resolved)
-        apply_prepared = getattr(agent, "_apply_prepared_branch_view", None)
-        if apply_prepared is None:
-            reload(resolved, events=events)
-        else:
-            apply_prepared(prepared)
+        apply_prepared_branch_view(agent, prepared)
         return await agent._process_event(event)
     persist_branch_view(store, namespace, resolved)
     return await agent._process_event(event)
