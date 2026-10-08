@@ -29,4 +29,18 @@ describe("idle branch view cache", () => {
     chat._adoptAuthoritativeBranchView("alice", { 1: 2 })
     expect(chat.branchViewByTab.alice).toEqual({ 1: 2 })
   })
+
+  it("clears browsed markers when unbinding so a later same-name tab can restore", () => {
+    const chat = useChatStore()
+    chat.activeTab = "alice"
+    chat.tabs = ["alice"]
+    chat.branchViewByTab = { alice: { 1: 1 } }
+    chat._browsedBranchByTab = { alice: true }
+    chat.unbindFromInstance()
+    expect(chat._browsedBranchByTab).toEqual({})
+    chat.activeTab = "alice"
+    chat.tabs = ["alice"]
+    chat._adoptAuthoritativeBranchView("alice", { 1: 2 })
+    expect(chat.branchViewByTab.alice).toEqual({ 1: 2 })
+  })
 })

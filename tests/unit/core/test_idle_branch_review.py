@@ -124,11 +124,14 @@ async def test_review_continuation_during_rerun_write_is_rejected(tmp_path):
         lock = agent._get_message_mutation_lock()
         await lock.acquire()
         calls = provider.call_count
+        live = selected_branch_view(agent)
         try:
             with pytest.raises(ConflictError):
                 await agent.inject_input("continue-original", branch_view={1: 1})
+            with pytest.raises(ConflictError):
+                await agent.inject_input("same-view", branch_view=live)
             assert provider.call_count == calls
-            assert selected_branch_view(agent)[1] == 2
+            assert selected_branch_view(agent) == live
         finally:
             lock.release()
     finally:
@@ -186,9 +189,27 @@ async def test_review_persist_failure_does_not_silently_lose_selection(tmp_path,
         monkeypatch.setattr(
             "kohakuterrarium.core.branch_continuation.persist_branch_view", boom
         )
+        before_live = selected_branch_view(agent)
+        before_turn = agent._turn_index
+        before_branch = agent._branch_id
+        before_path = list(agent._parent_branch_path)
+        before_conv = [
+            (m.role, m.content)
+            for m in agent.controller.conversation.get_messages()
+            if m.role != "system"
+        ]
         with pytest.raises(OSError):
             await agent.inject_input("continue-original", branch_view={1: 1})
         assert provider.call_count == calls
+        assert selected_branch_view(agent) == before_live
+        assert agent._turn_index == before_turn
+        assert agent._branch_id == before_branch
+        assert list(agent._parent_branch_path) == before_path
+        assert [
+            (m.role, m.content)
+            for m in agent.controller.conversation.get_messages()
+            if m.role != "system"
+        ] == before_conv
         session_path = agent.session_store.path
     finally:
         await engine.__aexit__(None, None, None)

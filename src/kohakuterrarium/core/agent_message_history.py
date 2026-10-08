@@ -200,10 +200,13 @@ def reload_conversation_under_branch_view(
     *,
     replay: Callable[..., list[dict[str, Any]]] = replay_conversation,
     events: list[dict[str, Any]] | None = None,
-) -> None:
-    """Replay a selected subtree and align conversation and branch state."""
+    apply: bool = True,
+):
+    """Replay a selected subtree and optionally install it on the agent."""
     if agent.session_store is None:
-        return
+        if apply:
+            return None
+        raise RuntimeError("Cannot prepare a selected branch without a session store")
     if events is None:
         events = agent.session_store.get_events(agent.config.name)
 
@@ -220,7 +223,17 @@ def reload_conversation_under_branch_view(
         branch_view=branch_view,
         include_metadata=True,
     )
+    prepared = {"messages": messages, "selected": selected}
+    if apply:
+        apply_prepared_branch_view(agent, prepared)
+        return None
+    return prepared
 
+
+def apply_prepared_branch_view(agent: Any, prepared: dict[str, Any]) -> None:
+    """Install a prepared subtree onto the live agent."""
+    messages = prepared["messages"]
+    selected = prepared["selected"]
     conversation = agent.controller.conversation
     existing_system = [
         message for message in conversation.get_messages() if message.role == "system"
@@ -252,9 +265,6 @@ def reload_conversation_under_branch_view(
             extra["extra_fields"] = extra_fields
         conversation.append(role, message.get("content", ""), **extra)
 
-    # Rebuilds restore tool outputs elided during live turns; re-apply
-    # elision when the estimated prompt is already past the compact
-    # threshold so reloads stay bounded (elision is a compact companion).
     controller = agent.controller
     config = getattr(controller, "config", None)
     if config is not None and getattr(config, "elide_tool_results", False):
