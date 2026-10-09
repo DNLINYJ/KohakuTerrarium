@@ -37,6 +37,7 @@ from kohakuterrarium.builtins.tools.canvas_image import CanvasImageTool
 from kohakuterrarium.builtins.tools.stop_task import StopTaskTool
 from kohakuterrarium.core.agent import Agent
 from kohakuterrarium.core.branch_continuation import (
+    live_branch_path,
     load_persisted_branch_view,
     selected_branch_view,
 )
@@ -1719,37 +1720,9 @@ class TestCoreIntegration:
             # The override map stays empty after the rejected set.
             assert agent.native_tool_options.list() == {}
 
-            # --- branch-view replay: reseat the conversation -----------
-            # ``_reload_conversation_under_branch_view`` is the frontend
-            # "select an older branch" path: it replays the event log
-            # under a chosen ``branch_view`` and reseats the in-memory
-            # conversation + agent turn/branch state to that subtree's
-            # leaf. Selecting turn 1's branch 1 (the original) reseats
-            # the agent onto turn 1 / branch 1.
-            agent._reload_conversation_under_branch_view({1: 1})
-            assert agent._turn_index == 1
-            assert agent._branch_id == 1
-            # The replayed conversation carries turn 1's branch-1 user
-            # message ("first question") and original assistant reply.
-            replayed = " ".join(
-                m.get_text_content()
-                for m in agent.controller.conversation.get_messages()
-            )
-            assert "first question" in replayed
-            assert "original reply" in replayed
-            replay_messages = agent.controller.conversation.get_messages()
-            replay_tool_index = next(
-                i
-                for i, message in enumerate(replay_messages)
-                if message.role == "tool" and message.tool_call_id == replay_call_id
-            )
-            replay_announcement = replay_messages[replay_tool_index - 1]
-            assert replay_announcement.role == "assistant"
-            assert replay_call_id in {
-                call["id"] for call in replay_announcement.tool_calls
-            }
-
-            # --- continue the original branch, persist, and resume -----
+            # Live path is the latest subtree. inject_input must reseat
+            # onto the original branch without a prior private reload.
+            assert live_branch_path(agent).get(1) != 1
             await agent.inject_input("continue original", branch_view={1: 1})
             continued = [
                 (message.get("role"), message.get("content"))

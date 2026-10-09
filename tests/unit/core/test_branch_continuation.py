@@ -8,8 +8,8 @@ import pytest
 from kohakuterrarium import Terrarium
 from kohakuterrarium.core.branch_continuation import (
     continue_on_branch,
+    live_branch_path,
     load_persisted_branch_view,
-    persist_branch_view,
     selected_branch_view,
 )
 from kohakuterrarium.core.config_types import AgentConfig
@@ -169,31 +169,49 @@ async def test_same_branch_paused_input_runs_after_resume(tmp_path):
         await engine.__aexit__(None, None, None)
 
 
-async def test_continuation_during_rerun_write_is_rejected(tmp_path):
+@pytest.mark.parametrize("phase", ["before_write", "after_write"])
+async def test_continuation_during_rerun_write_is_rejected(tmp_path, phase):
     engine, creature, agent, provider = await _started(
         tmp_path, ["A1", "A1-rerun", "must-not-run"]
     )
     entered = asyncio.Event()
     release = asyncio.Event()
     original = agent.session_store.run
+    written = {"n": 0}
 
     async def blocked_run(fn, *args, **kwargs):
         if fn is append_user_event_pair:
+            if phase == "after_write":
+                result = await original(fn, *args, **kwargs)
+                written["n"] += 1
+                entered.set()
+                await release.wait()
+                return result
             entered.set()
             await release.wait()
+            written["n"] += 1
+            return await original(fn, *args, **kwargs)
         return await original(fn, *args, **kwargs)
 
     try:
         await creature.run("U1", timeout=8)
+        inbox_before = len(agent._event_inbox)
         agent.session_store.run = blocked_run
         rerun = asyncio.create_task(agent.regenerate_last_response())
         await asyncio.wait_for(entered.wait(), 2)
         calls = provider.call_count
+        live = live_branch_path(agent)
         with pytest.raises(ConflictError):
             await agent.inject_input("continue-original", branch_view={1: 1})
         with pytest.raises(ConflictError):
-            await agent.inject_input("same-view", branch_view={1: 1})
+            await agent.inject_input("same-view", branch_view=live)
         assert provider.call_count == calls
+        assert len(agent._event_inbox) == inbox_before
+        if phase == "after_write":
+            assert written["n"] == 1
+            assert live[1] == 2
+        else:
+            assert written["n"] == 0
         release.set()
         await rerun
         assert "A1-rerun" in _assistant_contents(agent)
@@ -298,13 +316,15 @@ async def test_same_view_input_queues_during_rerun_generation(tmp_path):
 
 async def test_resume_uses_saved_original_branch_not_latest(tmp_path):
     engine, creature, agent, provider = await _started(
-        tmp_path, ["A1", "A1-rerun", "after-resume"]
+        tmp_path, ["A1", "A1-rerun", "orig-cont", "after-resume"]
     )
     session_path = None
     try:
         await creature.run("U1", timeout=8)
         await agent.regenerate_last_response()
-        persist_branch_view(agent.session_store, "alice", {1: 1})
+        assert live_branch_path(agent)[1] == 2
+        await agent.inject_input("continue-original", branch_view={1: 1})
+        assert live_branch_path(agent)[1] == 1
         session_path = agent.session_store.path
         await agent.stop()
     finally:
@@ -313,12 +333,19 @@ async def test_resume_uses_saved_original_branch_not_latest(tmp_path):
     resumed, store = resume_agent(session_path, io_mode="plain", llm=provider)
     try:
         assert selected_branch_view(resumed)[1] == 1
-        assert _non_system(resumed) == [("user", "U1"), ("assistant", "A1")]
+        assert _non_system(resumed) == [
+            ("user", "U1"),
+            ("assistant", "A1"),
+            ("user", "continue-original"),
+            ("assistant", "orig-cont"),
+        ]
         await resumed.start()
-        await resumed.inject_input("after-resume", branch_view={1: 1})
+        await resumed.inject_input("after-resume")
         assert _non_system_prefix(provider.call_log[-1]) == [
             ("user", "U1"),
             ("assistant", "A1"),
+            ("user", "continue-original"),
+            ("assistant", "orig-cont"),
             ("user", "after-resume"),
         ]
         assert "A1-rerun" not in [
