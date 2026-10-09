@@ -119,6 +119,14 @@ def _running_jobs(agent: Any) -> list[Any]:
     return jobs
 
 
+def require_no_running_jobs(agent: Any) -> None:
+    """Reject history changes while a tool or background job is still running."""
+    if _running_jobs(agent):
+        raise ConflictError(
+            "Cannot continue a selected branch while a tool or background job is running"
+        )
+
+
 def _require_history_switch_available(agent: Any) -> None:
     if _history_mutation_in_flight(agent):
         raise ConflictError(
@@ -132,10 +140,7 @@ def _require_history_switch_available(agent: Any) -> None:
         )
     if getattr(agent, "_paused", False):
         raise ConflictError("Cannot continue a selected branch while paused")
-    if _running_jobs(agent):
-        raise ConflictError(
-            "Cannot continue a selected branch while a tool or background job is running"
-        )
+    require_no_running_jobs(agent)
 
 
 async def continue_on_branch(agent: Any, event: Any, view: dict[int, int]) -> bool:
@@ -152,11 +157,7 @@ async def continue_on_branch(agent: Any, event: Any, view: dict[int, int]) -> bo
         if _history_mutation_in_flight(agent):
             _require_history_switch_available(agent)
         return await agent._process_event(event)
-    if (
-        getattr(agent, "_running", True) is False
-        or _history_mutation_in_flight(agent)
-        or _running_jobs(agent)
-    ):
+    if getattr(agent, "_running", True) is False or _history_mutation_in_flight(agent):
         _require_history_switch_available(agent)
     events = list(store.get_events(agent.config.name))
     try:

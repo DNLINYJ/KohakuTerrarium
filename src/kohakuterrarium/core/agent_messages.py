@@ -22,6 +22,7 @@ from kohakuterrarium.core.agent_raw_history import (
 from kohakuterrarium.core.branch_continuation import (
     live_branch_path,
     persist_branch_view,
+    require_no_running_jobs,
 )
 from kohakuterrarium.core.events import EventType, TriggerEvent
 from kohakuterrarium.errors import ConflictError
@@ -376,6 +377,7 @@ class AgentMessagesMixin:
             raise ConflictError(
                 "Cannot rerun conversation while the agent is not running"
             )
+        require_no_running_jobs(self)
 
     async def _rerun_from_last(self, new_user_content: str | list = "") -> None:
         """Trigger an LLM turn from the current conversation state.

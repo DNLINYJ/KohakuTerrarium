@@ -202,11 +202,11 @@ def include_settled_tool_results(
     events: list[dict[str, Any]],
     live_event_ids: set[int],
 ) -> list[dict[str, Any]]:
-    """Keep completed tool results immediately after the live call.
+    """Attach completed results to live calls without rewriting settled pairs.
 
-    Background results are stamped with the live turn at completion. Leaving
-    them at that later stream position makes sanitize_orphan_tool_pairs drop
-    both the call and the result.
+    Background results are stamped with the live turn at completion. A later
+    sibling of that later turn would otherwise drop the result and sanitize the
+    ancestor call away. Already-paired live results keep their original order.
     """
     live_events = [
         event
@@ -214,26 +214,67 @@ def include_settled_tool_results(
         if not isinstance(event.get("event_id"), int)
         or event["event_id"] in live_event_ids
     ]
-    results_by_id: dict[str, dict[str, Any]] = {}
-    for event in events:
-        if event.get("type") != "tool_result":
-            continue
-        identity = _tool_identity(event)
-        if identity and identity not in results_by_id:
-            results_by_id[identity] = event
     live_calls: set[str] = {
         identity
         for event in live_events
         if event.get("type") == "tool_call" and (identity := _tool_identity(event))
     }
+    live_result_ids: set[str] = {
+        identity
+        for event in live_events
+        if event.get("type") == "tool_result" and (identity := _tool_identity(event))
+    }
+    late_results: dict[str, dict[str, Any]] = {}
+    for event in events:
+        if event.get("type") != "tool_result":
+            continue
+        identity = _tool_identity(event)
+        eid = event.get("event_id")
+        if (
+            identity
+            and identity in live_calls
+            and identity not in live_result_ids
+            and identity not in late_results
+        ):
+            projected = dict(event)
+            projected.pop("event_id", None)
+            projected["_settled_from_call"] = True
+            late_results[identity] = projected
+        elif (
+            identity
+            and identity in live_calls
+            and isinstance(eid, int)
+            and eid in live_event_ids
+            and identity not in late_results
+        ):
+            # Result is live but recorded after a later user turn; move it
+            # next to the call so pairing survives sanitizer.
+            call_turn = next(
+                (
+                    ev.get("turn_index")
+                    for ev in live_events
+                    if ev.get("type") == "tool_call" and _tool_identity(ev) == identity
+                ),
+                None,
+            )
+            result_turn = event.get("turn_index")
+            if (
+                isinstance(call_turn, int)
+                and isinstance(result_turn, int)
+                and result_turn > call_turn
+            ):
+                projected = dict(event)
+                projected.pop("event_id", None)
+                projected["_settled_from_call"] = True
+                late_results[identity] = projected
     replay_events: list[dict[str, Any]] = []
     for event in live_events:
         identity = _tool_identity(event)
-        if event.get("type") == "tool_result" and identity in live_calls:
+        if event.get("type") == "tool_result" and identity in late_results:
             continue
         replay_events.append(event)
-        if event.get("type") == "tool_call" and identity in results_by_id:
-            replay_events.append(results_by_id[identity])
+        if event.get("type") == "tool_call" and identity in late_results:
+            replay_events.append(late_results[identity])
     return replay_events
 
 
