@@ -14,6 +14,8 @@ import pytest
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
 from kohakuterrarium.core.conversation import Conversation
+from kohakuterrarium.core.branch_continuation import persist_branch_view
+from kohakuterrarium.core.conversation_elide import ELISION_MARKER, TOOL_FEEDBACK_KIND
 from kohakuterrarium.errors import SessionNotResumableError
 from kohakuterrarium.session.resume_branch import snapshot_mismatches_branch
 
@@ -1595,6 +1597,289 @@ class TestInjectSavedState:
             agent = _FakeAgentForInject()
             inject_saved_state(agent, store, "alice")
             assert agent._pending_resume_triggers == [{"name": "t1"}]
+        finally:
+            store.close()
+
+    def _late_result_events(self, store):
+        store.append_event(
+            "alice",
+            "user_message",
+            {"content": "start bg"},
+            turn_index=1,
+            branch_id=1,
+        )
+        store.append_event(
+            "alice",
+            "assistant_tool_calls",
+            {
+                "tool_calls": [
+                    {
+                        "id": "b1",
+                        "type": "function",
+                        "function": {"name": "slowbg", "arguments": "{}"},
+                    }
+                ]
+            },
+            turn_index=1,
+            branch_id=1,
+        )
+        store.append_event(
+            "alice",
+            "tool_call",
+            {"name": "slowbg", "call_id": "slowbg_1", "tool_call_id": "b1"},
+            turn_index=1,
+            branch_id=1,
+        )
+        store.append_event(
+            "alice",
+            "user_message",
+            {"content": "second"},
+            turn_index=2,
+            branch_id=2,
+            parent_branch_path=[(1, 1)],
+        )
+        store.append_event(
+            "alice",
+            "text_chunk",
+            {"content": "t2-sibling", "chunk_seq": 0},
+            turn_index=2,
+            branch_id=2,
+            parent_branch_path=[(1, 1)],
+        )
+        _, eid = store.append_event(
+            "alice",
+            "tool_result",
+            {"name": "slowbg", "call_id": "slowbg_1", "output": "RESULT_reviewbg"},
+            turn_index=2,
+            branch_id=1,
+            parent_branch_path=[(1, 1)],
+        )
+        persist_branch_view(store, "alice", {1: 1, 2: 2})
+        store.state["alice:snapshot_event_id"] = eid
+        store.flush()
+        return eid
+
+    def _contents(self, agent):
+        return [
+            message.content
+            for message in agent.controller.conversation.get_messages()
+            if message.role != "system"
+        ]
+
+    def test_complete_snapshot_keeps_marker(self, tmp_path):
+        store = SessionStore(str(tmp_path / "x.kohakutr"))
+        try:
+            self._late_result_events(store)
+            store.save_conversation(
+                "alice",
+                [
+                    {"role": "user", "content": "start bg"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "b1",
+                                "type": "function",
+                                "function": {"name": "slowbg", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "b1",
+                        "name": "slowbg",
+                        "content": "RESULT_reviewbg",
+                    },
+                    {"role": "user", "content": "second"},
+                    {"role": "assistant", "content": "t2-sibling"},
+                    {"role": "assistant", "content": "SNAPSHOT_ONLY_SUMMARY"},
+                ],
+            )
+            store.flush()
+            agent = _FakeAgentForInject()
+            inject_saved_state(agent, store, "alice")
+            contents = self._contents(agent)
+            assert "SNAPSHOT_ONLY_SUMMARY" in contents
+            assert "RESULT_reviewbg" in contents
+        finally:
+            store.close()
+
+    def test_empty_final_output_keeps_marker(self, tmp_path):
+        store = SessionStore(str(tmp_path / "x.kohakutr"))
+        try:
+            store.append_event(
+                "alice",
+                "user_message",
+                {"content": "start bg"},
+                turn_index=1,
+                branch_id=1,
+            )
+            store.append_event(
+                "alice",
+                "tool_call",
+                {"name": "slowbg", "call_id": "slowbg_1", "tool_call_id": "b1"},
+                turn_index=1,
+                branch_id=1,
+            )
+            store.append_event(
+                "alice",
+                "user_message",
+                {"content": "second"},
+                turn_index=2,
+                branch_id=2,
+                parent_branch_path=[(1, 1)],
+            )
+            _, eid = store.append_event(
+                "alice",
+                "tool_result",
+                {"name": "slowbg", "call_id": "slowbg_1", "output": ""},
+                turn_index=2,
+                branch_id=1,
+                parent_branch_path=[(1, 1)],
+            )
+            persist_branch_view(store, "alice", {1: 1, 2: 2})
+            store.save_conversation(
+                "alice",
+                [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "b1",
+                                "type": "function",
+                                "function": {"name": "slowbg"},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "b1", "content": ""},
+                    {"role": "assistant", "content": "SNAPSHOT_ONLY_SUMMARY"},
+                ],
+            )
+            store.state["alice:snapshot_event_id"] = eid
+            store.flush()
+            agent = _FakeAgentForInject()
+            inject_saved_state(agent, store, "alice")
+            assert "SNAPSHOT_ONLY_SUMMARY" in self._contents(agent)
+        finally:
+            store.close()
+
+    def test_ack_only_snapshot_restores_final_result(self, tmp_path):
+        store = SessionStore(str(tmp_path / "x.kohakutr"))
+        try:
+            self._late_result_events(store)
+            store.save_conversation(
+                "alice",
+                [
+                    {"role": "user", "content": "start bg"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "b1",
+                                "type": "function",
+                                "function": {"name": "slowbg", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "b1",
+                        "content": (
+                            "Running in background — task delegated. "
+                            "No final result is available yet."
+                        ),
+                    },
+                    {"role": "assistant", "content": "SNAPSHOT_ONLY_SUMMARY"},
+                ],
+            )
+            store.flush()
+            agent = _FakeAgentForInject()
+            inject_saved_state(agent, store, "alice")
+            contents = self._contents(agent)
+            assert "SNAPSHOT_ONLY_SUMMARY" not in contents
+            assert "RESULT_reviewbg" in contents
+        finally:
+            store.close()
+
+    def test_tool_feedback_user_message_keeps_marker(self, tmp_path):
+        store = SessionStore(str(tmp_path / "x.kohakutr"))
+        try:
+            self._late_result_events(store)
+            store.save_conversation(
+                "alice",
+                [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "b1",
+                                "type": "function",
+                                "function": {"name": "slowbg"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "b1",
+                        "content": (
+                            "Running in background — task delegated. "
+                            "No final result is available yet."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": "[Tool slowbg_1 completed]\nRESULT_reviewbg",
+                        "metadata": {"kind": TOOL_FEEDBACK_KIND, "job_id": "slowbg_1"},
+                    },
+                    {"role": "assistant", "content": "SNAPSHOT_ONLY_SUMMARY"},
+                ],
+            )
+            store.flush()
+            agent = _FakeAgentForInject()
+            inject_saved_state(agent, store, "alice")
+            contents = self._contents(agent)
+            assert "SNAPSHOT_ONLY_SUMMARY" in contents
+            assert any("RESULT_reviewbg" in str(item) for item in contents)
+        finally:
+            store.close()
+
+    def test_elided_result_keeps_marker(self, tmp_path):
+        store = SessionStore(str(tmp_path / "x.kohakutr"))
+        try:
+            self._late_result_events(store)
+            store.save_conversation(
+                "alice",
+                [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "b1",
+                                "type": "function",
+                                "function": {"name": "slowbg"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "b1",
+                        "content": f"head\n… {ELISION_MARKER} — 400 chars dropped from slowbg",
+                        "metadata": {"tool_results_elided": True},
+                    },
+                    {"role": "assistant", "content": "SNAPSHOT_ONLY_SUMMARY"},
+                ],
+            )
+            store.flush()
+            agent = _FakeAgentForInject()
+            inject_saved_state(agent, store, "alice")
+            contents = self._contents(agent)
+            assert "SNAPSHOT_ONLY_SUMMARY" in contents
+            assert any(ELISION_MARKER in str(item) for item in contents)
         finally:
             store.close()
 

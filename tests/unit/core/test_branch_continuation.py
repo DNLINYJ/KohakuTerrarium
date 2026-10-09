@@ -14,6 +14,8 @@ from kohakuterrarium.core.branch_continuation import (
 )
 from kohakuterrarium.core.config_types import AgentConfig
 from kohakuterrarium.errors import AgentNotRunningError, ConflictError
+from kohakuterrarium.llm.base import NativeToolCall
+from kohakuterrarium.modules.tool.base import BaseTool, ExecutionMode, ToolResult
 from kohakuterrarium.session.raw_history import append_user_event_pair
 from kohakuterrarium.session.resume import resume_agent
 from kohakuterrarium.testing.llm import ScriptedLLM
@@ -52,6 +54,69 @@ class _BarrierLLM(ScriptedLLM):
             await self.release.wait()
         async for chunk in super().chat(messages, **kwargs):
             yield chunk
+
+
+class _SlowBg(BaseTool):
+    def __init__(self):
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    @property
+    def tool_name(self):
+        return "slowbg"
+
+    @property
+    def description(self):
+        return "Background tool."
+
+    @property
+    def execution_mode(self):
+        return ExecutionMode.BACKGROUND
+
+    async def _execute(self, args, **kwargs):
+        self.started.set()
+        await self.release.wait()
+        return ToolResult(output="RESULT_reviewbg")
+
+
+class _ToolLLM(ScriptedLLM):
+    def __init__(self, plan):
+        super().__init__(["x"] * max(len(plan), 1))
+        self.plan = plan
+        self._last_tool_calls = []
+
+    @property
+    def last_tool_calls(self):
+        return self._last_tool_calls
+
+    async def chat(self, messages, **kwargs):
+        normalized = self._normalize_messages(messages)
+        self.call_log.append(normalized)
+        idx = min(self.call_count, len(self.plan) - 1)
+        step = self.plan[idx]
+        self.call_count += 1
+        self._last_tool_calls = []
+        if isinstance(step, NativeToolCall):
+            self._last_tool_calls = [step]
+            yield ""
+            return
+        yield step if isinstance(step, str) else str(step)
+
+
+async def _started_with_bg(tmp_path, plan):
+    tool = _SlowBg()
+    provider = _ToolLLM(plan)
+    engine = Terrarium(session_dir=str(tmp_path / "sessions"))
+    await engine.__aenter__()
+    creature = await engine.add_creature(
+        AgentConfig(name="alice", system_prompt="plain", tool_format="native"),
+        llm=provider,
+        tools=[tool],
+        io="headless",
+        start=True,
+    )
+    return engine, creature, creature.agent, provider, tool
 
 
 async def _started(tmp_path, script, *, barrier_on_call=None):
@@ -354,3 +419,51 @@ async def test_resume_uses_saved_original_branch_not_latest(tmp_path):
     finally:
         await resumed.stop()
         store.close()
+
+
+async def test_running_job_keeps_same_view_and_rejects_history_change(tmp_path):
+    engine, creature, agent, provider, tool = await _started_with_bg(
+        tmp_path,
+        ["seed", NativeToolCall("b1", "slowbg", "{}"), "follow"],
+    )
+    try:
+        await creature.run("seed", timeout=8)
+        await agent.regenerate_last_response()
+        original = {1: 1}
+        assert live_branch_path(agent)[1] == 2
+        second = asyncio.create_task(creature.run("start bg", timeout=20))
+        await asyncio.wait_for(tool.started.wait(), 5)
+        await second
+        assert agent.executor.get_running_jobs()
+        live = live_branch_path(agent)
+        calls_before = provider.call_count
+        await agent.inject_input("normal followup", branch_view=live)
+        assert live_branch_path(agent)[1] == live[1]
+        with pytest.raises(ConflictError, match="running"):
+            await agent.regenerate_last_response()
+        with pytest.raises(ConflictError, match="running"):
+            await agent.edit_and_rerun(1, "edited while running")
+        with pytest.raises(ConflictError, match="running"):
+            await agent.inject_input("switch", branch_view=original)
+        assert live_branch_path(agent)[1] == live[1]
+        assert provider.call_count >= calls_before
+        tool.release.set()
+        for _ in range(80):
+            events = agent.session_store.get_events("alice")
+            if any(
+                event.get("type") == "tool_result"
+                and event.get("output") == "RESULT_reviewbg"
+                for event in events
+            ):
+                break
+            await asyncio.sleep(0.05)
+        result = next(
+            event
+            for event in agent.session_store.get_events("alice")
+            if event.get("type") == "tool_result"
+        )
+        assert result["output"] == "RESULT_reviewbg"
+        assert result.get("turn_index") >= 1
+    finally:
+        tool.release.set()
+        await engine.__aexit__(None, None, None)

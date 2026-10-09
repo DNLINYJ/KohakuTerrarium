@@ -6,6 +6,7 @@ import pytest
 
 import kohakuterrarium.core.agent_messages as agent_messages_module
 
+from kohakuterrarium.core.agent_message_history import replay_with_settled_tools
 from kohakuterrarium.core.agent_messages import AgentMessagesMixin
 from kohakuterrarium.core.conversation import Conversation
 from kohakuterrarium.errors import ConflictError
@@ -667,6 +668,226 @@ class TestReloadConversationUnderBranchView:
             1,
         )
         assert assistants == ["a1", "a2"]
+
+
+def _shape(messages):
+    rows = []
+    for message in messages:
+        role = message.get("role")
+        if role == "system":
+            continue
+        if role == "assistant" and message.get("tool_calls"):
+            rows.append(
+                (
+                    "assistant-calls",
+                    [call.get("id") for call in message["tool_calls"]],
+                    message.get("content") or "",
+                )
+            )
+        elif role == "tool":
+            rows.append(
+                ("tool", message.get("tool_call_id"), message.get("content") or "")
+            )
+        else:
+            rows.append((role, message.get("content") or ""))
+    return rows
+
+
+def _evt(event_id, etype, turn, branch, **payload):
+    event = {
+        "event_id": event_id,
+        "type": etype,
+        "turn_index": turn,
+        "branch_id": branch,
+        "parent_branch_path": [(1, 1)] if turn > 1 else [],
+    }
+    event.update(payload)
+    return event
+
+
+class TestSettledToolReplay:
+    def test_keeps_grouped_direct_calls(self):
+        events = [
+            _evt(1, "user_message", 1, 1, content="do two"),
+            _evt(
+                2,
+                "assistant_tool_calls",
+                1,
+                1,
+                tool_calls=[
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "echo", "arguments": '{"text":"a"}'},
+                    },
+                    {
+                        "id": "c2",
+                        "type": "function",
+                        "function": {"name": "echo", "arguments": '{"text":"b"}'},
+                    },
+                ],
+            ),
+            _evt(
+                3, "tool_call", 1, 1, call_id="echo_1", tool_call_id="c1", name="echo"
+            ),
+            _evt(
+                4, "tool_result", 1, 1, call_id="echo_1", tool_call_id="c1", output="A"
+            ),
+            _evt(
+                5, "tool_call", 1, 1, call_id="echo_2", tool_call_id="c2", name="echo"
+            ),
+            _evt(
+                6, "tool_result", 1, 1, call_id="echo_2", tool_call_id="c2", output="B"
+            ),
+            _evt(7, "text_chunk", 1, 1, content="done", chunk_seq=0),
+        ]
+        original = [dict(event) for event in events]
+        messages = Conversation.sanitize_orphan_tool_pairs(
+            replay_with_settled_tools(events, branch_view={1: 1})
+        )
+        assert _shape(messages) == [
+            ("user", "do two"),
+            ("assistant-calls", ["c1", "c2"], ""),
+            ("tool", "c1", "A"),
+            ("tool", "c2", "B"),
+            ("assistant", "done"),
+        ]
+        assert events == original
+
+    @pytest.mark.parametrize("view", [{1: 1, 2: 1}, {1: 1, 2: 2}])
+    def test_late_ancestor_result_survives_both_turn2_branches(self, view):
+        events = [
+            _evt(1, "user_message", 1, 1, content="start bg"),
+            _evt(
+                2,
+                "assistant_tool_calls",
+                1,
+                1,
+                tool_calls=[
+                    {
+                        "id": "b1",
+                        "type": "function",
+                        "function": {"name": "slowbg", "arguments": "{}"},
+                    }
+                ],
+            ),
+            _evt(
+                3,
+                "tool_call",
+                1,
+                1,
+                call_id="slowbg_1",
+                tool_call_id="b1",
+                name="slowbg",
+            ),
+            _evt(4, "user_message", 2, 1, content="second"),
+            _evt(5, "text_chunk", 2, 1, content="second-turn", chunk_seq=0),
+            _evt(6, "tool_result", 2, 1, call_id="slowbg_1", output="RESULT_reviewbg"),
+            _evt(7, "user_message", 2, 2, content="second"),
+            _evt(8, "text_chunk", 2, 2, content="t2-sibling", chunk_seq=0),
+        ]
+        messages = Conversation.sanitize_orphan_tool_pairs(
+            replay_with_settled_tools(events, branch_view=view)
+        )
+        shape = _shape(messages)
+        assert ("assistant-calls", ["b1"], "") in shape
+        assert ("tool", "b1", "RESULT_reviewbg") in shape
+        assert shape.count(("tool", "b1", "RESULT_reviewbg")) == 1
+        if view[2] == 1:
+            assert ("assistant", "second-turn") in shape
+            assert ("assistant", "t2-sibling") not in shape
+        else:
+            assert ("assistant", "t2-sibling") in shape
+            assert ("assistant", "second-turn") not in shape
+
+    def test_unselected_call_does_not_enter_current_context(self):
+        events = [
+            _evt(1, "user_message", 1, 1, content="one"),
+            _evt(
+                2, "tool_call", 1, 1, call_id="keep_1", tool_call_id="k1", name="echo"
+            ),
+            _evt(
+                3,
+                "tool_result",
+                1,
+                1,
+                call_id="keep_1",
+                tool_call_id="k1",
+                output="keep",
+            ),
+            _evt(4, "user_message", 1, 2, content="two"),
+            _evt(
+                5, "tool_call", 1, 2, call_id="drop_1", tool_call_id="d1", name="echo"
+            ),
+            _evt(
+                6,
+                "tool_result",
+                1,
+                2,
+                call_id="drop_1",
+                tool_call_id="d1",
+                output="drop",
+            ),
+        ]
+        messages = Conversation.sanitize_orphan_tool_pairs(
+            replay_with_settled_tools(events, branch_view={1: 1})
+        )
+        shape = _shape(messages)
+        assert ("tool", "k1", "keep") in shape
+        assert ("tool", "d1", "drop") not in shape
+        assert all("drop_1" not in str(row) for row in shape)
+
+    def test_reused_provider_id_does_not_cross_pair(self):
+        events = [
+            _evt(1, "user_message", 1, 1, content="first"),
+            _evt(
+                2,
+                "tool_call",
+                1,
+                1,
+                call_id="job_a",
+                tool_call_id="shared",
+                name="echo",
+            ),
+            _evt(3, "user_message", 2, 1, content="second"),
+            _evt(
+                4,
+                "tool_call",
+                2,
+                1,
+                call_id="job_b",
+                tool_call_id="shared",
+                name="echo",
+            ),
+            _evt(5, "tool_result", 2, 1, call_id="job_a", output="FROM_A"),
+            _evt(6, "tool_result", 2, 1, call_id="job_b", output="FROM_B"),
+        ]
+        messages = Conversation.sanitize_orphan_tool_pairs(
+            replay_with_settled_tools(events, branch_view={1: 1, 2: 1})
+        )
+        tools = [row for row in _shape(messages) if row[0] == "tool"]
+        assert ("tool", "shared", "FROM_A") in tools
+        assert ("tool", "shared", "FROM_B") in tools
+
+    @pytest.mark.parametrize(
+        ("output", "expected"),
+        [("", ""), ("RESULT", "RESULT"), (None, "")],
+    )
+    def test_empty_and_real_outputs_stay_paired(self, output, expected):
+        payload = {"call_id": "job_1", "tool_call_id": "b1"}
+        if output is not None:
+            payload["output"] = output
+        events = [
+            _evt(1, "user_message", 1, 1, content="go"),
+            _evt(2, "tool_call", 1, 1, call_id="job_1", tool_call_id="b1", name="echo"),
+            _evt(3, "user_message", 2, 1, content="later"),
+            _evt(4, "tool_result", 2, 1, **payload),
+        ]
+        messages = Conversation.sanitize_orphan_tool_pairs(
+            replay_with_settled_tools(events, branch_view={1: 1, 2: 1})
+        )
+        assert ("assistant-calls", ["b1"], "") in _shape(messages)
+        assert ("tool", "b1", expected) in _shape(messages)
 
 
 class TestEdgeBranches:
