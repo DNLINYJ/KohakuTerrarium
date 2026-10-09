@@ -209,13 +209,61 @@ def snapshot_mismatches_branch(store: Any, agent: Any, agent_name: str) -> bool:
 def snapshot_needs_settled_tool_replay(
     events: list[dict],
     branch_view: dict[int, int] | None,
+    snapshot: list[dict] | None = None,
 ) -> bool:
-    """Whether live calls still need a completed result projected from another turn."""
+    """Whether the snapshot still lacks a completed result for a live call."""
     if not events:
         return False
     live_ids = select_live_event_ids(events, branch_view=branch_view)
     projected = include_settled_tool_results(events, live_ids)
-    return any(event.get("_settled_from_call") for event in projected)
+    needed: dict[str, str] = {}
+    aliases: dict[str, set[str]] = {}
+    provider_ids: dict[str, str] = {}
+    for event in projected:
+        if event.get("type") != "tool_call":
+            continue
+        job_id = str(event.get("call_id") or event.get("job_id") or "")
+        provider_id = str(event.get("tool_call_id") or "")
+        if job_id and provider_id:
+            provider_ids[job_id] = provider_id
+    for event in projected:
+        if not event.get("_settled_from_call"):
+            continue
+        job_id = str(event.get("call_id") or event.get("job_id") or "")
+        if not job_id:
+            continue
+        needed[job_id] = str(event.get("output") or "")
+        names = {
+            job_id,
+            provider_ids.get(job_id, ""),
+            str(event.get("tool_call_id") or ""),
+        }
+        names.discard("")
+        aliases[job_id] = names
+    if not needed:
+        return False
+    if not snapshot:
+        return True
+    present: set[str] = set()
+    for message in snapshot:
+        if message.get("role") != "tool":
+            continue
+        identity = str(message.get("tool_call_id") or "")
+        content = str(message.get("content") or "")
+        for job_id, names in aliases.items():
+            if identity in names and _is_final_tool_result(content, needed[job_id]):
+                present.add(job_id)
+    return any(job_id not in present for job_id in needed)
+
+
+def _is_final_tool_result(content: str, expected_output: str) -> bool:
+    if "Running in background" in content:
+        return False
+    if expected_output and expected_output in content:
+        return True
+    if content.startswith("[Tool ") and " completed]" in content:
+        return True
+    return bool(content.strip())
 
 
 def replayed_messages_for(

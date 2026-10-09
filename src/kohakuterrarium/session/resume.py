@@ -329,7 +329,10 @@ def inject_saved_state(agent, store: SessionStore, agent_name: str) -> None:
     # or omits a completed ancestor tool result that the selected view needs.
     persisted = load_persisted_branch_view(store, agent_name)
     if snapshot_mismatches_branch(store, agent, agent_name) or (
-        persisted and snapshot_needs_settled_tool_replay(events, persisted)
+        persisted
+        and snapshot_needs_settled_tool_replay(
+            events, persisted, snapshot=saved_messages
+        )
     ):
         logger.info(
             "Replaying target branch for resume",
