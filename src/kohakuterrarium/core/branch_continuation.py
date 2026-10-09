@@ -108,6 +108,17 @@ def _history_mutation_in_flight(agent: Any) -> bool:
     return mutation_lock is not None and mutation_lock.locked()
 
 
+def _running_jobs(agent: Any) -> list[Any]:
+    jobs: list[Any] = []
+    executor = getattr(agent, "executor", None)
+    if executor is not None and hasattr(executor, "get_running_jobs"):
+        jobs.extend(executor.get_running_jobs() or [])
+    manager = getattr(agent, "subagent_manager", None)
+    if manager is not None and hasattr(manager, "get_running_jobs"):
+        jobs.extend(manager.get_running_jobs() or [])
+    return jobs
+
+
 def _require_history_switch_available(agent: Any) -> None:
     if _history_mutation_in_flight(agent):
         raise ConflictError(
@@ -121,6 +132,10 @@ def _require_history_switch_available(agent: Any) -> None:
         )
     if getattr(agent, "_paused", False):
         raise ConflictError("Cannot continue a selected branch while paused")
+    if _running_jobs(agent):
+        raise ConflictError(
+            "Cannot continue a selected branch while a tool or background job is running"
+        )
 
 
 async def continue_on_branch(agent: Any, event: Any, view: dict[int, int]) -> bool:
@@ -137,7 +152,11 @@ async def continue_on_branch(agent: Any, event: Any, view: dict[int, int]) -> bo
         if _history_mutation_in_flight(agent):
             _require_history_switch_available(agent)
         return await agent._process_event(event)
-    if getattr(agent, "_running", True) is False or _history_mutation_in_flight(agent):
+    if (
+        getattr(agent, "_running", True) is False
+        or _history_mutation_in_flight(agent)
+        or _running_jobs(agent)
+    ):
         _require_history_switch_available(agent)
     events = list(store.get_events(agent.config.name))
     try:

@@ -194,6 +194,49 @@ def user_message_content_for_turn(
     return None
 
 
+def _tool_identity(event: dict[str, Any]) -> str:
+    return str(event.get("call_id") or event.get("job_id") or "")
+
+
+def include_settled_tool_results(
+    events: list[dict[str, Any]],
+    live_event_ids: set[int],
+) -> list[dict[str, Any]]:
+    """Keep completed tool results immediately after the live call.
+
+    Background results are stamped with the live turn at completion. Leaving
+    them at that later stream position makes sanitize_orphan_tool_pairs drop
+    both the call and the result.
+    """
+    live_events = [
+        event
+        for event in events
+        if not isinstance(event.get("event_id"), int)
+        or event["event_id"] in live_event_ids
+    ]
+    results_by_id: dict[str, dict[str, Any]] = {}
+    for event in events:
+        if event.get("type") != "tool_result":
+            continue
+        identity = _tool_identity(event)
+        if identity and identity not in results_by_id:
+            results_by_id[identity] = event
+    live_calls: set[str] = {
+        identity
+        for event in live_events
+        if event.get("type") == "tool_call" and (identity := _tool_identity(event))
+    }
+    replay_events: list[dict[str, Any]] = []
+    for event in live_events:
+        identity = _tool_identity(event)
+        if event.get("type") == "tool_result" and identity in live_calls:
+            continue
+        replay_events.append(event)
+        if event.get("type") == "tool_call" and identity in results_by_id:
+            replay_events.append(results_by_id[identity])
+    return replay_events
+
+
 def reload_conversation_under_branch_view(
     agent: Any,
     branch_view: dict[int, int],
@@ -212,12 +255,7 @@ def reload_conversation_under_branch_view(
 
     selected = resolve_branch_view_strict(events, branch_view)
     live_event_ids = select_live_event_ids(events, branch_view=branch_view)
-    replay_events = [
-        event
-        for event in events
-        if not isinstance(event.get("event_id"), int)
-        or event["event_id"] in live_event_ids
-    ]
+    replay_events = include_settled_tool_results(events, live_event_ids)
     messages = replay(
         normalize_tool_call_events(replay_events),
         branch_view=branch_view,
