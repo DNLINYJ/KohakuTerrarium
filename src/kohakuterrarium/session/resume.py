@@ -36,6 +36,7 @@ from kohakuterrarium.session.resume_branch import (
     replayed_messages_for,
     snapshot_has_turn_metadata,
     snapshot_mismatches_branch,
+    snapshot_needs_settled_tool_replay,
 )
 from kohakuterrarium.session.resume_build import (
     build_conversation as _build_conversation,
@@ -324,11 +325,12 @@ def inject_saved_state(agent, store: SessionStore, agent_name: str) -> None:
 
     _restore_turn_branch_state(agent, store, agent_name, events)
 
-    # A snapshot saved on a DIFFERENT branch is stale. A matching snapshot
-    # can still omit projected ancestor tool results, so a persisted view
-    # always rebuilds from the event log.
+    # Rebuild from the event log only when the snapshot is on another branch
+    # or omits a completed ancestor tool result that the selected view needs.
     persisted = load_persisted_branch_view(store, agent_name)
-    if persisted or snapshot_mismatches_branch(store, agent, agent_name):
+    if snapshot_mismatches_branch(store, agent, agent_name) or (
+        persisted and snapshot_needs_settled_tool_replay(events, persisted)
+    ):
         logger.info(
             "Replaying target branch for resume",
             agent=agent_name,

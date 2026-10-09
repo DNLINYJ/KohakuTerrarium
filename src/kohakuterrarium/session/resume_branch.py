@@ -7,7 +7,10 @@ agent resumes onto, or must be rebuilt from the event log.
 
 from typing import Any
 
-from kohakuterrarium.core.agent_message_history import replay_with_settled_tools
+from kohakuterrarium.core.agent_message_history import (
+    include_settled_tool_results,
+    replay_with_settled_tools,
+)
 from kohakuterrarium.core.branch_continuation import load_persisted_branch_view
 from kohakuterrarium.core.conversation_elide import TOOL_FEEDBACK_KIND
 from kohakuterrarium.session.history import select_live_event_ids
@@ -201,6 +204,18 @@ def snapshot_mismatches_branch(store: Any, agent: Any, agent_name: str) -> bool:
     snapshot_path = _safe_branch_path(branch.get("parent_branch_path")) + [(ti, bi)]
     agent_path = _safe_branch_path(a_ppath) + [(a_ti, a_bi)]
     return not is_path_prefix(snapshot_path, agent_path)
+
+
+def snapshot_needs_settled_tool_replay(
+    events: list[dict],
+    branch_view: dict[int, int] | None,
+) -> bool:
+    """Whether live calls still need a completed result projected from another turn."""
+    if not events:
+        return False
+    live_ids = select_live_event_ids(events, branch_view=branch_view)
+    projected = include_settled_tool_results(events, live_ids)
+    return any(event.get("_settled_from_call") for event in projected)
 
 
 def replayed_messages_for(
