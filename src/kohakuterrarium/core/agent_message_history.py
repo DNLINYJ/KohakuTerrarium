@@ -12,6 +12,7 @@ from kohakuterrarium.core.message_locator import (
     user_message_indices_for_turn,
 )
 from kohakuterrarium.session.history import (
+    normalize_resumable_events,
     normalize_tool_call_events,
     replay_conversation,
     resolve_branch_view_strict,
@@ -278,6 +279,27 @@ def include_settled_tool_results(
     return replay_events
 
 
+def replay_with_settled_tools(
+    events: list[dict[str, Any]],
+    *,
+    branch_view: dict[int, int] | None = None,
+    include_metadata: bool = False,
+    resumable: bool = False,
+) -> list[dict[str, Any]]:
+    """Replay a branch, keeping completed results with their live calls."""
+    live_event_ids = select_live_event_ids(events, branch_view=branch_view)
+    replay_events = include_settled_tool_results(events, live_event_ids)
+    if resumable:
+        replay_events = normalize_resumable_events(replay_events)
+    else:
+        replay_events = normalize_tool_call_events(replay_events)
+    return replay_conversation(
+        replay_events,
+        branch_view=branch_view,
+        include_metadata=include_metadata,
+    )
+
+
 def reload_conversation_under_branch_view(
     agent: Any,
     branch_view: dict[int, int],
@@ -295,13 +317,18 @@ def reload_conversation_under_branch_view(
         events = agent.session_store.get_events(agent.config.name)
 
     selected = resolve_branch_view_strict(events, branch_view)
-    live_event_ids = select_live_event_ids(events, branch_view=branch_view)
-    replay_events = include_settled_tool_results(events, live_event_ids)
-    messages = replay(
-        normalize_tool_call_events(replay_events),
-        branch_view=branch_view,
-        include_metadata=True,
-    )
+    if replay is replay_conversation:
+        messages = replay_with_settled_tools(
+            events, branch_view=branch_view, include_metadata=True
+        )
+    else:
+        live_event_ids = select_live_event_ids(events, branch_view=branch_view)
+        replay_events = include_settled_tool_results(events, live_event_ids)
+        messages = replay(
+            normalize_tool_call_events(replay_events),
+            branch_view=branch_view,
+            include_metadata=True,
+        )
     prepared = {"messages": messages, "selected": selected}
     if apply:
         apply_prepared_branch_view(agent, prepared)

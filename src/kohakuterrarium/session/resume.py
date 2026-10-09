@@ -7,6 +7,7 @@ from typing import Any
 from kohakuterrarium.builtins.inputs import create_builtin_input
 from kohakuterrarium.builtins.outputs import create_builtin_output
 from kohakuterrarium.core.agent import Agent
+from kohakuterrarium.core.agent_message_history import replay_with_settled_tools
 from kohakuterrarium.core.agent_selection import restore_selections
 from kohakuterrarium.core.branch_continuation import load_persisted_branch_view
 from kohakuterrarium.core.config_serde import unpack_agent_config
@@ -22,7 +23,6 @@ from kohakuterrarium.session.history import (
     dedupe_adjacent_duplicate_events,
     index_parent_paths,
     normalize_resumable_events,
-    replay_conversation,
     resolve_selected_branches,
 )
 from kohakuterrarium.session.resume_open import (
@@ -140,8 +140,11 @@ def _load_conversation_with_replay_fallback(
             for evt in tail
         )
         if not tail_has_forks:
-            appended = replay_conversation(
-                normalize_resumable_events(tail), include_metadata=True
+            appended = replay_with_settled_tools(
+                tail,
+                branch_view=load_persisted_branch_view(store, agent_name),
+                include_metadata=True,
+                resumable=True,
             )
             # A legacy snapshot portion must be backfilled too, otherwise the
             # resumed conversation becomes a mix of metadata-less (snapshot)
@@ -178,8 +181,11 @@ def _load_conversation_with_replay_fallback(
             agent=agent_name,
         )
         return backfill_turn_metadata(snapshot, events)
-    replayed = replay_conversation(
-        normalize_resumable_events(events), include_metadata=True
+    replayed = replay_with_settled_tools(
+        events,
+        branch_view=load_persisted_branch_view(store, agent_name),
+        include_metadata=True,
+        resumable=True,
     )
     if replayed:
         logger.info(
@@ -318,12 +324,13 @@ def inject_saved_state(agent, store: SessionStore, agent_name: str) -> None:
 
     _restore_turn_branch_state(agent, store, agent_name, events)
 
-    # A snapshot saved on a DIFFERENT branch (a sibling path) is stale for
-    # the restored target branch: discard it and rebuild via the branch-aware
-    # replay so the restored conversation matches the branch the agent is on.
-    if snapshot_mismatches_branch(store, agent, agent_name):
+    # A snapshot saved on a DIFFERENT branch is stale. A matching snapshot
+    # can still omit projected ancestor tool results, so a persisted view
+    # always rebuilds from the event log.
+    persisted = load_persisted_branch_view(store, agent_name)
+    if persisted or snapshot_mismatches_branch(store, agent, agent_name):
         logger.info(
-            "Snapshot belongs to another branch — replaying target branch",
+            "Replaying target branch for resume",
             agent=agent_name,
         )
         replayed = replayed_messages_for(store, agent_name, events)

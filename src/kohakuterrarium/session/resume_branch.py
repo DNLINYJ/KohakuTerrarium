@@ -7,13 +7,10 @@ agent resumes onto, or must be rebuilt from the event log.
 
 from typing import Any
 
+from kohakuterrarium.core.agent_message_history import replay_with_settled_tools
 from kohakuterrarium.core.branch_continuation import load_persisted_branch_view
 from kohakuterrarium.core.conversation_elide import TOOL_FEEDBACK_KIND
-from kohakuterrarium.session.history import (
-    normalize_resumable_events,
-    replay_conversation,
-    select_live_event_ids,
-)
+from kohakuterrarium.session.history import select_live_event_ids
 
 
 def snapshot_has_turn_metadata(snapshot: list[dict]) -> bool:
@@ -225,8 +222,9 @@ def replayed_messages_for(
     if not events:
         return []
     persisted = load_persisted_branch_view(store, agent_name)
-    return replay_conversation(
-        normalize_resumable_events(events),
+    return replay_with_settled_tools(
+        events,
         branch_view=persisted,
         include_metadata=True,
+        resumable=True,
     )
