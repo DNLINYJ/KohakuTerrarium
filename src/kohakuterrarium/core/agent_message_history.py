@@ -12,6 +12,7 @@ from kohakuterrarium.core.message_locator import (
     user_message_indices_for_turn,
 )
 from kohakuterrarium.session.history import (
+    compact_covered_event_ids,
     normalize_resumable_events,
     normalize_tool_call_events,
     replay_conversation,
@@ -202,6 +203,8 @@ def _tool_identity(event: dict[str, Any]) -> str:
 def include_settled_tool_results(
     events: list[dict[str, Any]],
     live_event_ids: set[int],
+    *,
+    covered_event_ids: set[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Attach completed results to live calls without rewriting settled pairs.
 
@@ -231,6 +234,8 @@ def include_settled_tool_results(
             continue
         identity = _tool_identity(event)
         eid = event.get("event_id")
+        if eid in (covered_event_ids or ()):
+            continue
         if (
             identity
             and identity in live_calls
@@ -288,11 +293,18 @@ def replay_with_settled_tools(
 ) -> list[dict[str, Any]]:
     """Replay a branch, keeping completed results with their live calls."""
     live_event_ids = select_live_event_ids(events, branch_view=branch_view)
-    replay_events = include_settled_tool_results(events, live_event_ids)
+    covered_ids = compact_covered_event_ids(events, branch_view)
+    replay_events = include_settled_tool_results(
+        events, live_event_ids, covered_event_ids=covered_ids
+    )
     if resumable:
-        replay_events = normalize_resumable_events(replay_events)
+        replay_events = normalize_resumable_events(
+            replay_events, covered_event_ids=covered_ids
+        )
     else:
-        replay_events = normalize_tool_call_events(replay_events)
+        replay_events = normalize_tool_call_events(
+            replay_events, covered_event_ids=covered_ids
+        )
     return replay_conversation(
         replay_events,
         branch_view=branch_view,
@@ -323,9 +335,12 @@ def reload_conversation_under_branch_view(
         )
     else:
         live_event_ids = select_live_event_ids(events, branch_view=branch_view)
-        replay_events = include_settled_tool_results(events, live_event_ids)
+        covered_ids = compact_covered_event_ids(events, branch_view)
+        replay_events = include_settled_tool_results(
+            events, live_event_ids, covered_event_ids=covered_ids
+        )
         messages = replay(
-            normalize_tool_call_events(replay_events),
+            normalize_tool_call_events(replay_events, covered_event_ids=covered_ids),
             branch_view=branch_view,
             include_metadata=True,
         )

@@ -497,12 +497,7 @@ def _covered_by_replace(
     branch_id: object,
     rules: list[tuple[int, int, set[tuple[int, int]] | None, str]],
 ) -> bool:
-    """Whether event ``eid`` is covered by a compaction replacement rule.
-
-    A rule is ``(replaced_from, replaced_to, compact_path_or_None, summary)``.
-    With a path, only events on that path are covered (branch-aware); without
-    a path (legacy migration data) the whole id range is covered.
-    """
+    """Whether a replacement range and its optional branch path cover an event."""
     if not isinstance(eid, int):
         return False
     for frm, to, path, _summary in rules:
@@ -520,22 +515,60 @@ def _rule_priority(
     rule: tuple[int, int, set[tuple[int, int]] | None, str],
     selected_pairs: set[tuple[int, int]],
 ) -> tuple[int, int]:
-    """Rank a compaction rule against a selected branch projection.
-
-    Rank 2: a path-carrying rule whose ENTIRE path lies on the selected
-    lineage (``path ⊆ selected``) — the summary covers only this branch's own
-    turns, and a deeper path (more turns) is authoritative for the prefix it
-    covers. Rank 1: a legacy pathless rule (fallback baseline). Rank 0: a
-    sibling/incompatible rule whose summary covers turns outside the selected
-    branch — its summary carries sibling-specific content, not just the shared
-    ancestor, so it must never leak into this branch's replay.
-    """
+    """Rank current-lineage summaries above legacy and incompatible summaries."""
     _frm, _to, path, _summary = rule
     if path is None:
         return (1, 0)
     if not path.issubset(selected_pairs):
         return (0, 0)
     return (2, len(path))
+
+
+def compact_replacement_rules(
+    events: list[dict[str, Any]], branch_view: dict[int, int] | None = None
+) -> list[tuple[int, int, set[tuple[int, int]] | None, str]]:
+    """Select the authoritative summary range on the requested lineage."""
+    selected = resolve_selected_branches(
+        events, index_parent_paths(events), branch_view
+    )
+    selected_pairs = set(selected.items())
+    rules = [
+        (
+            evt["replaced_from_event_id"],
+            evt["replaced_to_event_id"],
+            compact_path_from_event(evt),
+            evt.get("summary", "") or evt.get("summary_text", ""),
+        )
+        for evt in events
+        if evt.get("type") in {"compact_replace", "compact_complete"}
+        and isinstance(evt.get("replaced_from_event_id"), int)
+        and isinstance(evt.get("replaced_to_event_id"), int)
+    ]
+    eligible = [r for r in rules if _rule_priority(r, selected_pairs)[0] > 0]
+    return (
+        [
+            max(
+                enumerate(eligible),
+                key=lambda item: (*_rule_priority(item[1], selected_pairs), item[0]),
+            )[1]
+        ]
+        if eligible
+        else []
+    )
+
+
+def compact_covered_event_ids(
+    events: list[dict[str, Any]], branch_view: dict[int, int] | None = None
+) -> set[int]:
+    """Return source identities replaced by the current branch's summary."""
+    rules = compact_replacement_rules(events, branch_view)
+    return {
+        evt["event_id"]
+        for evt in events
+        if _covered_by_replace(
+            evt.get("event_id"), evt.get("turn_index"), evt.get("branch_id"), rules
+        )
+    }
 
 
 def replay_conversation(
@@ -562,54 +595,7 @@ def replay_conversation(
         and evt.get("tool_call_id")
         and (not isinstance(evt.get("event_id"), int) or evt["event_id"] in live_ids)
     }
-    selected = resolve_selected_branches(
-        events_list, index_parent_paths(events_list), branch_view
-    )
-
-    # Compaction summaries replace every covered source event. Each
-    # compact_replace may carry a ``compact_path`` so a replacement recorded
-    # on one branch never deletes the sibling branch's events.
-    replaced_rules: list[tuple[int, int, set[tuple[int, int]] | None, str]] = []
-    for evt in events_list:
-        if evt.get("type") not in ("compact_replace", "compact_complete"):
-            continue
-        frm = evt.get("replaced_from_event_id")
-        to = evt.get("replaced_to_event_id")
-        if isinstance(frm, int) and isinstance(to, int):
-            replaced_rules.append(
-                (
-                    frm,
-                    to,
-                    compact_path_from_event(evt),
-                    evt.get("summary", "") or evt.get("summary_text", ""),
-                )
-            )
-    # A single replay projects ONE linear branch, so at most one compaction
-    # summary is live: the deepest compaction on the lineage matching the
-    # selected branch. Same-lineage rounds nest (the deeper one wins); a
-    # sibling branch's compaction shares only a shorter prefix and must not
-    # stack on top of this branch's own summary. Newest wins on an exact tie.
-    if replaced_rules:
-        selected_pairs = {(turn, branch) for turn, branch in selected.items()}
-        # Drop sibling/incompatible rules (rank 0) before selecting: their
-        # summaries carry sibling-specific content that must not leak into
-        # this branch's replay.
-        eligible = [
-            r for r in replaced_rules if _rule_priority(r, selected_pairs)[0] > 0
-        ]
-        replaced_rules = (
-            [
-                max(
-                    enumerate(eligible),
-                    key=lambda item: (
-                        *_rule_priority(item[1], selected_pairs),
-                        item[0],
-                    ),
-                )[1]
-            ]
-            if eligible
-            else []
-        )
+    replaced_rules = compact_replacement_rules(events_list, branch_view)
     # Summaries are emitted where the replaced content sat, not at the
     # compact_replace event's own stream position (a compact runs after the
     # live tail it preserves). pending summaries are ordered by replaced_from
@@ -808,6 +794,7 @@ def _coerce_tool_args_to_json(args: Any) -> str:
 
 def _inject_synthetic_announcements(
     events: list[dict[str, Any]],
+    covered_event_ids: set[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Insert missing assistant tool-call announcements before consumption.
 
@@ -815,6 +802,11 @@ def _inject_synthetic_announcements(
     announcements suppress duplicates. Synthetic announcements intentionally omit
     event identifiers so replay preserves their inserted position.
     """
+    uncovered_results = {
+        str(evt.get("call_id") or evt.get("job_id") or "")
+        for evt in events
+        if evt.get("_settled_from_call")
+    }
     pending: list[dict[str, Any]] = []
     announced_ids: set[str] = set()
     result: list[dict[str, Any]] = []
@@ -854,6 +846,15 @@ def _inject_synthetic_announcements(
 
     for evt in events:
         etype = evt.get("type", "")
+        if etype in {"user_input", "user_message"}:
+            _flush_pending()
+            announced_ids.clear()
+        if evt.get("event_id") in (covered_event_ids or ()) and not (
+            etype == "tool_call"
+            and str(evt.get("call_id") or evt.get("job_id") or "") in uncovered_results
+        ):
+            result.append(evt)
+            continue
 
         if etype == "tool_call":
             cid = _provider_call_id(evt)
@@ -885,8 +886,6 @@ def _inject_synthetic_announcements(
 
         # Announcements must precede the structural event that consumes the calls.
         _flush_pending()
-        if etype in {"user_input", "user_message"}:
-            announced_ids.clear()
         result.append(evt)
 
     # An unfinished stream still needs a valid trailing assistant announcement.
@@ -902,6 +901,8 @@ def _provider_call_id(event: dict[str, Any]) -> str:
 
 def normalize_tool_call_events(
     events: Iterable[dict[str, Any]],
+    *,
+    covered_event_ids: set[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Copy events and restore missing assistant tool-call announcements.
 
@@ -909,13 +910,16 @@ def normalize_tool_call_events(
     unfinished background job as interrupted. It only repairs the declaration
     required to pair persisted tool results with their assistant call.
     """
-    return _inject_synthetic_announcements([dict(evt) for evt in events])
+    return _inject_synthetic_announcements(
+        [dict(evt) for evt in events], covered_event_ids
+    )
 
 
 def normalize_resumable_events(
     events: list[dict[str, Any]],
     *,
     live_job_ids: set[str] | None = None,
+    covered_event_ids: set[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Mark unfinished tool/sub-agent work as interrupted for history replay.
 
@@ -931,6 +935,8 @@ def normalize_resumable_events(
     live = live_job_ids or set()
 
     for evt in normalized:
+        if evt.get("event_id") in (covered_event_ids or ()):
+            continue
         etype = evt.get("type", "")
         if etype == "tool_call":
             job_id = evt.get("call_id") or evt.get("job_id") or ""
@@ -991,4 +997,4 @@ def normalize_resumable_events(
         )
 
     full = normalized + synthetic_events
-    return normalize_tool_call_events(full)
+    return normalize_tool_call_events(full, covered_event_ids=covered_event_ids)

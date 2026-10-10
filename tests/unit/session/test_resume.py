@@ -14,6 +14,7 @@ import pytest
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
 from kohakuterrarium.core.agent_handlers import _BG_PLACEHOLDER
+from kohakuterrarium.core.agent_message_history import replay_with_settled_tools
 from kohakuterrarium.core.controller_context import format_events_for_context
 from kohakuterrarium.core.conversation import Conversation
 from kohakuterrarium.core.events import create_tool_complete_event
@@ -1823,6 +1824,70 @@ class TestInjectSavedState:
             agent = _FakeAgentForInject()
             inject_saved_state(agent, store, "alice")
             assert self._contents(agent) == [message["content"] for message in snapshot]
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize(
+        "coverage", ["covered", "outside", "late", "sibling", "legacy"]
+    )
+    def test_compact_coverage_controls_settled_replay(self, tmp_path, coverage):
+        store = SessionStore(str(tmp_path / "x.kohakutr"))
+        try:
+            self._late_result_events(store)
+            events = list(store.get_events("alice"))
+            call = next(e for e in events if e["type"] == "tool_call")
+            result = next(e for e in events if e["type"] == "tool_result")
+            payload = {
+                "summary": "SUMMARY",
+                "replaced_from_event_id": events[0]["event_id"],
+                "replaced_to_event_id": (
+                    result["event_id"]
+                    if coverage not in {"outside", "late"}
+                    else call["event_id"] - (coverage == "outside")
+                ),
+            }
+            if coverage != "legacy":
+                payload["compact_path"] = [
+                    [1, 1],
+                    [2, 1 if coverage != "sibling" else 2],
+                ]
+            store.append_event(
+                "alice", "compact_complete", payload, turn_index=2, branch_id=1
+            )
+            events = list(store.get_events("alice"))
+            snapshot = [{"role": "assistant", "content": "SNAPSHOT_SUMMARY"}]
+            needs_replay = coverage in {"outside", "late", "sibling"}
+            assert (
+                snapshot_needs_settled_tool_replay(events, {1: 1, 2: 1}, snapshot)
+                is needs_replay
+            )
+            replayed = replay_with_settled_tools(
+                events, branch_view={1: 1, 2: 1}, resumable=True
+            )
+            tools = [m for m in replayed if m["role"] == "tool"]
+            assert [(m["tool_call_id"], m["content"]) for m in tools] == (
+                [("b1", "RESULT_reviewbg")] if needs_replay else []
+            )
+            assert [c["id"] for m in replayed for c in m.get("tool_calls", [])] == (
+                ["b1"] if needs_replay else []
+            )
+            if needs_replay:
+                call_index = next(
+                    i for i, m in enumerate(replayed) if m.get("tool_calls")
+                )
+                assert replayed[call_index]["tool_calls"] == [
+                    {
+                        "id": "b1",
+                        "type": "function",
+                        "function": {"name": "slowbg", "arguments": "{}"},
+                    }
+                ]
+                assert replayed[call_index + 1]["role"] == "tool"
+                assert replayed[call_index + 1]["content"] == "RESULT_reviewbg"
+            assert any(m.get("content") == "SUMMARY" for m in replayed) is (
+                coverage != "sibling"
+            )
+            assert list(store.get_events("alice")) == events
         finally:
             store.close()
 

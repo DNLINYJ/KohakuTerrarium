@@ -2053,6 +2053,130 @@ class TestCoreIntegration:
             assert echo.calls == 2
             assert bg.calls == 1
 
+        compact_bg = _SlowBackgroundTool(gated=True)
+        compact_bg.config.notify_controller_on_background_complete = True
+        compact_llm = _HistoryReplayLLM(
+            True,
+            plan=[
+                [NativeToolCall("b1", "slowbg", "{}")],
+                "launched",
+                "completion done",
+                "third done",
+                "fourth done",
+            ],
+        )
+        async with Terrarium(session_dir=tmp_path / "compact-cold") as engine:
+            creature = await engine.add_creature(
+                AgentConfig(
+                    name="compactcold", system_prompt="plain", tool_format="native"
+                ),
+                llm=compact_llm,
+                tools=[compact_bg],
+                io="headless",
+                pwd=tmp_path,
+                start=True,
+            )
+            agent = creature.agent
+            agent.controller.config.include_job_status = False
+            try:
+                await creature.run("launch", timeout=8)
+                await asyncio.wait_for(compact_bg.started.wait(), 2)
+                await creature.run("second", timeout=8)
+                async with creature.attach() as stream:
+                    compact_bg.release.set()
+                    while True:
+                        event = await asyncio.wait_for(anext(stream), 8)
+                        if (
+                            isinstance(event, Activity)
+                            and event.kind == "processing_end"
+                        ):
+                            break
+                completion = agent._turn_completion
+                if completion is not None:
+                    await asyncio.wait_for(asyncio.shield(completion), 8)
+                assert (
+                    agent.controller.conversation.get_last_assistant_message().content
+                    == "completion done"
+                )
+                await creature.run("third", timeout=8)
+                await creature.run("fourth", timeout=8)
+                await agent._session_output.drain()
+
+                manager = agent.compact_manager
+                manager.config.keep_recent_turns = 1
+                manager._llm = ScriptedLLM(["summary"])
+                assert manager.trigger_compact()
+                await asyncio.wait_for(manager.wait_for_current(), 8)
+                await agent._session_output.drain()
+                assert manager._compact_count == 1
+                compacted = prefix(agent.controller.conversation.to_messages())
+                assert compacted == [
+                    (
+                        "assistant",
+                        "[Previous context summary (compact round 1)]\n\nsummary",
+                    ),
+                    ("user", "fourth"),
+                    ("assistant", "fourth done"),
+                ]
+
+                raw = agent.session_store.get_events("compactcold")
+                compact_event = [
+                    event for event in raw if event["type"] == "compact_complete"
+                ][-1]
+                assert compact_event["summary"] == "summary"
+                tool_events = [
+                    event
+                    for event in raw
+                    if event["type"] in ("tool_call", "tool_result")
+                ]
+                assert [event["type"] for event in tool_events] == [
+                    "tool_call",
+                    "tool_result",
+                ]
+                for event in tool_events:
+                    assert (
+                        compact_event["replaced_from_event_id"]
+                        <= event["event_id"]
+                        <= compact_event["replaced_to_event_id"]
+                    ), event
+                assert compact_event["replaced_to_event_id"] < compact_event["event_id"]
+                assert (
+                    load_persisted_branch_view(agent.session_store, "compactcold")
+                    is None
+                )
+                compact_path = agent.session_store.path
+                raw_before_resume = list(raw)
+            finally:
+                compact_bg.release.set()
+
+        resumed_llm = ScriptedLLM(["after compact"])
+        restored, restored_store = resume_agent(
+            compact_path, io_mode="plain", llm=resumed_llm
+        )
+        try:
+            await restored.start()
+            await restored.inject_input("after reopen")
+            assert prefix(resumed_llm.last_messages) == compacted + [
+                ("user", "after reopen")
+            ]
+            assert prefix(restored.controller.conversation.to_messages()) == (
+                compacted + [("user", "after reopen"), ("assistant", "after compact")]
+            )
+            assert compact_bg.calls == 1
+            raw_after = restored_store.get_events("compactcold")
+            assert raw_after[: len(raw_before_resume)] == raw_before_resume
+            appended = raw_after[len(raw_before_resume) :]
+            assert not any(
+                event["type"] in ("tool_call", "tool_result", "compact_complete")
+                for event in appended
+            ), appended
+            assert [
+                event["type"] for event in appended if event["type"] == "user_message"
+            ] == ["user_message"]
+        finally:
+            await restored.stop()
+            restored_store.close()
+
     async def test_inject_event_and_unified_trigger_model(self, make_creature):
         """The unified ``TriggerEvent`` model: a non-user-input event
         (a synthetic ``tool_complete``) injected straight into the

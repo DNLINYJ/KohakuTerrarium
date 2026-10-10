@@ -839,7 +839,8 @@ class TestSettledToolReplay:
         assert ("tool", "d1", "drop") not in shape
         assert all("drop_1" not in str(row) for row in shape)
 
-    def test_reused_provider_id_does_not_cross_pair(self):
+    @pytest.mark.parametrize("compacted", [False, True])
+    def test_reused_provider_id_does_not_cross_pair(self, compacted):
         events = [
             _evt(1, "user_message", 1, 1, content="first"),
             _evt(
@@ -864,17 +865,47 @@ class TestSettledToolReplay:
             _evt(5, "tool_result", 2, 1, call_id="job_a", output="FROM_A"),
             _evt(6, "tool_result", 2, 1, call_id="job_b", output="FROM_B"),
         ]
+        if compacted:
+            for event in events[-2:]:
+                event["turn_index"] = 3
+            events += [
+                _evt(7, "user_message", 3, 1, content="retained"),
+                _evt(
+                    8,
+                    "compact_complete",
+                    3,
+                    1,
+                    summary="SUMMARY",
+                    replaced_from_event_id=1,
+                    replaced_to_event_id=4,
+                    compact_path=[[1, 1], [2, 1]],
+                ),
+            ]
+        original = deepcopy(events)
         messages = Conversation.sanitize_orphan_tool_pairs(
-            replay_with_settled_tools(events, branch_view={1: 1, 2: 1})
+            replay_with_settled_tools(
+                events, branch_view={1: 1, 2: 1}, resumable=compacted
+            )
         )
-        assert _shape(messages) == [
-            ("user", "first"),
-            ("assistant-calls", ["shared"], ""),
-            ("tool", "shared", "FROM_A"),
-            ("user", "second"),
-            ("assistant-calls", ["shared"], ""),
-            ("tool", "shared", "FROM_B"),
-        ]
+        assert events == original
+        assert _shape(messages) == (
+            [
+                ("assistant-calls", ["shared"], "SUMMARY"),
+                ("tool", "shared", "FROM_A"),
+                ("assistant-calls", ["shared"], ""),
+                ("tool", "shared", "FROM_B"),
+                ("user", "retained"),
+            ]
+            if compacted
+            else [
+                ("user", "first"),
+                ("assistant-calls", ["shared"], ""),
+                ("tool", "shared", "FROM_A"),
+                ("user", "second"),
+                ("assistant-calls", ["shared"], ""),
+                ("tool", "shared", "FROM_B"),
+            ]
+        )
         assert [
             message["tool_calls"][0]["function"]
             for message in messages

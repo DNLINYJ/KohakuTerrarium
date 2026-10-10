@@ -15,7 +15,10 @@ from kohakuterrarium.core.agent_message_history import (
 from kohakuterrarium.core.branch_continuation import load_persisted_branch_view
 from kohakuterrarium.core.conversation_elide import ELISION_MARKER, TOOL_FEEDBACK_KIND
 from kohakuterrarium.core.tool_output import render_content_text
-from kohakuterrarium.session.history import select_live_event_ids
+from kohakuterrarium.session.history import (
+    compact_covered_event_ids,
+    select_live_event_ids,
+)
 
 
 def snapshot_has_turn_metadata(snapshot: list[dict]) -> bool:
@@ -217,7 +220,11 @@ def snapshot_needs_settled_tool_replay(
     if not events:
         return False
     live_ids = select_live_event_ids(events, branch_view=branch_view)
-    projected = include_settled_tool_results(events, live_ids)
+    projected = include_settled_tool_results(
+        events,
+        live_ids,
+        covered_event_ids=compact_covered_event_ids(events, branch_view),
+    )
     needed: dict[str, set[str]] = {}
     provider_ids: dict[str, str] = {}
     alias_owners: dict[str, set[str]] = {}
