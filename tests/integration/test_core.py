@@ -1963,6 +1963,9 @@ class TestCoreIntegration:
                             "kind": "tool_results",
                             "job_ids": [job_id],
                             "tool_result_phase": "final",
+                            "turn_index": 3,
+                            "branch_id": 1,
+                            "origin_known": True,
                         }
                     else:
                         bg.release.set()
@@ -2104,7 +2107,8 @@ class TestCoreIntegration:
 
                 manager = agent.compact_manager
                 manager.config.keep_recent_turns = 1
-                manager._llm = ScriptedLLM(["summary"])
+                summary_llm = ScriptedLLM(["summary OLD_LAUNCH"])
+                manager._llm = summary_llm
                 assert manager.trigger_compact()
                 await asyncio.wait_for(manager.wait_for_current(), 8)
                 await agent._session_output.drain()
@@ -2113,7 +2117,7 @@ class TestCoreIntegration:
                 assert compacted == [
                     (
                         "assistant",
-                        "[Previous context summary (compact round 1)]\n\nsummary",
+                        "[Previous context summary (compact round 1)]\n\nsummary OLD_LAUNCH",
                     ),
                     ("user", "fourth"),
                     ("assistant", "fourth done"),
@@ -2123,7 +2127,10 @@ class TestCoreIntegration:
                 compact_event = [
                     event for event in raw if event["type"] == "compact_complete"
                 ][-1]
-                assert compact_event["summary"] == "summary"
+                assert compact_event["summary"] == "summary OLD_LAUNCH"
+                assert compact_event["compact_source_path"] == [
+                    [t, 1] for t in range(1, 4)
+                ]
                 tool_events = [
                     event
                     for event in raw
@@ -2149,7 +2156,9 @@ class TestCoreIntegration:
             finally:
                 compact_bg.release.set()
 
-        resumed_llm = ScriptedLLM(["after compact"])
+        resumed_llm = ScriptedLLM(
+            ["after compact", "edited tail", "rerun tail", "edited launch"]
+        )
         restored, restored_store = resume_agent(
             compact_path, io_mode="plain", llm=resumed_llm
         )
@@ -2173,6 +2182,47 @@ class TestCoreIntegration:
             assert [
                 event["type"] for event in appended if event["type"] == "user_message"
             ] == ["user_message"]
+            tail = next(
+                evt
+                for evt in raw_before_resume
+                if evt["type"] == "user_message" and evt["content"] == "fourth"
+            )
+            await restored.edit_and_rerun(
+                -1,
+                "fourth edited",
+                target=UserMessageSelector(
+                    tail["event_id"], tail["turn_index"], tail["branch_id"]
+                ),
+            )
+            assert prefix(resumed_llm.last_messages) == [
+                compacted[0],
+                ("user", "fourth edited"),
+            ]
+            await restored.regenerate_last_response()
+            assert prefix(resumed_llm.last_messages) == [
+                compacted[0],
+                ("user", "fourth edited"),
+            ]
+            launch = next(
+                evt
+                for evt in raw_before_resume
+                if evt["type"] == "user_message" and evt["content"] == "launch"
+            )
+            await restored.edit_and_rerun(
+                -1,
+                "launch edited",
+                target=UserMessageSelector(
+                    launch["event_id"], launch["turn_index"], launch["branch_id"]
+                ),
+            )
+            assert prefix(resumed_llm.last_messages) == [("user", "launch edited")]
+            assert "OLD_LAUNCH" not in str(resumed_llm.last_messages)
+            assert (
+                restored_store.get_events("compactcold")[: len(raw_before_resume)]
+                == raw_before_resume
+            )
+            assert summary_llm.call_count == 1
+            assert compact_bg.calls == 1
         finally:
             await restored.stop()
             restored_store.close()

@@ -154,7 +154,9 @@ class AgentMidTurnMixin:
                 elif isinstance(combined, list):
                     combined.append({"type": "text", "text": f"\n\n{hint}"})
         try:
-            controller.conversation.append("user", combined)
+            controller.conversation.append(
+                "user", combined, metadata={"origin_known": False}
+            )
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(
                 "Mid-turn input injection failed", error=str(exc), exc_info=True

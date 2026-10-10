@@ -22,7 +22,12 @@ from kohakuterrarium.core.agent_raw_history import (
 from kohakuterrarium.core.branch_continuation import (
     live_branch_path,
     persist_branch_view,
+    require_no_active_compact,
     require_no_running_jobs,
+)
+from kohakuterrarium.core.compact_branch import (
+    compact_source_path_from_event,
+    is_summary_message,
 )
 from kohakuterrarium.core.events import EventType, TriggerEvent
 from kohakuterrarium.errors import ConflictError
@@ -118,11 +123,44 @@ class AgentMessagesMixin:
             finally:
                 self._branch_request_id = None
 
+    def _restore_changed_summary_inputs(
+        self, turn_index: int | None, branch_id: int
+    ) -> bool:
+        """Rebuild a summary-dependent mutation prefix before editing its inputs."""
+        if not any(
+            (inputs := compact_source_path_from_event(msg.metadata)) is None
+            or turn_index is None
+            or any(turn >= turn_index for turn, _ in inputs)
+            for msg in self.controller.conversation.get_messages()
+            if is_summary_message(msg)
+        ):
+            return False
+        if self.session_store is None or turn_index is None:
+            raise ConflictError(
+                "Cannot reconstruct summarized history without a persisted target"
+            )
+        targets = [
+            evt
+            for evt in self.session_store.get_events(self.config.name)
+            if evt.get("type") == "user_message"
+            and evt.get("turn_index") == turn_index
+            and evt.get("branch_id") == branch_id
+        ]
+        if len(targets) != 1:
+            raise ConflictError("Cannot identify the summarized turn to mutate")
+        reload_raw_prefix_for_target(
+            self,
+            UserMessageSelector(targets[0]["event_id"], turn_index, branch_id),
+            branch_view=live_branch_path(self),
+        )
+        return True
+
     async def _regenerate_tail_response(self, *, request_id: str | None) -> bool:
         """Commit a sibling branch of the current tail, then return whether to rerun."""
         await self._wait_for_history_finalization()
         self._ensure_history_mutation_idle()
         self._ensure_rerun_available()
+        self._restore_changed_summary_inputs(self._turn_index, self._branch_id)
         conv = self.controller.conversation
         last_user = conv.find_last_user_index()
         if last_user < 0:
@@ -131,6 +169,9 @@ class AgentMessagesMixin:
         removed = conv.truncate_from(last_user + 1)
         # Open a new branch of the current turn.
         self._branch_id = self._max_branch_id_for_turn(self._turn_index) + 1
+        conv.get_messages()[last_user].metadata.update(
+            turn_index=self._turn_index, branch_id=self._branch_id
+        )
         logger.info(
             "Regenerating",
             dropped=len(removed),
@@ -256,6 +297,22 @@ class AgentMessagesMixin:
         resolved_user_position = (
             sum(1 for m in msgs[: resolved_idx + 1] if m.role == "user") - 1
         )
+        resolved_turn = turn_index or target.metadata.get("turn_index")
+        if resolved_turn is None:
+            if any(is_summary_message(msg) for msg in msgs):
+                raise ConflictError(
+                    "Cannot identify an untagged target in summarized history"
+                )
+            resolved_turn = self._turn_index_for_user_position(
+                resolved_user_position, branch_view=branch_view
+            )
+        resolved_branch = target.metadata.get("branch_id") or (branch_view or {}).get(
+            resolved_turn, self._branch_id
+        )
+        if self._restore_changed_summary_inputs(resolved_turn, resolved_branch):
+            conv = self.controller.conversation
+            resolved_idx = conv.find_last_user_index()
+        turn_index = resolved_turn
         # Drop the old user message + everything after from the
         # in-memory conversation. Do NOT append the new user message
         # here — the rerun trigger carries it; the controller appends
@@ -360,6 +417,7 @@ class AgentMessagesMixin:
 
     def _ensure_history_mutation_idle(self) -> None:
         """Reject destructive history changes while another turn can observe it."""
+        require_no_active_compact(self)
         processing_lock = getattr(self, "_processing_lock", None)
         inbox = getattr(self, "_event_inbox", None)
         turn_active = processing_lock is not None and processing_lock.locked()

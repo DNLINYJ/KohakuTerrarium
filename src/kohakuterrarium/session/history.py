@@ -2,9 +2,13 @@
 
 import bisect
 import json
-from collections.abc import Hashable, Mapping
+from collections.abc import Hashable
 from typing import Any, Iterable
 
+from kohakuterrarium.core.compact_branch import (
+    CompactRule,
+    compact_rule_from_event,
+)
 from kohakuterrarium.core.job_label import canonical_tool_name, make_job_label
 from kohakuterrarium.llm.antigravity_format import replay_target
 
@@ -470,79 +474,34 @@ def _clean_tool_name(evt: dict) -> str:
     return name if isinstance(name, str) else ""
 
 
-def compact_path_from_event(evt: Mapping[str, Any]) -> set[tuple[int, int]] | None:
-    """Parse a compact event's ``compact_path`` (list of [turn, branch]).
-
-    Returns ``None`` when absent — the legacy v1_to_v2 migration product has
-    no path, so replay falls back to the global id-range behaviour for it.
-    Public: shared by ``session.history`` (replay) and
-    ``core.agent_raw_history`` (edit reload baseline selection).
-    """
-    raw = evt.get("compact_path")
-    if not isinstance(raw, (list, tuple)):
-        return None
-    out: set[tuple[int, int]] = set()
-    for item in raw:
-        if isinstance(item, (list, tuple)) and len(item) == 2:
-            try:
-                out.add((int(item[0]), int(item[1])))
-            except (TypeError, ValueError):
-                continue
-    return out or None
-
-
 def _covered_by_replace(
     eid: object,
     turn_index: object,
     branch_id: object,
-    rules: list[tuple[int, int, set[tuple[int, int]] | None, str]],
+    rules: list[CompactRule],
 ) -> bool:
     """Whether a replacement range and its optional branch path cover an event."""
-    if not isinstance(eid, int):
-        return False
-    for frm, to, path, _summary in rules:
-        if not (frm <= eid <= to):
-            continue
-        if path is None:
-            return True
-        if isinstance(turn_index, int) and isinstance(branch_id, int):
-            if (turn_index, branch_id) in path:
-                return True
-    return False
+    return any(rule.covers(eid, turn_index, branch_id) for rule in rules)
 
 
 def _rule_priority(
-    rule: tuple[int, int, set[tuple[int, int]] | None, str],
+    rule: CompactRule,
     selected_pairs: set[tuple[int, int]],
 ) -> tuple[int, int]:
     """Rank current-lineage summaries above legacy and incompatible summaries."""
-    _frm, _to, path, _summary = rule
-    if path is None:
-        return (1, 0)
-    if not path.issubset(selected_pairs):
-        return (0, 0)
-    return (2, len(path))
+    return rule.priority(selected_pairs)
 
 
 def compact_replacement_rules(
     events: list[dict[str, Any]], branch_view: dict[int, int] | None = None
-) -> list[tuple[int, int, set[tuple[int, int]] | None, str]]:
+) -> list[CompactRule]:
     """Select the authoritative summary range on the requested lineage."""
     selected = resolve_selected_branches(
         events, index_parent_paths(events), branch_view
     )
     selected_pairs = set(selected.items())
     rules = [
-        (
-            evt["replaced_from_event_id"],
-            evt["replaced_to_event_id"],
-            compact_path_from_event(evt),
-            evt.get("summary", "") or evt.get("summary_text", ""),
-        )
-        for evt in events
-        if evt.get("type") in {"compact_replace", "compact_complete"}
-        and isinstance(evt.get("replaced_from_event_id"), int)
-        and isinstance(evt.get("replaced_to_event_id"), int)
+        rule for evt in events if (rule := compact_rule_from_event(evt)) is not None
     ]
     eligible = [r for r in rules if _rule_priority(r, selected_pairs)[0] > 0]
     return (
@@ -600,9 +559,7 @@ def replay_conversation(
     # compact_replace event's own stream position (a compact runs after the
     # live tail it preserves). pending summaries are ordered by replaced_from
     # and flushed when the live stream reaches the first event past a range.
-    pending_rules: list[tuple[int, int, set[tuple[int, int]] | None, str]] = sorted(
-        replaced_rules, key=lambda r: r[0]
-    )
+    pending_rules = sorted(replaced_rules, key=lambda rule: rule.replaced_from)
 
     messages: list[dict[str, Any]] = []
     text_buf: list[str] = []
@@ -628,8 +585,8 @@ def replay_conversation(
         # otherwise that summary is injected late or lost entirely.
         i = 0
         while i < len(pending_rules):
-            frm, to, _path, summary = pending_rules[i]
-            if frm > eid:
+            rule = pending_rules[i]
+            if rule.replaced_from > eid:
                 break
             # Inject the summary only when the current branch actually has an
             # event covered by this rule; a rule whose path does not intersect
@@ -640,11 +597,21 @@ def replay_conversation(
                 # range before injecting the summary (a covered event does not
                 # otherwise delimit the text buffer).
                 _flush_text()
-                if summary:
-                    messages.append({"role": "assistant", "content": summary})
+                if rule.summary:
+                    message = {"role": "assistant", "content": rule.summary}
+                    if include_metadata:
+                        message["metadata"] = {
+                            "compact_summary": True,
+                            "compact_source_path": (
+                                sorted([t, b] for t, b in rule.source_path)
+                                if rule.source_recorded and rule.source_path
+                                else None
+                            ),
+                        }
+                    messages.append(message)
                 pending_rules.pop(i)
                 continue
-            if eid > to:
+            if eid > rule.replaced_to:
                 # Range passed with no covered event on this branch — drop.
                 pending_rules.pop(i)
                 continue

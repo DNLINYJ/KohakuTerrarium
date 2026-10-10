@@ -119,6 +119,20 @@ def _running_jobs(agent: Any) -> list[Any]:
     return jobs
 
 
+def compact_in_flight(agent: Any) -> bool:
+    """Whether a compaction round currently owns the conversation."""
+    manager = getattr(agent, "compact_manager", None)
+    return manager is not None and bool(getattr(manager, "is_compacting", False))
+
+
+def require_no_active_compact(agent: Any) -> None:
+    """Reject history mutation while a compaction round can still splice it."""
+    if compact_in_flight(agent):
+        raise ConflictError(
+            "Cannot change conversation history while compaction is running"
+        )
+
+
 def require_no_running_jobs(agent: Any) -> None:
     """Reject history changes until running jobs and promoted handoffs settle."""
     promoted = any(

@@ -1,6 +1,7 @@
 """Formatting of trigger events into provider-facing user context."""
 
 import re
+from typing import Any
 
 from kohakuterrarium.core.conversation_elide import TOOL_FEEDBACK_KIND
 from kohakuterrarium.core.events import TriggerEvent
@@ -57,6 +58,24 @@ def tool_feedback_metadata(events: list[TriggerEvent]) -> dict:
         "job_ids": [event.job_id for event in events if event.job_id],
         "tool_result_phase": "final",
     }
+
+
+def message_origin_metadata(controller: Any) -> dict:
+    """Consume the branch provenance declared for one pushed batch.
+
+    The controller has no branch state of its own, so the agent declares the
+    ``(turn, branch)`` a user message is written on before pushing a batch.
+    The value is taken once: an undeclared origin stays absent, never
+    guessed, and a later message in the same push gets none.
+    """
+    origin = getattr(controller, "_message_origin", None)
+    controller._message_origin = None
+    return dict(origin) if isinstance(origin, dict) else {}
+
+
+def declare_message_origin(controller: Any, origin: dict[str, Any] | None) -> None:
+    """Record the branch the next user message will be written on."""
+    controller._message_origin = dict(origin) if origin else None
 
 
 def format_events_for_context(

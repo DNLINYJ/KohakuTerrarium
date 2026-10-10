@@ -2,6 +2,7 @@
 
 import asyncio
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,6 +10,7 @@ import kohakuterrarium.core.agent_messages as agent_messages_module
 
 from kohakuterrarium.core.agent_message_history import replay_with_settled_tools
 from kohakuterrarium.core.agent_messages import AgentMessagesMixin
+from kohakuterrarium.core.compact_splice import splice_conversation
 from kohakuterrarium.core.conversation import Conversation
 from kohakuterrarium.errors import ConflictError
 from kohakuterrarium.session.history import InvalidBranchViewError
@@ -310,6 +312,70 @@ class TestPreviousBranchUserContent:
 
 
 class TestRegenerateLastResponse:
+    @pytest.mark.parametrize(
+        "operation, source",
+        [
+            ("edit", "covered"),
+            ("turn_rerun", "covered"),
+            ("tail_rerun", "covered"),
+            ("edit", "safe"),
+            ("edit", "unknown"),
+        ],
+    )
+    async def test_summary_mutation_uses_canonical_turn_without_stale_content(
+        self, agent, operation, source
+    ):
+        conv = agent.controller.conversation
+        conv.append("system", "sys")
+        agent._apply_user_input("u1")
+        agent._emit_assistant("a1")
+        agent._apply_user_input("u2")
+        agent._emit_assistant("OLD_STALE_RESPONSE")
+        if source != "unknown":
+            conv.get_messages()[3].metadata.update(turn_index=2, branch_id=1)
+        assert splice_conversation(
+            conv,
+            3 if source == "safe" else 5,
+            "SAFE_PREFIX" if source == "safe" else "OLD_STALE_RESPONSE",
+            1,
+            retain_latest_user=source != "safe",
+            source_path=(
+                {(1, 1)}
+                if source == "safe"
+                else ({(1, 1), (2, 1)} if source == "covered" else None)
+            ),
+        )
+        before = conv.snapshot_messages(), agent.session_store.get_events("alice")
+        agent.compact_manager = SimpleNamespace(is_compacting=True)
+        with pytest.raises(ConflictError):
+            await agent.regenerate_last_response()
+        assert (
+            conv.snapshot_messages(),
+            agent.session_store.get_events("alice"),
+        ) == before
+        agent.compact_manager.is_compacting = False
+        if source == "unknown":
+            with pytest.raises(ConflictError):
+                await agent.edit_and_rerun(2, "changed")
+            assert (
+                conv.snapshot_messages(),
+                agent.session_store.get_events("alice"),
+            ) == before
+            return
+        if operation == "edit":
+            assert await agent.edit_and_rerun(2, "changed")
+        elif operation == "turn_rerun":
+            await agent.regenerate_last_response(turn_index=2)
+        else:
+            await agent.regenerate_last_response()
+        assert "OLD_STALE_RESPONSE" not in str(
+            agent.controller.conversation.to_messages()
+        )
+        assert (agent._turn_index, agent._branch_id) == (2, 2)
+        if source == "safe":
+            assert "SAFE_PREFIX" in str(agent.controller.conversation.to_messages())
+        assert agent.session_store.get_events("alice")[: len(before[1])] == before[1]
+
     async def test_no_user_message_no_op(self, agent):
         await agent.regenerate_last_response()
         # No process_event call.

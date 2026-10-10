@@ -30,6 +30,7 @@ from kohakuterrarium.core.conversation import Conversation, ConversationConfig
 from kohakuterrarium.core.events import EventType, TriggerEvent
 from kohakuterrarium.core.controller_context import (
     format_events_for_context,
+    message_origin_metadata,
     tool_feedback_metadata,
 )
 from kohakuterrarium.core.executor import Executor
@@ -199,6 +200,7 @@ class Controller:
         # Injections remain pending until the next round so every pre-LLM hook
         # receives the same augmented message list.
         self._pending_injections: list[dict] = []
+        self._message_origin: dict[str, Any] | None = None
         # Path guidance belongs to the whole user turn, including tool rounds.
         self._skill_path_hint: str | None = None
 
@@ -824,6 +826,7 @@ class Controller:
 
         logger.debug("Processing events", count=len(events))
 
+        origin = message_origin_metadata(self)
         user_content, combined_text = self._build_turn_context(events)
         # Tool continuations and unedited regeneration reuse existing context;
         # appending an empty user message would corrupt provider turn ordering.
@@ -845,6 +848,7 @@ class Controller:
             # elided).
             if events and all(e.type == EventType.TOOL_COMPLETE for e in events):
                 msg.metadata.update(tool_feedback_metadata(events))
+            msg.metadata.update(origin)
 
         messages = self.conversation.to_messages()
         messages = await self._resolve_message_files(messages)

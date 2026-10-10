@@ -6,12 +6,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from kohakuterrarium.core.compact_branch import (
-    read_agent_events,
-    build_compact_metadata,
+    capture_compact_metadata,
+    live_turn_window,
     persist_compacted_async,
 )
 from kohakuterrarium.core.compact_splice import (
-    is_real_user_message,
     prefix_fingerprint,
     select_compact_boundary,
     splice_conversation,
@@ -286,16 +285,9 @@ class CompactManager:
             # Live zone: messages[boundary:]
             compact_messages = messages[1:boundary]
 
-            # The replaced range must reflect the turns this splice actually
-            # kept live (token pressure can move boundary past the window).
-            live_turn_count = self.config.keep_recent_turns
-            if boundary > preferred_boundary:
-                live_turn_count = sum(
-                    1 for m in messages[boundary:] if is_real_user_message(m)
-                )
-                live_turn_count += int(
-                    any(is_real_user_message(m) for m in reversed(messages[1:boundary]))
-                )
+            live_turn_count = live_turn_window(
+                messages, boundary, preferred_boundary, self.config.keep_recent_turns
+            )
 
             if not compact_messages:
                 self._emit_compact_skipped(
@@ -304,6 +296,22 @@ class CompactManager:
                 )
                 terminal_sent = True
                 return
+
+            summary_input = format_messages_for_summary(compact_messages)
+            expected_fingerprint = prefix_fingerprint(compact_messages)
+            metadata = await capture_compact_metadata(
+                self._session_store,
+                self._agent_name,
+                self._agent,
+                compact_messages,
+                live_turn_count,
+                self._compact_count + 1,
+            )
+            source_path = (
+                {tuple(pair) for pair in metadata["compact_source_path"]}
+                if metadata["compact_source_path"]
+                else None
+            )
 
             # Plugin veto: ``on_compact_start`` is a vetoable callback.
             # Any plugin returning ``False`` skips this compaction cycle
@@ -332,10 +340,6 @@ class CompactManager:
                     # and emitting a flood of ``compact_skipped`` events.
                     self._last_compact_time = time.time()
                     return
-
-            # Build the text to summarize
-            summary_input = format_messages_for_summary(compact_messages)
-            expected_fingerprint = prefix_fingerprint(compact_messages)
 
             # Call LLM to summarize
             summary = await self._summarize(summary_input)
@@ -390,6 +394,7 @@ class CompactManager:
                 expected_last=compact_messages[-1],
                 expected_fingerprint=expected_fingerprint,
                 retain_latest_user=boundary > preferred_boundary,
+                source_path=source_path,
             )
             if not applied:
                 logger.warning(
@@ -423,25 +428,7 @@ class CompactManager:
             # tail-replays events the compacted snapshot already contains.
             if self._output_router:
                 run = getattr(self._session_store, "run", None)
-                if callable(run):
-                    # Scan on the affinity thread, ordered after queued writes.
-                    events = await run(
-                        read_agent_events, self._session_store, self._agent_name
-                    )
-                else:
-                    events = read_agent_events(self._session_store, self._agent_name)
-                metadata = build_compact_metadata(
-                    self._agent,
-                    events,
-                    # keep_count must be the number of live USER TURNS this
-                    # splice actually retained (under token pressure it is
-                    # smaller than the configured window), so the replaced
-                    # range matches what the summary really covered.
-                    live_turn_count,
-                    compact_round=self._compact_count,
-                    summary=summary,
-                    messages_compacted=boundary - 1,
-                )
+                metadata["summary"] = summary
                 self._output_router.notify_activity(
                     "compact_complete",
                     f"Context auto-compact done (round {self._compact_count})",
@@ -565,6 +552,7 @@ class CompactManager:
         expected_last: Any = None,
         expected_fingerprint: tuple | None = None,
         retain_latest_user: bool = False,
+        source_path: set[tuple[int, int]] | None = None,
     ) -> bool:
         """Atomic splice — see :func:`compact_splice.splice_conversation`."""
         return splice_conversation(
@@ -575,6 +563,7 @@ class CompactManager:
             expected_last=expected_last,
             expected_fingerprint=expected_fingerprint,
             retain_latest_user=retain_latest_user,
+            source_path=source_path,
         )
 
     async def wait_for_current(self) -> None:

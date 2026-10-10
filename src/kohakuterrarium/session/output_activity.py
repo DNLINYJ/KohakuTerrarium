@@ -346,6 +346,7 @@ class SessionActivityMixin:
                 "replaced_from_event_id": metadata.get("replaced_from_event_id"),
                 "replaced_to_event_id": metadata.get("replaced_to_event_id"),
                 "compact_path": metadata.get("compact_path"),
+                "compact_source_path": metadata.get("compact_source_path"),
                 "turn_index": metadata.get("turn_index"),
                 "branch_id": metadata.get("branch_id"),
                 "parent_branch_path": metadata.get("parent_branch_path"),
