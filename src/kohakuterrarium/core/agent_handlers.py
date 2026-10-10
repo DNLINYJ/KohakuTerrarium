@@ -384,6 +384,8 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
             native_tool_call_ids[job_id] = tool_call_id
 
         if handle.promoted:
+            if not executor_delivers_completion:
+                self._active_handles[job_id] = handle
             # A deliverable background tool defers this turn's output wire
             # until it reports back. STATEFUL (persistent, multi-turn) tools
             # and notify=False (fire-and-forget) tools do NOT — they would
@@ -399,6 +401,7 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
                     f"[{parse_event.name}] {_BG_PLACEHOLDER}",
                     tool_call_id=tool_call_id,
                     name=parse_event.name,
+                    metadata={"job_id": job_id, "tool_result_phase": "pending"},
                 )
             else:
                 # Text mode has no role=tool slot — deliver the same
@@ -469,6 +472,7 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
         )
 
         if handle and handle.promoted:
+            self._active_handles[job_id] = handle
             # A deliverable background sub-agent defers this turn's output
             # wire until it reports. INTERACTIVE sub-agents (persistent,
             # receive context updates, may never "complete") and notify=False
@@ -483,6 +487,7 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
                     f"[{parse_event.name}] {_BG_PLACEHOLDER}",
                     tool_call_id=sa_tool_call_id,
                     name=parse_event.name,
+                    metadata={"job_id": job_id, "tool_result_phase": "pending"},
                 )
             else:
                 self._bg_dispatch_acks.append(

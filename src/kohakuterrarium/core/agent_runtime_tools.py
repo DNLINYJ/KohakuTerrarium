@@ -1,8 +1,8 @@
-import asyncio
-
 from kohakuterrarium.core.backgroundify import BackgroundifyHandle
 from kohakuterrarium.core.controller import Controller
+from kohakuterrarium.core.event_inbox import EventEnvelope
 from kohakuterrarium.core.events import TriggerEvent
+from kohakuterrarium.core.pending_input import stamp_pending_id
 from kohakuterrarium.core.job_label import make_job_label
 from kohakuterrarium.core.tool_output import render_content_text
 from kohakuterrarium.llm.message import content_parts_to_dicts
@@ -255,6 +255,8 @@ class AgentRuntimeToolsMixin:
 
         logger.info("Background job completed", job_id=job_id)
         if self._should_notify_controller_on_background_complete(job_id):
-            asyncio.create_task(self._process_event(event))
+            stamp_pending_id(event)
+            self._event_inbox.put(EventEnvelope(event))
+            self._flush_trigger_backlog_stash()
         else:
             self._bg_controller_notify.pop(job_id, None)

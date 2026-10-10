@@ -57,8 +57,9 @@ class _BarrierLLM(ScriptedLLM):
 
 
 class _SlowBg(BaseTool):
-    def __init__(self):
+    def __init__(self, mode=ExecutionMode.BACKGROUND):
         super().__init__()
+        self.mode = mode
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
@@ -72,7 +73,7 @@ class _SlowBg(BaseTool):
 
     @property
     def execution_mode(self):
-        return ExecutionMode.BACKGROUND
+        return self.mode
 
     async def _execute(self, args, **kwargs):
         self.started.set()
@@ -104,8 +105,8 @@ class _ToolLLM(ScriptedLLM):
         yield step if isinstance(step, str) else str(step)
 
 
-async def _started_with_bg(tmp_path, plan):
-    tool = _SlowBg()
+async def _started_with_bg(tmp_path, plan, mode=ExecutionMode.BACKGROUND):
+    tool = _SlowBg(mode)
     provider = _ToolLLM(plan)
     engine = Terrarium(session_dir=str(tmp_path / "sessions"))
     await engine.__aenter__()
@@ -421,10 +422,21 @@ async def test_resume_uses_saved_original_branch_not_latest(tmp_path):
         store.close()
 
 
-async def test_running_job_keeps_same_view_and_rejects_history_change(tmp_path):
+@pytest.mark.parametrize("launch", ["declared", "requested", "promoted"])
+async def test_running_job_keeps_same_view_and_rejects_history_change(tmp_path, launch):
     engine, creature, agent, provider, tool = await _started_with_bg(
         tmp_path,
-        ["seed", NativeToolCall("b1", "slowbg", "{}"), "follow"],
+        [
+            "seed",
+            "rerun",
+            NativeToolCall(
+                "b1",
+                "slowbg",
+                '{"run_in_background":true}' if launch == "requested" else "{}",
+            ),
+            "follow",
+        ],
+        ExecutionMode.BACKGROUND if launch == "declared" else ExecutionMode.DIRECT,
     )
     try:
         await creature.run("seed", timeout=8)
@@ -433,6 +445,9 @@ async def test_running_job_keeps_same_view_and_rejects_history_change(tmp_path):
         assert live_branch_path(agent)[1] == 2
         second = asyncio.create_task(creature.run("start bg", timeout=20))
         await asyncio.wait_for(tool.started.wait(), 5)
+        if launch == "promoted":
+            handle = next(iter(agent._active_handles.values()))
+            assert handle.promote()
         await second
         assert agent.executor.get_running_jobs()
         live = live_branch_path(agent)
@@ -447,23 +462,50 @@ async def test_running_job_keeps_same_view_and_rejects_history_change(tmp_path):
             await agent.inject_input("switch", branch_view=original)
         assert live_branch_path(agent)[1] == live[1]
         assert provider.call_count >= calls_before
+
+        async def change_during_handoff():
+            assert agent.executor.get_running_jobs() == []
+            assert agent.executor.get_pending_count() == 0
+            before = _snapshot(agent, provider)
+            with pytest.raises(ConflictError):
+                await agent.edit_and_rerun(-1, "edited during handoff", turn_index=1)
+            with pytest.raises(ConflictError):
+                await agent.regenerate_last_response()
+            with pytest.raises(ConflictError):
+                await agent.inject_input("switch during handoff", branch_view=original)
+            assert _snapshot(agent, provider) == before
+
         tool.release.set()
-        for _ in range(80):
-            events = agent.session_store.get_events("alice")
-            if any(
-                event.get("type") == "tool_result"
-                and event.get("output") == "RESULT_reviewbg"
-                for event in events
-            ):
-                break
-            await asyncio.sleep(0.05)
-        result = next(
-            event
-            for event in agent.session_store.get_events("alice")
-            if event.get("type") == "tool_result"
+        handoff = asyncio.create_task(change_during_handoff())
+        await asyncio.wait_for(handoff, 8)
+        await agent.inject_input(
+            "same view after completion", branch_view=live_branch_path(agent)
         )
-        assert result["output"] == "RESULT_reviewbg"
-        assert result.get("turn_index") >= 1
+        completion = next(
+            content
+            for role, content in _non_system_prefix(provider.call_log[-1])
+            if role == "user" and "RESULT_reviewbg" in str(content)
+        )
+        job_id = next(
+            event["call_id"]
+            for event in agent.session_store.get_events("alice")
+            if event["type"] == "tool_result"
+        )
+        feedback = f"[Tool {job_id} completed]\nRESULT_reviewbg"
+        assert completion == (
+            f"{feedback}\n\nsame view after completion"
+            if launch == "declared"
+            else f"same view after completion\n\n{feedback}"
+        )
+        assert agent._active_handles == {}
+        assert agent.executor.get_running_jobs() == []
+        assert len(agent._event_inbox) == 0
+        await agent.inject_input("switch after settlement", branch_view=original)
+        assert _non_system_prefix(provider.call_log[-1]) == [
+            ("user", "seed"),
+            ("assistant", "seed"),
+            ("user", "switch after settlement"),
+        ]
     finally:
         tool.release.set()
         await engine.__aexit__(None, None, None)

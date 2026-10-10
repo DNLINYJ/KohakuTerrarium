@@ -254,6 +254,32 @@ class TestStaleToolResultElision:
         assert big in feedback[0].content
         assert ELISION_MARKER not in feedback[0].content
 
+    @pytest.mark.parametrize("mixed", [False, True])
+    async def test_batched_completion_metadata_from_controller(self, mixed):
+        env = TestAgentBuilder().with_llm_script(["ack"]).build()
+        env.controller.push_event_sync(create_tool_complete_event("job1", "first"))
+        env.controller.push_event_sync(create_tool_complete_event("job2", "second"))
+        if mixed:
+            env.controller.push_event_sync(create_user_input_event("follow up"))
+        async for _ in env.controller.run_once():
+            pass
+        messages = [
+            m for m in env.controller.conversation.get_messages() if m.role == "user"
+        ]
+        assert len(messages) == 1
+        message = messages[0]
+        expected = "[Tool job1 completed]\nfirst\n\n[Tool job2 completed]\nsecond"
+        assert message.content == expected + ("\n\nfollow up" if mixed else "")
+        assert message.metadata == (
+            {}
+            if mixed
+            else {
+                "kind": TOOL_FEEDBACK_KIND,
+                "job_ids": ["job1", "job2"],
+                "tool_result_phase": "final",
+            }
+        )
+
     async def test_real_user_input_is_never_tagged_or_elided(self):
         env = TestAgentBuilder().with_llm_script(["r1", "r2"]).build()
         long_input = "important spec " + "s" * 2000

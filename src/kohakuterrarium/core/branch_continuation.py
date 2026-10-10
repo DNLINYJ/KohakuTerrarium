@@ -120,8 +120,11 @@ def _running_jobs(agent: Any) -> list[Any]:
 
 
 def require_no_running_jobs(agent: Any) -> None:
-    """Reject history changes while a tool or background job is still running."""
-    if _running_jobs(agent):
+    """Reject history changes until running jobs and promoted handoffs settle."""
+    promoted = any(
+        handle.promoted for handle in getattr(agent, "_active_handles", {}).values()
+    )
+    if _running_jobs(agent) or promoted:
         raise ConflictError(
             "Cannot continue a selected branch while a tool or background job is running"
         )

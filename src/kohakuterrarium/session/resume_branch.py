@@ -5,6 +5,7 @@ decide whether a saved conversation snapshot still matches the branch the
 agent resumes onto, or must be rebuilt from the event log.
 """
 
+import re
 from typing import Any
 
 from kohakuterrarium.core.agent_message_history import (
@@ -13,6 +14,7 @@ from kohakuterrarium.core.agent_message_history import (
 )
 from kohakuterrarium.core.branch_continuation import load_persisted_branch_view
 from kohakuterrarium.core.conversation_elide import ELISION_MARKER, TOOL_FEEDBACK_KIND
+from kohakuterrarium.core.tool_output import render_content_text
 from kohakuterrarium.session.history import select_live_event_ids
 
 
@@ -218,13 +220,17 @@ def snapshot_needs_settled_tool_replay(
     projected = include_settled_tool_results(events, live_ids)
     needed: dict[str, set[str]] = {}
     provider_ids: dict[str, str] = {}
+    alias_owners: dict[str, set[str]] = {}
     for event in projected:
         if event.get("type") != "tool_call":
             continue
         job_id = str(event.get("call_id") or event.get("job_id") or "")
         provider_id = str(event.get("tool_call_id") or "")
-        if job_id and provider_id:
-            provider_ids[job_id] = provider_id
+        if job_id:
+            alias_owners.setdefault(job_id, set()).add(job_id)
+            if provider_id:
+                provider_ids[job_id] = provider_id
+                alias_owners.setdefault(provider_id, set()).add(job_id)
     for event in projected:
         if not event.get("_settled_from_call"):
             continue
@@ -238,6 +244,8 @@ def snapshot_needs_settled_tool_replay(
         }
         names.discard("")
         needed[job_id] = names
+        for name in names:
+            alias_owners.setdefault(name, set()).add(job_id)
     if not needed:
         return False
     if not snapshot:
@@ -249,9 +257,10 @@ def snapshot_needs_settled_tool_replay(
             continue
         if not _snapshot_result_is_final(message):
             continue
-        for job_id, names in needed.items():
-            if identities & names:
-                present.add(job_id)
+        for identity in identities:
+            owners = alias_owners.get(identity, set())
+            if len(owners) == 1:
+                present.update(owners & needed.keys())
     return any(job_id not in present for job_id in needed)
 
 
@@ -261,24 +270,29 @@ def _snapshot_result_identities(message: dict) -> set[str]:
         message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
     )
     names: set[str] = set()
+    if role != "tool" and not (
+        role == "user" and metadata.get("kind") == TOOL_FEEDBACK_KIND
+    ):
+        return names
+    for key in ("job_id", "call_id"):
+        if metadata.get(key):
+            names.add(str(metadata[key]))
+    job_ids = metadata.get("job_ids")
+    if isinstance(job_ids, list):
+        names.update(str(value) for value in job_ids if value)
+    if names:
+        return names
     if role == "tool":
         identity = str(message.get("tool_call_id") or "")
-        if identity:
-            names.add(identity)
-        return names
-    if role == "user" and metadata.get("kind") == TOOL_FEEDBACK_KIND:
-        for key in ("job_id", "call_id", "tool_call_id"):
-            value = metadata.get(key)
-            if value:
-                names.add(str(value))
-        content = str(message.get("content") or "")
-        if content.startswith("[Tool "):
-            rest = content[6:]
-            for suffix in (" completed]", " failed", " cancelled]"):
-                idx = rest.find(suffix)
-                if idx > 0:
-                    names.add(rest[:idx].strip())
-                    break
+        return {identity} if identity else set()
+    content = render_content_text(message.get("content") or "")
+    names.update(
+        re.findall(
+            r"(?:\A|\n\n)\[Tool ([^\]\n]+?) "
+            r"(?:completed|failed(?:, exit [^\]\n]+)?|cancelled)\](?=\n|\Z)",
+            content,
+        )
+    )
     return names
 
 
@@ -286,15 +300,22 @@ def _snapshot_result_is_final(message: dict) -> bool:
     metadata = (
         message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
     )
-    if metadata.get("tool_results_elided"):
-        return True
-    content = str(message.get("content") or "")
-    if ELISION_MARKER in content:
-        return True
-    if content.startswith("Running in background — task delegated."):
+    phase = metadata.get("tool_result_phase")
+    if phase == "pending":
         return False
+    if phase == "final":
+        return True
+    content = render_content_text(message.get("content") or "")
+    if re.match(
+        r"^(?:\[[^\]\n]+\] )?(?:Running in background — task delegated\.|"
+        r"Promoted to background\. Result arrives in a later turn\.)",
+        content,
+    ):
+        return False
+    if metadata.get("tool_results_elided") or ELISION_MARKER in content:
+        return True
     if message.get("role") == "user" and metadata.get("kind") == TOOL_FEEDBACK_KIND:
-        return content.startswith("[Tool ")
+        return bool(_snapshot_result_identities(message))
     return True
 
 

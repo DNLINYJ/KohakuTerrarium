@@ -53,7 +53,7 @@ from kohakuterrarium.core.events import (
     create_tool_complete_event,
     create_user_input_event,
 )
-from kohakuterrarium.core.turn import TurnCapture
+from kohakuterrarium.core.turn import Activity, TurnCapture
 from kohakuterrarium.llm.message import FilePart, ImagePart, TextPart
 from kohakuterrarium.llm.artifact_resolve import (
     file_reference_path,
@@ -63,6 +63,7 @@ from kohakuterrarium.llm.base import NativeToolCall
 from kohakuterrarium.llm.codex_format import to_responses_input
 from kohakuterrarium.llm.recovery import drop_last_tool_round
 from kohakuterrarium.session.raw_history import UserMessageSelector
+from kohakuterrarium.session.resume import resume_agent
 from kohakuterrarium.session.resume_build import build_conversation
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.reader import SessionReader
@@ -91,9 +92,10 @@ from kohakuterrarium.testing.output import OutputRecorder
 class _HistoryReplayLLM(ScriptedLLM):
     """Supply native/text tool calls and a cancellable response for history workflows."""
 
-    def __init__(self, native):
+    def __init__(self, native, plan=None):
         super().__init__(["OK"])
         self.native = native
+        self.plan = plan
         self.started = asyncio.Event()
         self.last_tool_calls = []
 
@@ -105,6 +107,14 @@ class _HistoryReplayLLM(ScriptedLLM):
             if item.get("type") == "function_call":
                 assert re.fullmatch(r"[a-zA-Z0-9_-]+", item["name"])
         self.last_tool_calls = []
+        if self.plan is not None:
+            step = self.plan[min(self.call_count - 1, len(self.plan) - 1)]
+            if isinstance(step, list):
+                self.last_tool_calls = step
+                yield ""
+            else:
+                yield step
+            return
         if self.call_count == 1:
             if self.native:
                 self.last_tool_calls = [
@@ -131,6 +141,10 @@ class _EchoTool(BaseTool):
     ``[echo/]`` onto the ``content`` argument.
     """
 
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
     @property
     def tool_name(self) -> str:
         return "echo"
@@ -144,12 +158,20 @@ class _EchoTool(BaseTool):
         return ExecutionMode.DIRECT
 
     async def _execute(self, args, **kwargs):
+        self.calls += 1
         return ToolResult(output=f"echoed:{args.get('content', '')}")
 
 
 class _SlowBackgroundTool(BaseTool):
     """BACKGROUND tool: yields after a short sleep so the controller
     must promote it and pick the result up on a later turn."""
+
+    def __init__(self, *, gated=False):
+        super().__init__()
+        self.calls = 0
+        self.gated = gated
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
 
     @property
     def tool_name(self) -> str:
@@ -164,7 +186,12 @@ class _SlowBackgroundTool(BaseTool):
         return ExecutionMode.BACKGROUND
 
     async def _execute(self, args, **kwargs):
-        await asyncio.sleep(0.05)
+        self.calls += 1
+        self.started.set()
+        if self.gated:
+            await self.release.wait()
+        else:
+            await asyncio.sleep(0.05)
         return ToolResult(output="background-finished")
 
 
@@ -1813,6 +1840,218 @@ class TestCoreIntegration:
                 assert [(call["id"], call["function"]["name"]) for call in calls] == [
                     (expected_id, "scratchpad")
                 ]
+
+        def prefix(messages):
+            rows = []
+            for message in messages:
+                role = message["role"]
+                if role == "system":
+                    continue
+                if message.get("tool_calls"):
+                    rows.append(
+                        (
+                            "calls",
+                            [
+                                (
+                                    c["id"],
+                                    c["function"]["name"],
+                                    c["function"]["arguments"],
+                                )
+                                for c in message["tool_calls"]
+                            ],
+                        )
+                    )
+                elif role == "tool":
+                    rows.append(
+                        (
+                            role,
+                            message["tool_call_id"],
+                            message.get("name"),
+                            message["content"],
+                        )
+                    )
+                else:
+                    rows.append((role, message["content"]))
+            return rows
+
+        for notify in (True, False):
+            echo, bg = _EchoTool(), _SlowBackgroundTool(gated=True)
+            bg.config.notify_controller_on_background_complete = notify
+            plan = [
+                [
+                    NativeToolCall("c1", "echo", '{"content":"a"}'),
+                    NativeToolCall("c2", "echo", '{"content":"b"}'),
+                ],
+                "direct done",
+                [NativeToolCall("b1", "slowbg", "{}")],
+                "later done",
+                "completion done" if notify else "snapshot done",
+                "later sibling",
+                "orig cont",
+                "sib cont",
+                "resume one",
+                "resume two",
+            ]
+            llm = _HistoryReplayLLM(True, plan=plan)
+            async with Terrarium(session_dir=tmp_path / f"settled-{notify}") as engine:
+                creature = await engine.add_creature(
+                    AgentConfig(
+                        name="settled", system_prompt="plain", tool_format="native"
+                    ),
+                    llm=llm,
+                    tools=[echo, bg],
+                    io="headless",
+                    start=True,
+                )
+                agent = creature.agent
+                agent.controller.config.include_job_status = False
+                cold_store = None
+                try:
+                    await creature.run("do two", timeout=8)
+                    direct = [
+                        ("user", "do two"),
+                        (
+                            "calls",
+                            [
+                                ("c1", "echo", '{"content":"a"}'),
+                                ("c2", "echo", '{"content":"b"}'),
+                            ],
+                        ),
+                        ("tool", "c1", "echo", "echoed:a"),
+                        ("tool", "c2", "echo", "echoed:b"),
+                    ]
+                    assert prefix(llm.call_log[1]) == direct
+                    await creature.run("launch", timeout=8)
+                    await asyncio.wait_for(bg.started.wait(), 2)
+                    job = agent.executor.get_running_jobs()[0]
+                    job_id = job.job_id
+                    task = agent.executor._tasks[job_id]
+                    ack = next(
+                        m
+                        for m in agent.controller.conversation.get_messages()
+                        if m.role == "tool" and m.tool_call_id == "b1"
+                    )
+                    assert ack.metadata == {
+                        "job_id": job_id,
+                        "tool_result_phase": "pending",
+                    }
+                    await creature.run("later", timeout=8)
+                    if notify:
+                        async with creature.attach() as stream:
+                            bg.release.set()
+                            while True:
+                                event = await asyncio.wait_for(anext(stream), 8)
+                                if (
+                                    isinstance(event, Activity)
+                                    and event.kind == "processing_end"
+                                ):
+                                    break
+                        completion = agent._turn_completion
+                        if completion is not None:
+                            await asyncio.wait_for(asyncio.shield(completion), 8)
+                        assert (
+                            agent.controller.conversation.get_last_assistant_message().content
+                            == "completion done"
+                        )
+                        await task
+                        feedback = next(
+                            m
+                            for m in agent.controller.conversation.get_messages()
+                            if m.metadata.get("kind") == "tool_results"
+                        )
+                        assert feedback.metadata == {
+                            "kind": "tool_results",
+                            "job_ids": [job_id],
+                            "tool_result_phase": "final",
+                        }
+                    else:
+                        bg.release.set()
+                        await asyncio.wait_for(task, 8)
+                        assert len(agent._event_inbox) == 0
+                        await creature.run("save ack snapshot", timeout=8)
+                        snapshot = agent.session_store.load_conversation("settled")
+                        assert (
+                            next(m for m in snapshot if m.get("tool_call_id") == "b1")[
+                                "metadata"
+                            ]["tool_result_phase"]
+                            == "pending"
+                        )
+                        path = agent.session_store.path
+                        await engine.remove_creature(creature)
+                        agent.session_store.close()
+                        agent, cold_store = resume_agent(path, io_mode="plain", llm=llm)
+                        restored_bg = [
+                            m
+                            for m in agent.controller.conversation.get_messages()
+                            if m.role == "tool" and m.tool_call_id == "b1"
+                        ]
+                        assert [(m.name, m.content) for m in restored_bg] == [
+                            ("slowbg", "background-finished")
+                        ]
+                        await agent.start()
+                    original = dict(live_branch_path(agent))
+                    await agent.regenerate_last_response(turn_index=agent._turn_index)
+                    sibling = dict(live_branch_path(agent))
+                    assert sibling != original
+                    expected = direct + [
+                        ("assistant", "direct done"),
+                        ("user", "launch"),
+                        ("calls", [("b1", "slowbg", "{}")]),
+                        ("tool", "b1", "slowbg", "background-finished"),
+                        ("user", "later"),
+                    ]
+                    if not notify:
+                        expected += [
+                            ("assistant", "later done"),
+                            ("user", "save ack snapshot"),
+                        ]
+                    original_tail = (
+                        [("assistant", "later done"), ("assistant", "completion done")]
+                        if notify
+                        else [("assistant", "snapshot done")]
+                    )
+                    await agent.inject_input("continue original", branch_view=original)
+                    assert prefix(llm.last_messages) == expected + original_tail + [
+                        ("user", "continue original")
+                    ]
+                    await agent.inject_input("continue sibling", branch_view=sibling)
+                    selected = expected + [
+                        ("assistant", "later sibling"),
+                        ("user", "continue sibling"),
+                    ]
+                    assert prefix(llm.last_messages) == selected
+                    selected += [("assistant", "sib cont")]
+                    saved_view = selected_branch_view(agent)
+                    path = agent.session_store.path
+                finally:
+                    bg.release.set()
+                    if cold_store is not None:
+                        await agent.stop()
+                        cold_store.close()
+
+            for prompt, response in (
+                ("after resume", "resume one"),
+                ("after second resume", "resume two"),
+            ):
+                restored, store = resume_agent(path, io_mode="plain", llm=llm)
+                try:
+                    assert selected_branch_view(restored) == saved_view
+                    assert (
+                        prefix(restored.controller.conversation.to_messages())
+                        == selected
+                    )
+                    await restored.start()
+                    await restored.inject_input(prompt)
+                    selected += [("user", prompt)]
+                    assert prefix(llm.last_messages) == selected
+                    selected += [("assistant", response)]
+                    saved_view = selected_branch_view(restored)
+                    path = store.path
+                finally:
+                    await restored.stop()
+                    store.close()
+            assert echo.calls == 2
+            assert bg.calls == 1
 
     async def test_inject_event_and_unified_trigger_model(self, make_creature):
         """The unified ``TriggerEvent`` model: a non-user-input event

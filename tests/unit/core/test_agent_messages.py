@@ -1,6 +1,7 @@
 """Unit tests for :mod:`kohakuterrarium.core.agent_messages`."""
 
 import asyncio
+from copy import deepcopy
 
 import pytest
 
@@ -741,7 +742,7 @@ class TestSettledToolReplay:
             ),
             _evt(7, "text_chunk", 1, 1, content="done", chunk_seq=0),
         ]
-        original = [dict(event) for event in events]
+        original = deepcopy(events)
         messages = Conversation.sanitize_orphan_tool_pairs(
             replay_with_settled_tools(events, branch_view={1: 1})
         )
@@ -753,6 +754,7 @@ class TestSettledToolReplay:
             ("assistant", "done"),
         ]
         assert events == original
+        assert messages[1]["tool_calls"] == events[1]["tool_calls"]
 
     @pytest.mark.parametrize("view", [{1: 1, 2: 1}, {1: 1, 2: 2}])
     def test_late_ancestor_result_survives_both_turn2_branches(self, view):
@@ -865,9 +867,22 @@ class TestSettledToolReplay:
         messages = Conversation.sanitize_orphan_tool_pairs(
             replay_with_settled_tools(events, branch_view={1: 1, 2: 1})
         )
-        tools = [row for row in _shape(messages) if row[0] == "tool"]
-        assert ("tool", "shared", "FROM_A") in tools
-        assert ("tool", "shared", "FROM_B") in tools
+        assert _shape(messages) == [
+            ("user", "first"),
+            ("assistant-calls", ["shared"], ""),
+            ("tool", "shared", "FROM_A"),
+            ("user", "second"),
+            ("assistant-calls", ["shared"], ""),
+            ("tool", "shared", "FROM_B"),
+        ]
+        assert [
+            message["tool_calls"][0]["function"]
+            for message in messages
+            if message.get("tool_calls")
+        ] == [
+            {"name": "echo", "arguments": "{}"},
+            {"name": "echo", "arguments": "{}"},
+        ]
 
     @pytest.mark.parametrize(
         ("output", "expected"),

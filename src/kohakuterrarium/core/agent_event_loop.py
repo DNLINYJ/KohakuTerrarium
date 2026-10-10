@@ -21,18 +21,8 @@ from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Settle window (in cooperative yields) applied after a wake before the
-# claim, so producers whose event reaches the inbox across several
-# create_task / done-callback hops still land in the SAME batch. A
-# background TOOL completion reaches the inbox in ~1 hop
-# (``_run_tool`` → ``_on_bg_complete`` → ``create_task(_process_event)``);
-# a backgroundified SUB-AGENT completion in ~3 (``_on_task_done``
-# done-callback → ``create_task(_on_backgroundify_complete)`` →
-# ``create_task(_process_event)``). A single yield would coalesce only
-# the shallower path, letting a simultaneous sub-agent completion slip to
-# a second turn. This budget spans that gap with margin. It is NOT a poll:
-# a FIXED, bounded number of immediate reschedules — no timed sleep and no
-# drain-until-empty loop — so a steady event stream can never extend it.
+# Fixed cooperative yields coalesce synchronous tool admission with
+# promoted tool/sub-agent done callbacks before the inbox claim.
 _COALESCE_HOPS = 3
 
 

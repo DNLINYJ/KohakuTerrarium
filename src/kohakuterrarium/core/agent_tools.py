@@ -97,7 +97,7 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
 
                 if isinstance(result, PromotionResult):
                     self._handle_promotion(jid, controller, tool_call_ids, native_mode)
-                    self._clear_direct_job_tracking(jid)
+                    self._direct_job_meta.pop(jid, None)
                     had_promotions = True
                 else:
                     results[jid] = result
@@ -126,6 +126,7 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
                 f"[{tool_name}] Promoted to background. Result arrives in a later turn.",
                 tool_call_id=tool_call_id,
                 name=tool_name,
+                metadata={"job_id": job_id, "tool_result_phase": "pending"},
             )
 
         if hasattr(self, "plugins") and self.plugins:
@@ -368,6 +369,7 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
             )
 
         self._on_bg_complete(event)
+        self._clear_direct_job_tracking(job_id)
 
     def _emit_direct_completion_activity(self, job_id: str, result: Any) -> None:
         """Emit terminal activity immediately when a direct job finishes."""
@@ -578,7 +580,11 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
                 content = ""
 
             controller.conversation.append(
-                "tool", content, tool_call_id=tool_call_id, name=tool_name
+                "tool",
+                content,
+                tool_call_id=tool_call_id,
+                name=tool_name,
+                metadata={"job_id": job_id, "tool_result_phase": "final"},
             )
 
     def _format_text_results(

@@ -2,6 +2,7 @@
 
 import re
 
+from kohakuterrarium.core.conversation_elide import TOOL_FEEDBACK_KIND
 from kohakuterrarium.core.events import TriggerEvent
 from kohakuterrarium.core.tool_output import render_content_text
 from kohakuterrarium.llm.message import ContentPart, FilePart, ImagePart, TextPart
@@ -47,6 +48,15 @@ def _tool_completion_prefix(event: TriggerEvent) -> str:
         return prefix
 
     return f"[Tool {event.job_id} completed]"
+
+
+def tool_feedback_metadata(events: list[TriggerEvent]) -> dict:
+    """Identify the completed jobs represented by a pure tool-feedback message."""
+    return {
+        "kind": TOOL_FEEDBACK_KIND,
+        "job_ids": [event.job_id for event in events if event.job_id],
+        "tool_result_phase": "final",
+    }
 
 
 def format_events_for_context(

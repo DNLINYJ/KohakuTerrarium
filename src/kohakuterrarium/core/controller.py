@@ -27,11 +27,11 @@ from kohakuterrarium.core.controller_plugins import (
     run_post_llm_call_chain,
 )
 from kohakuterrarium.core.conversation import Conversation, ConversationConfig
-from kohakuterrarium.core.conversation_elide import (
-    TOOL_FEEDBACK_KIND,
-)
 from kohakuterrarium.core.events import EventType, TriggerEvent
-from kohakuterrarium.core.controller_context import format_events_for_context
+from kohakuterrarium.core.controller_context import (
+    format_events_for_context,
+    tool_feedback_metadata,
+)
 from kohakuterrarium.core.executor import Executor
 from kohakuterrarium.core.job import JobResult, JobStatus, JobStore
 from kohakuterrarium.core.registry import Registry
@@ -844,7 +844,7 @@ class Controller:
             # carrying any real user input is never tagged (and never
             # elided).
             if events and all(e.type == EventType.TOOL_COMPLETE for e in events):
-                msg.metadata["kind"] = TOOL_FEEDBACK_KIND
+                msg.metadata.update(tool_feedback_metadata(events))
 
         messages = self.conversation.to_messages()
         messages = await self._resolve_message_files(messages)

@@ -885,6 +885,8 @@ def _inject_synthetic_announcements(
 
         # Announcements must precede the structural event that consumes the calls.
         _flush_pending()
+        if etype in {"user_input", "user_message"}:
+            announced_ids.clear()
         result.append(evt)
 
     # An unfinished stream still needs a valid trailing assistant announcement.
