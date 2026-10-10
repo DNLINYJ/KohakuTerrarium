@@ -67,11 +67,14 @@ class CompactRule:
     summary: str
     source_path: set[tuple[int, int]] | None
     source_recorded: bool = False
+    result_event_ids: frozenset[int] = frozenset()
 
     def covers(self, event_id: object, turn_index: object, branch_id: object) -> bool:
         """Whether this replacement swallows one event of its own branch."""
         if not isinstance(event_id, int):
             return False
+        if event_id in self.result_event_ids:
+            return True
         if not self.replaced_from <= event_id <= self.replaced_to:
             return False
         if self.path is None:
@@ -121,6 +124,7 @@ def compact_rule_from_event(evt: Mapping[str, Any]) -> CompactRule | None:
         summary=summary,
         source_path=compact_source_path_from_event(evt),
         source_recorded="compact_source_path" in evt,
+        result_event_ids=frozenset(_result_ids(evt)),
     )
 
 
@@ -216,6 +220,59 @@ def is_summary_message(msg: Any) -> bool:
     )
 
 
+def _result_ids(metadata: Mapping[str, Any]) -> set[int]:
+    raw = metadata.get("compact_result_event_ids")
+    return (
+        {value for value in raw if type(value) is int and value > 0}
+        if isinstance(raw, (list, tuple))
+        else set()
+    )
+
+
+def summary_result_event_ids(messages: Sequence[Any], events: list[dict]) -> set[int]:
+    """Collect the identities of final results consumed by captured messages."""
+    results: dict[str, set[int]] = {}
+    for index, event in enumerate(events):
+        if event.get("type") != "tool_result" or type(event.get("event_id")) is not int:
+            continue
+        if index and {
+            k: v for k, v in event.items() if k not in {"event_id", "ts"}
+        } == {
+            k: v for k, v in events[index - 1].items() if k not in {"event_id", "ts"}
+        }:
+            continue
+        job_id = str(event.get("call_id") or event.get("job_id") or "")
+        if job_id:
+            results.setdefault(job_id, set()).add(event["event_id"])
+    known_ids = set().union(*results.values()) if results else set()
+    consumed: set[int] = set()
+    for message in messages:
+        metadata = _message_metadata(message)
+        if is_summary_message(message):
+            consumed.update(_result_ids(metadata))
+            continue
+        if metadata.get("tool_result_phase") == "pending":
+            continue
+        if getattr(message, "role", None) == "tool":
+            event_id = metadata.get("result_event_id")
+            if event_id in known_ids:
+                consumed.add(event_id)
+                continue
+            job_ids = [metadata.get("job_id")]
+        elif (
+            metadata.get("kind") == "tool_results"
+            and metadata.get("tool_result_phase") == "final"
+        ):
+            job_ids = metadata.get("job_ids") or []
+        else:
+            continue
+        for job_id in job_ids:
+            identities = results.get(str(job_id), set())
+            if len(identities) == 1:
+                consumed.update(identities)
+    return consumed
+
+
 async def capture_compact_metadata(
     store: Any,
     agent_name: str,
@@ -246,6 +303,7 @@ async def capture_compact_metadata(
         summary="",
         messages_compacted=len(messages),
         source_path=source,
+        result_event_ids=summary_result_event_ids(messages, events),
     )
 
 
@@ -419,6 +477,7 @@ def build_compact_metadata(
     summary: str,
     messages_compacted: int,
     source_path: set[tuple[int, int]] | None = None,
+    result_event_ids: set[int] | None = None,
 ) -> dict:
     """Serialize replacement coverage and inputs; explicit null denotes unknown."""
     compact_path = current_path(agent)
@@ -430,6 +489,7 @@ def build_compact_metadata(
         "summary": summary,
         "messages_compacted": messages_compacted,
     }
+    metadata["compact_result_event_ids"] = sorted(result_event_ids or ())
     if replaced is not None:
         metadata["replaced_from_event_id"] = replaced[0]
         metadata["replaced_to_event_id"] = replaced[1]

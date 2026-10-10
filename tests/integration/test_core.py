@@ -2024,6 +2024,45 @@ class TestCoreIntegration:
                     ]
                     assert prefix(llm.last_messages) == selected
                     selected += [("assistant", "sib cont")]
+                    await agent._session_output.drain()
+                    manager = agent.compact_manager
+                    manager.config.keep_recent_turns = 1
+                    summary_llm = ScriptedLLM(["summary SIBLING"])
+                    manager._llm = summary_llm
+                    assert manager.trigger_compact()
+                    await asyncio.wait_for(manager.wait_for_current(), 8)
+                    await agent._session_output.drain()
+                    assert "background-finished" in str(summary_llm.last_messages)
+                    messages = agent.controller.conversation.to_messages()
+                    assert not any(
+                        m.get("tool_calls") or m["role"] == "tool" for m in messages
+                    )
+                    raw_compacted = agent.session_store.get_events("settled")
+                    bg_result = next(
+                        e
+                        for e in raw_compacted
+                        if e["type"] == "tool_result" and e.get("call_id") == job_id
+                    )
+                    compact_event = next(
+                        e
+                        for e in reversed(raw_compacted)
+                        if e["type"] == "compact_complete"
+                    )
+                    assert (
+                        bg_result["event_id"]
+                        in compact_event["compact_result_event_ids"]
+                    )
+                    if notify:
+                        assert [3, 1] not in compact_event["compact_source_path"]
+                    selected = prefix(messages)
+                    assert selected[-3:] == [
+                        (
+                            "assistant",
+                            "[Previous context summary (compact round 1)]\n\nsummary SIBLING",
+                        ),
+                        ("user", "continue sibling"),
+                        ("assistant", "sib cont"),
+                    ]
                     saved_view = selected_branch_view(agent)
                     path = agent.session_store.path
                 finally:

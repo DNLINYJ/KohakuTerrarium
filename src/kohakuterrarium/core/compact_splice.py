@@ -49,6 +49,7 @@ def splice_conversation(
     expected_fingerprint: tuple | None = None,
     retain_latest_user: bool = False,
     source_path: set[tuple[int, int]] | None = None,
+    result_event_ids: set[int] | None = None,
 ) -> bool:
     """Atomic splice: replace compact zone with summary message.
 
@@ -104,6 +105,7 @@ def splice_conversation(
     summary_msg.metadata["compact_source_path"] = (
         sorted([t, b] for t, b in source_path) if source_path else None
     )
+    summary_msg.metadata["compact_result_event_ids"] = sorted(result_event_ids or ())
     conversation._messages.append(summary_msg)
     if retained_user is not None:
         conversation._messages.append(retained_user)

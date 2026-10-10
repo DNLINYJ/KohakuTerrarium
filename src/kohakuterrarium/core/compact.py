@@ -395,6 +395,7 @@ class CompactManager:
                 expected_fingerprint=expected_fingerprint,
                 retain_latest_user=boundary > preferred_boundary,
                 source_path=source_path,
+                result_event_ids=set(metadata["compact_result_event_ids"]),
             )
             if not applied:
                 logger.warning(
@@ -553,6 +554,7 @@ class CompactManager:
         expected_fingerprint: tuple | None = None,
         retain_latest_user: bool = False,
         source_path: set[tuple[int, int]] | None = None,
+        result_event_ids: set[int] | None = None,
     ) -> bool:
         """Atomic splice — see :func:`compact_splice.splice_conversation`."""
         return splice_conversation(
@@ -564,6 +566,7 @@ class CompactManager:
             expected_fingerprint=expected_fingerprint,
             retain_latest_user=retain_latest_user,
             source_path=source_path,
+            result_event_ids=result_event_ids,
         )
 
     async def wait_for_current(self) -> None:

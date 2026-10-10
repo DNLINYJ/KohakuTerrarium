@@ -521,13 +521,24 @@ def compact_covered_event_ids(
 ) -> set[int]:
     """Return source identities replaced by the current branch's summary."""
     rules = compact_replacement_rules(events, branch_view)
-    return {
+    covered = {
         evt["event_id"]
         for evt in events
         if _covered_by_replace(
             evt.get("event_id"), evt.get("turn_index"), evt.get("branch_id"), rules
         )
     }
+    for previous, event in zip(events, events[1:]):
+        if (
+            previous.get("event_id") not in covered
+            or event.get("type") != "tool_result"
+        ):
+            continue
+        if {k: v for k, v in previous.items() if k not in {"event_id", "ts"}} == {
+            k: v for k, v in event.items() if k not in {"event_id", "ts"}
+        } and isinstance(event.get("event_id"), int):
+            covered.add(event["event_id"])
+    return covered
 
 
 def replay_conversation(
@@ -602,6 +613,7 @@ def replay_conversation(
                     if include_metadata:
                         message["metadata"] = {
                             "compact_summary": True,
+                            "compact_result_event_ids": sorted(rule.result_event_ids),
                             "compact_source_path": (
                                 sorted([t, b] for t, b in rule.source_path)
                                 if rule.source_recorded and rule.source_path
@@ -703,15 +715,20 @@ def replay_conversation(
                 )
         elif etype == "tool_result":
             job_id = evt.get("call_id", "") or evt.get("job_id", "")
-            messages.append(
-                {
-                    "role": "tool",
-                    "content": evt.get("output", "") or "",
-                    "tool_call_id": evt.get("tool_call_id")
-                    or provider_ids.get(job_id, job_id),
-                    "name": _clean_tool_name(evt),
+            message = {
+                "role": "tool",
+                "content": evt.get("output", "") or "",
+                "tool_call_id": evt.get("tool_call_id")
+                or provider_ids.get(job_id, job_id),
+                "name": _clean_tool_name(evt),
+            }
+            if include_metadata:
+                message["metadata"] = {
+                    "job_id": job_id,
+                    "result_event_id": evt.get("_source_event_id", evt.get("event_id")),
+                    "tool_result_phase": "final",
                 }
-            )
+            messages.append(message)
         elif etype == "system_prompt_set":
             messages.append({"role": "system", "content": evt.get("content", "")})
         elif etype == "assistant_reasoning":

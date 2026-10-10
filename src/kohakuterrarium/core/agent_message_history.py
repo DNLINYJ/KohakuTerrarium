@@ -243,7 +243,7 @@ def include_settled_tool_results(
             and identity not in late_results
         ):
             projected = dict(event)
-            projected.pop("event_id", None)
+            projected["_source_event_id"] = projected.pop("event_id", None)
             projected["_settled_from_call"] = True
             late_results[identity] = projected
         elif (
@@ -270,7 +270,7 @@ def include_settled_tool_results(
                 and result_turn > call_turn
             ):
                 projected = dict(event)
-                projected.pop("event_id", None)
+                projected["_source_event_id"] = projected.pop("event_id", None)
                 projected["_settled_from_call"] = True
                 late_results[identity] = projected
     replay_events: list[dict[str, Any]] = []

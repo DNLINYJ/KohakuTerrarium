@@ -1828,7 +1828,17 @@ class TestInjectSavedState:
             store.close()
 
     @pytest.mark.parametrize(
-        "coverage", ["covered", "outside", "late", "sibling", "legacy"]
+        "coverage",
+        [
+            "covered",
+            "outside",
+            "late",
+            "sibling",
+            "legacy",
+            "projected_consumed",
+            "projected_late",
+            "projected_duplicate",
+        ],
     )
     def test_compact_coverage_controls_settled_replay(self, tmp_path, coverage):
         store = SessionStore(str(tmp_path / "x.kohakutr"))
@@ -1846,23 +1856,48 @@ class TestInjectSavedState:
                     else call["event_id"] - (coverage == "outside")
                 ),
             }
+            if coverage == "projected_duplicate":
+                store.append_event(
+                    "alice",
+                    "tool_result",
+                    {
+                        key: value
+                        for key, value in result.items()
+                        if key not in {"event_id", "ts", "type"}
+                    },
+                    turn_index=2,
+                    branch_id=1,
+                    parent_branch_path=[(1, 1)],
+                )
+            projected = coverage.startswith("projected_")
+            branch_view = {1: 1, 2: 2 if projected else 1}
+            if projected:
+                payload["compact_result_event_ids"] = (
+                    [result["event_id"]]
+                    if coverage in {"projected_consumed", "projected_duplicate"}
+                    else []
+                )
             if coverage != "legacy":
                 payload["compact_path"] = [
                     [1, 1],
-                    [2, 1 if coverage != "sibling" else 2],
+                    [2, 2 if projected or coverage == "sibling" else 1],
                 ]
             store.append_event(
-                "alice", "compact_complete", payload, turn_index=2, branch_id=1
+                "alice",
+                "compact_complete",
+                payload,
+                turn_index=2,
+                branch_id=branch_view[2],
             )
             events = list(store.get_events("alice"))
             snapshot = [{"role": "assistant", "content": "SNAPSHOT_SUMMARY"}]
-            needs_replay = coverage in {"outside", "late", "sibling"}
+            needs_replay = coverage in {"outside", "late", "sibling", "projected_late"}
             assert (
-                snapshot_needs_settled_tool_replay(events, {1: 1, 2: 1}, snapshot)
+                snapshot_needs_settled_tool_replay(events, branch_view, snapshot)
                 is needs_replay
             )
             replayed = replay_with_settled_tools(
-                events, branch_view={1: 1, 2: 1}, resumable=True
+                events, branch_view=branch_view, resumable=True
             )
             tools = [m for m in replayed if m["role"] == "tool"]
             assert [(m["tool_call_id"], m["content"]) for m in tools] == (
@@ -1888,6 +1923,28 @@ class TestInjectSavedState:
                 coverage != "sibling"
             )
             assert list(store.get_events("alice")) == events
+            if coverage == "projected_duplicate":
+                store.append_event(
+                    "alice",
+                    "tool_result",
+                    {
+                        "name": "slowbg",
+                        "call_id": "slowbg_1",
+                        "output": "LATER_DISTINCT",
+                    },
+                    turn_index=2,
+                    branch_id=1,
+                    parent_branch_path=[(1, 1)],
+                )
+                later = list(store.get_events("alice"))
+                assert snapshot_needs_settled_tool_replay(later, branch_view, snapshot)
+                assert [
+                    m["content"]
+                    for m in replay_with_settled_tools(
+                        later, branch_view=branch_view, resumable=True
+                    )
+                    if m["role"] == "tool"
+                ] == ["LATER_DISTINCT"]
         finally:
             store.close()
 
