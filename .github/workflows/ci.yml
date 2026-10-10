@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, ci/codex-ws-hosted-tool-reconnect]
   pull_request:
     branches: [main]
 
