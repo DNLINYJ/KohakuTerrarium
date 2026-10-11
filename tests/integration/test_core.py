@@ -25,8 +25,10 @@ side effect (conversation contents, tool output text, engine state).
 
 import asyncio
 import re
+import time
 from contextlib import closing
 from pathlib import Path
+from typing import Callable
 
 import pytest
 from PIL import Image
@@ -542,6 +544,13 @@ async def _drain_chat(creature: Creature, message: str) -> str:
     return "".join(chunks)
 
 
+async def _settle(predicate: Callable[[], bool], budget: float = 30.0) -> None:
+    """Poll ``predicate`` until true; ``budget`` caps a hang, never a speed."""
+    deadline = time.monotonic() + budget
+    while not predicate() and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+
+
 def _assistant_text(agent: Agent) -> str:
     last = agent.controller.conversation.get_last_assistant_message()
     assert last is not None, "expected an assistant message in conversation"
@@ -641,10 +650,7 @@ class TestCoreIntegration:
             # completion callback injects a ``tool_complete`` TriggerEvent
             # which drives exactly one more controller turn whose final
             # assistant text acknowledges the real background output.
-            for _ in range(100):
-                if "background acknowledged" in _assistant_text(agent):
-                    break
-                await asyncio.sleep(0.02)
+            await _settle(lambda: "background acknowledged" in _assistant_text(agent))
             assert "background acknowledged" in _assistant_text(agent)
             assert agent.executor._event_queue.qsize() == 0
             assert all(
@@ -669,10 +675,7 @@ class TestCoreIntegration:
             # ``on_bg_complete=None`` to the handle whenever the executor
             # already delivers the completion. Expected: exactly 4
             # controller calls (turn1 ×2 + turn2 ×1 + one bg follow-up).
-            for _ in range(100):
-                if agent.llm.call_count >= 4:
-                    break
-                await asyncio.sleep(0.02)
+            await _settle(lambda: agent.llm.call_count >= 4)
             # Settle: on the unfixed (double-fire) code a 5th controller
             # call would be scheduled right here by the second completion.
             await asyncio.sleep(0.3)
@@ -935,10 +938,9 @@ class TestCoreIntegration:
                 )
                 agent.llm = agent.controller.llm = canvas_llm
                 await _drain_chat(creature, f"{mode} canvas")
-                for _ in range(100):
-                    if _assistant_text(agent) == f"{mode} canvas acknowledged":
-                        break
-                    await asyncio.sleep(0.02)
+                await _settle(
+                    lambda: _assistant_text(agent) == f"{mode} canvas acknowledged"
+                )
                 assert _assistant_text(agent) == f"{mode} canvas acknowledged"
                 completions = [
                     event
@@ -1096,10 +1098,13 @@ class TestCoreIntegration:
             # Both registered sub-agents are visible on the property.
             assert set(agent.subagents) == {"explore", "planner"}
 
-            out = await _drain_chat(creature, "investigate the project")
+            # A background sub-agent's result drives a follow-up turn that can
+            # land after chat() returns, so the summary is read once settled.
+            await _drain_chat(creature, "investigate the project")
+            await _settle(lambda: agent.llm.call_count == 2 and not agent.is_processing)
 
             # The parent's final turn summarised the sub-agent's work.
-            assert "summary: exploration complete" in out
+            assert "summary: exploration complete" in _assistant_text(agent)
             # The parent looped twice: dispatch, then summarise.
             assert agent.llm.call_count == 2
             # The sub-agent's result text reached the parent conversation
@@ -1114,8 +1119,9 @@ class TestCoreIntegration:
             assert len(done) == 1
 
             # --- Turn 2: dispatch the SECOND sub-agent ------------------
-            out2 = await _drain_chat(creature, "now plan the work")
-            assert "summary: plan received" in out2
+            await _drain_chat(creature, "now plan the work")
+            await _settle(lambda: agent.llm.call_count == 4 and not agent.is_processing)
+            assert "summary: plan received" in _assistant_text(agent)
             # The planner sub-agent's own LLM output routed back.
             convo_text2 = " ".join(
                 m.get_text_content()
@@ -1133,8 +1139,9 @@ class TestCoreIntegration:
             # exact suffix, so a green turn here PROVES the rewrite
             # reached ``spawn_from_event``.
             agent.plugins.register(_SubagentGatePlugin("planner"))
-            out3 = await _drain_chat(creature, "gated rerun please")
-            assert "summary: gated run complete" in out3
+            await _drain_chat(creature, "gated rerun please")
+            await _settle(lambda: agent.llm.call_count == 6 and not agent.is_processing)
+            assert "summary: gated run complete" in _assistant_text(agent)
             convo_text3 = " ".join(
                 m.get_text_content()
                 for m in agent.controller.conversation.get_messages()
@@ -1458,10 +1465,7 @@ class TestCoreIntegration:
             # turn keyed on it.
             out_bg = await _drain_chat(creature, "fail bg now")
             assert "kicked off failing bg" in out_bg
-            for _ in range(100):
-                if "noticed bg failure" in _assistant_text(agent):
-                    break
-                await asyncio.sleep(0.02)
+            await _settle(lambda: "noticed bg failure" in _assistant_text(agent))
             assert "noticed bg failure" in _assistant_text(agent)
             # The executor recorded an ERROR job for the raising bg tool.
             bgboom_status = next(
@@ -1794,10 +1798,9 @@ class TestCoreIntegration:
             assert folded is False
             agent.resume()
             await delivered
-            for _ in range(500):
-                if agent._turn_index == turn_before + 1 and not agent.is_processing:
-                    break
-                await asyncio.sleep(0.01)
+            await _settle(
+                lambda: agent._turn_index == turn_before + 1 and not agent.is_processing
+            )
             assert "channel turn reply" in _assistant_text(agent)
             opened = [
                 (event["type"], event.get("content"), event["turn_index"])
@@ -2570,10 +2573,7 @@ class TestCoreIntegration:
 
             # Wait for the trigger to fire and its event to drive a turn.
             await asyncio.wait_for(trig.fired.wait(), timeout=5.0)
-            for _ in range(100):
-                if "trigger handled" in _assistant_text(agent):
-                    break
-                await asyncio.sleep(0.02)
+            await _settle(lambda: "trigger handled" in _assistant_text(agent))
             assert "trigger handled" in _assistant_text(agent)
             assert agent.llm.call_count == 3
             # The trigger-fired turn is a non-user-input event: turn_index
