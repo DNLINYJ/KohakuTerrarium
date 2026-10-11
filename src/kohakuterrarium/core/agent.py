@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from kohakuterrarium.bootstrap.agent_init import AgentInitMixin
 from kohakuterrarium.bootstrap.plugins import init_plugins
 from kohakuterrarium.core.agent_budget_recovery import (
+    attach_recovery_hooks,
     sync_emergency_drop_conversation,
 )
 from kohakuterrarium.core.agent_compact import (
@@ -32,10 +33,6 @@ from kohakuterrarium.core.agent_observability import (
 )
 from kohakuterrarium.core.agent_selection import track_plugin_selection
 from kohakuterrarium.core.agent_turn import AgentTurnMixin
-from kohakuterrarium.core.agent_budget_recovery import (
-    attach_recovery_hooks,
-    sync_emergency_drop_conversation,
-)
 from kohakuterrarium.core.branch_continuation import (
     continue_on_branch,
     normalize_branch_view,

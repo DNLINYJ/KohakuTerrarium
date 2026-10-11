@@ -1,17 +1,68 @@
 """Retired-file routing is published only after destination durability."""
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 
 from kohakuterrarium.errors import SessionNotResumableError
+from kohakuterrarium.core.config_types import AgentConfig
+from kohakuterrarium.modules.plugin.base import BasePlugin
+from kohakuterrarium.session.resume import _load_conversation_with_replay_fallback
 from kohakuterrarium.session.readonly_view import SessionReadView
 from kohakuterrarium.session.resume_target import resolve_resume_path
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.terrarium.engine import Terrarium
+from kohakuterrarium.testing.llm import ScriptedLLM
 from kohakuterrarium.terrarium.session_successor import (
     publish_successors,
     stage_successor,
 )
+
+
+class _InputGate(BasePlugin):
+    name = "input_gate"
+
+    def __init__(self):
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def on_event(self, event, context=None):
+        if event.content == "second input":
+            self.entered.set()
+            await self.release.wait()
+
+
+async def test_graph_checkpoint_preserves_input_recorded_before_plugin_returns(
+    tmp_path,
+):
+    gate = _InputGate()
+    async with Terrarium(session_dir=tmp_path / "sessions") as engine:
+        creature = await engine.add_creature(
+            AgentConfig(name="alice", system_prompt="plain"),
+            llm=ScriptedLLM(["first answer", "second answer"]),
+            plugins=[gate],
+            io="headless",
+            start=True,
+        )
+        await creature.run("first input", timeout=5)
+        pending = asyncio.create_task(creature.run("second input", timeout=5))
+        try:
+            await asyncio.wait_for(gate.entered.wait(), 3)
+            publish_successors(engine, creature.graph_id)
+            store = SessionStore.open_readonly(creature.agent.session_store.path)
+            try:
+                restored = _load_conversation_with_replay_fallback(store, "alice")
+                assert [
+                    message["content"]
+                    for message in restored
+                    if message["role"] == "user"
+                ] == ["first input", "second input"]
+            finally:
+                store.close()
+        finally:
+            gate.release.set()
+            await pending
 
 
 def test_pending_unowned_source_uses_live_members_and_survives_failed_checkpoint(

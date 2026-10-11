@@ -12,8 +12,13 @@ from kohakuvault import KVault
 
 from kohakuterrarium.session.artifacts import artifacts_dir_for
 from kohakuterrarium.session.errors import ForkNotStableError
-from kohakuterrarium.session.store_protocol import SessionStoreLike
+from kohakuterrarium.session.history import (
+    InvalidBranchViewError,
+    _coerce_branch_view,
+    resolve_branch_view_strict,
+)
 from kohakuterrarium.session.identity import new_conversation_id
+from kohakuterrarium.session.store_protocol import SessionStoreLike
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -111,6 +116,29 @@ def _copy_table(src: KVault, dst: KVault, keys: list[str] | None = None) -> int:
                 exc_info=True,
             )
     return written
+
+
+def _copy_branch_views(source: SessionStoreLike, dest: SessionStoreLike) -> None:
+    """Project persisted selections onto the child's surviving user history."""
+    for key in _iter_keys(source.state):
+        if not key.endswith(":branch_view"):
+            continue
+        events = dest.get_events(key.removesuffix(":branch_view"))
+        pairs = {
+            (event.get("turn_index"), event.get("branch_id"))
+            for event in events
+            if event.get("type") in ("user_message", "user_input")
+        }
+        try:
+            requested = _coerce_branch_view(source.state[key])
+            surviving = {t: b for t, b in requested.items() if (t, b) in pairs}
+            selected = (
+                resolve_branch_view_strict(events, surviving) if surviving else {}
+            )
+        except InvalidBranchViewError:
+            continue
+        if selected:
+            dest.state[key] = {str(t): b for t, b in selected.items()}
 
 
 def _build_lineage(
@@ -397,7 +425,12 @@ def perform_fork(
             k
             for k in _iter_keys(source.state)
             if not k.endswith(
-                (":snapshot_event_id", ":snapshot_branch", ":branch_snapshots")
+                (
+                    ":snapshot_event_id",
+                    ":snapshot_branch",
+                    ":branch_snapshots",
+                    ":branch_view",
+                )
             )
         ]
         _copy_table(source.state, dest.state, keys=state_keys)
@@ -417,6 +450,8 @@ def perform_fork(
         dest._subagent_runs.clear()
         dest._global_event_id = 0
         dest._restore_counters()
+        _copy_branch_views(source, dest)
+        dest.flush()
     except Exception:
         try:
             dest.close(update_status=False)

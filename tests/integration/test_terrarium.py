@@ -136,6 +136,14 @@ def _agent_config(name: str, tmp_path: Path) -> AgentConfig:
     )
 
 
+def _dialogue(creature):
+    return [
+        message
+        for message in creature.agent.controller.conversation.to_messages()
+        if message["role"] != "system"
+    ]
+
+
 @pytest.fixture
 async def make_service(patched_llm, tmp_path):
     """Build a real ``Terrarium`` wrapped in ``LocalTerrariumService``
@@ -930,6 +938,7 @@ class TestTerrariumIntegration:
         # complete graph, not resurrect a standalone creature's stale snapshot.
         restart_dir = tmp_path / "cold-restart"
         original_paths = []
+        expected_histories = {}
         async with Terrarium(session_dir=restart_dir) as before_restart:
             workers = []
             for name in ("reader", "writer"):
@@ -941,10 +950,22 @@ class TestTerrariumIntegration:
                     before_restart._session_stores[worker.graph_id].path
                 )
                 await worker.run("before merging", timeout=5)
+                user_index = next(
+                    index
+                    for index, message in enumerate(
+                        worker.agent.controller.conversation.to_messages()
+                    )
+                    if message["role"] == "user"
+                )
+                assert await worker.agent.edit_and_rerun(
+                    user_index, "sibling before merging"
+                )
+                await worker.agent.inject_input(
+                    "original continuation", branch_view={1: 1}
+                )
+                expected_histories[worker.config.name] = _dialogue(worker)
             connected = await before_restart.connect(*workers, channel="team")
             current_path = before_restart._session_stores[connected.graph_id].path
-            for worker in workers:
-                await worker.run("latest after merging", timeout=5)
             expected_ids = {worker.creature_id for worker in workers}
         for old_path in original_paths:
             assert resolve_resume_path(old_path) == Path(current_path)
@@ -954,13 +975,39 @@ class TestTerrariumIntegration:
                     c.creature_id for c in restored.list_creatures()
                 } == expected_ids
                 for worker in restored.list_creatures():
-                    assert "latest after merging" in str(
-                        worker.agent.controller.conversation.to_messages()
-                    )
+                    assert _dialogue(worker) == expected_histories[worker.config.name]
                     assert worker.agent._turn_index == 2
                 # Repeated resume attaches to the existing canonical graph.
                 assert await restored.adopt_session(old_path) == connected.graph_id
                 assert len(restored.list_creatures()) == 2
+        async with Terrarium(session_dir=restart_dir) as merged:
+            await merged.adopt_session(current_path)
+            members = sorted(merged.list_creatures(), key=lambda c: c.config.name)
+            for member in members:
+                await member.run("latest after merging", timeout=5)
+                expected_histories[member.config.name] = _dialogue(member)
+            disconnected = await merged.disconnect(*members, channel="team")
+            assert disconnected.delta_kind == "split"
+            split_paths = {
+                member.config.name: merged._session_stores[member.graph_id].path
+                for member in members
+            }
+        for name, path in split_paths.items():
+            cold = await Terrarium.resume(path)
+            async with cold:
+                member = next(c for c in cold.list_creatures() if c.config.name == name)
+                assert _dialogue(member) == expected_histories[name]
+                await member.run("after split resume", timeout=5)
+                assert [
+                    message["content"]
+                    for message in member.agent.controller.conversation.to_messages()
+                    if message["role"] == "user"
+                ] == [
+                    "before merging",
+                    "original continuation",
+                    "latest after merging",
+                    "after split resume",
+                ]
 
     async def test_split_drive_lifecycle_no_repo_race(
         self, make_service, tmp_path, monkeypatch
