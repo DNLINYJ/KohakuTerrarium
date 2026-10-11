@@ -35,6 +35,18 @@ MAX_TOOL_GUIDANCE_CHARS = 600
 BACKGROUND_CAPABLE = {"bash", "python", "web_fetch", "web_search"}
 
 
+@pytest.fixture
+def reference_workspace(tmp_path, monkeypatch):
+    """Provide an empty user home and working directory for the reference agent."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    return workspace
+
+
 def _measure(agent, mode):
     """Return (framework_chars, schemas) for one built agent."""
     base = agent.config.system_prompt
@@ -49,7 +61,7 @@ def _measure(agent, mode):
 
 class TestPromptBudget:
     @pytest.mark.asyncio
-    async def test_framework_payload_stays_within_budget(self):
+    async def test_framework_payload_stays_within_budget(self, reference_workspace):
         config = load_agent_config(str(FIXTURE))
         assert config.tool_format == "native"
         # kt-biome ships `full`; both modes are measured explicitly below so
@@ -59,7 +71,11 @@ class TestPromptBudget:
         # ── standard: the lean mode ────────────────────────────────────
         config.tool_doc_mode = "standard"
         agent = await Agent.build(
-            config, llm=ScriptedLLM(["ok"]), io="headless", strict=False
+            config,
+            llm=ScriptedLLM(["ok"]),
+            pwd=str(reference_workspace),
+            io="headless",
+            strict=False,
         )
         try:
             standard_chars, schemas = _measure(agent, "standard")
@@ -77,6 +93,7 @@ class TestPromptBudget:
             # not repeat it, in prose or as a sub-agent list.
             assert "## Available Functions" not in prompt
             assert "## Available Sub-Agents" not in prompt
+            assert "## Skills" not in prompt
 
             # No call-syntax prose for a format that has none.
             assert "## Calling functions" not in prompt
@@ -115,7 +132,11 @@ class TestPromptBudget:
         # ── full: every usage tier inlined; the shipped default ────────
         config.tool_doc_mode = "full"
         agent = await Agent.build(
-            config, llm=ScriptedLLM(["ok"]), io="headless", strict=False
+            config,
+            llm=ScriptedLLM(["ok"]),
+            pwd=str(reference_workspace),
+            io="headless",
+            strict=False,
         )
         try:
             full_chars, _ = _measure(agent, "full")
@@ -132,7 +153,9 @@ class TestPromptBudget:
             await agent.stop()
 
     @pytest.mark.asyncio
-    async def test_per_tool_full_override_costs_only_that_tool(self):
+    async def test_per_tool_full_override_costs_only_that_tool(
+        self, reference_workspace
+    ):
         # A creature on `standard` can still opt one tool into the usage tier,
         # and pays for that tool alone.
         config = load_agent_config(str(FIXTURE))
@@ -141,7 +164,11 @@ class TestPromptBudget:
             entry.doc_mode = "full" if entry.name == "multi_edit" else None
 
         agent = await Agent.build(
-            config, llm=ScriptedLLM(["ok"]), io="headless", strict=False
+            config,
+            llm=ScriptedLLM(["ok"]),
+            pwd=str(reference_workspace),
+            io="headless",
+            strict=False,
         )
         try:
             prompt = agent._controller_config.system_prompt
