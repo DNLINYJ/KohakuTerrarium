@@ -196,6 +196,7 @@ class TestApplyRecipe:
             )
             # Per-creature direct channel auto-added.
             assert "alice" in graph.channels
+            assert graph.channels["alice"].direct is True
             # Auto-listen on own channel.
             alice = engine.get_creature("alice")
             assert "alice" in alice.listen_channels
@@ -210,12 +211,15 @@ class TestApplyRecipe:
                     _creature_cfg("alice", listen=["chat"], send=["chat"]),
                     _creature_cfg("bob", listen=["chat"]),
                 ],
-                channels=[ChannelConfig(name="chat")],
+                channels=[ChannelConfig(name="chat"), ChannelConfig(name="bob")],
             )
             graph = await recipe_mod.apply_recipe(
                 engine, r, creature_builder=_fake_builder
             )
             assert "chat" in graph.channels
+            assert graph.channels["chat"].direct is False
+            # A declared channel that shares a creature's name stays designed.
+            assert graph.channels["bob"].direct is False
             alice = engine.get_creature("alice")
             assert "chat" in alice.send_channels
         finally:

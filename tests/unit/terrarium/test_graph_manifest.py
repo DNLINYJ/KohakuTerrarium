@@ -139,6 +139,64 @@ class TestGraphManifest:
         assert payload["creatures"][0]["config_name"] == "alice-config"
         assert payload["creatures"][0]["config_ref"] == "@pkg/alice"
 
+    def test_direct_flag_round_trips_and_is_only_written_when_set(self):
+        raw = _raw_manifest(
+            channels=[
+                {"name": "alice", "description": "Inbox", "direct": True},
+                {"name": "tasks", "description": "Work"},
+            ],
+        )
+
+        payload = manifest_to_dict(parse_manifest(raw))
+
+        assert payload["channels"] == [
+            {"name": "alice", "description": "Inbox", "direct": True},
+            {"name": "tasks", "description": "Work"},
+        ]
+        assert manifest_to_dict(parse_manifest(payload)) == payload
+
+    def test_legacy_recipe_direct_channel_is_backfilled_but_designed_one_is_not(
+        self,
+    ):
+        raw = _raw_manifest(
+            creatures=[
+                _creature_row("creature_a", "alice"),
+                _creature_row("creature_b", "deploy"),
+            ],
+            channels=[
+                {"name": "alice", "description": "Direct channel to alice"},
+                {"name": "deploy", "description": "Deployment planning"},
+                {"name": "ghost", "description": "Direct channel to ghost"},
+            ],
+            listen=[],
+            send=[],
+        )
+
+        channels = {c.name: c.direct for c in parse_manifest(raw).channels}
+
+        assert channels == {"alice": True, "deploy": False, "ghost": False}
+
+    def test_explicit_false_overrides_the_legacy_backfill(self):
+        raw = _raw_manifest(
+            channels=[
+                {
+                    "name": "alice",
+                    "description": "Direct channel to alice",
+                    "direct": False,
+                }
+            ],
+            listen=[],
+            send=[],
+        )
+
+        assert parse_manifest(raw).channels[0].direct is False
+
+    def test_rejects_non_boolean_direct(self):
+        raw = _raw_manifest(channels=[{"name": "tasks", "direct": "yes"}])
+
+        with pytest.raises(GraphManifestError, match=r"channels\[0\]\.direct"):
+            parse_manifest(raw)
+
     @pytest.mark.parametrize(
         ("change", "field"),
         [
@@ -229,6 +287,7 @@ class TestGraphManifest:
             graph_id="graph_test",
             creature_ids={"creature_root", "creature_child"},
             channels={
+                "child": ChannelInfo("child", "Inbox", direct=True),
                 "empty": ChannelInfo("empty", "No edges"),
                 "tasks": ChannelInfo("tasks", "Work"),
             },
@@ -250,6 +309,7 @@ class TestGraphManifest:
 
         assert payload["revision"] == 4
         assert payload["channels"] == [
+            {"name": "child", "description": "Inbox", "direct": True},
             {"name": "empty", "description": "No edges"},
             {"name": "tasks", "description": "Work"},
         ]

@@ -92,6 +92,12 @@ class TestChannelInfoRoundTrip:
     def test_missing_description_default(self):
         out = unpack_channel_info({"name": "ch"})
         assert out.description == ""
+        assert out.direct is False
+
+    def test_direct_flag_survives_the_wire(self):
+        c = ChannelInfo(name="alice", description="d", direct=True)
+        assert pack_channel_info(c)["direct"] is True
+        assert unpack_channel_info(pack_channel_info(c)) == c
 
 
 # ── GraphTopology round-trip ────────────────────────────────────

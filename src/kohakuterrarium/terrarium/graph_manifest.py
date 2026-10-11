@@ -12,6 +12,7 @@ from kohakuterrarium.errors import (
     GraphManifestVersionError,
     SessionNotResumableError,
 )
+from kohakuterrarium.terrarium.topology import is_legacy_direct_channel
 
 if TYPE_CHECKING:
     from kohakuterrarium.session.store import SessionStore
@@ -47,6 +48,7 @@ class ManifestChannel:
 
     name: str
     description: str = ""
+    direct: bool = False
 
 
 @dataclass(frozen=True)
@@ -132,15 +134,29 @@ def _parse_creature(value: object, index: int) -> ManifestCreature:
     )
 
 
-def _parse_channel(value: object, index: int) -> ManifestChannel:
+def _parse_channel(
+    value: object, index: int, creature_names: set[str]
+) -> ManifestChannel:
     prefix = f"channels[{index}]"
     data = _mapping(value, prefix)
-    return ManifestChannel(
-        name=_string(_required(data, "name"), f"{prefix}.name"),
-        description=_string(
-            data.get("description", ""), f"{prefix}.description", allow_empty=True
-        ),
+    name = _string(_required(data, "name"), f"{prefix}.name")
+    description = _string(
+        data.get("description", ""), f"{prefix}.description", allow_empty=True
     )
+    if "direct" in data:
+        direct = data["direct"]
+        if type(direct) is not bool:
+            raise _error("expected a boolean", f"{prefix}.direct")
+    else:
+        direct = is_legacy_direct_channel(name, description, creature_names)
+    return ManifestChannel(name=name, description=description, direct=direct)
+
+
+def _channel_dict(channel: Any) -> dict[str, Any]:
+    out: dict[str, Any] = {"name": channel.name, "description": channel.description}
+    if channel.direct:
+        out["direct"] = True
+    return out
 
 
 def _parse_edge(value: object, index: int, field: str) -> tuple[str, str]:
@@ -236,10 +252,11 @@ def parse_manifest(raw: object) -> GraphManifest:
             key=lambda creature: creature.creature_id,
         )
     )
+    creature_names = {creature.name for creature in creatures}
     channels = tuple(
         sorted(
             (
-                _parse_channel(value, index)
+                _parse_channel(value, index, creature_names)
                 for index, value in enumerate(_parse_sequence(data, "channels"))
             ),
             key=lambda channel: channel.name,
@@ -301,10 +318,7 @@ def manifest_to_dict(manifest: GraphManifest) -> dict[str, Any]:
                 }
                 for creature in manifest.creatures
             ],
-            "channels": [
-                {"name": channel.name, "description": channel.description}
-                for channel in manifest.channels
-            ],
+            "channels": [_channel_dict(channel) for channel in manifest.channels],
             "listen": [list(edge) for edge in manifest.listen],
             "send": [list(edge) for edge in manifest.send],
         }
@@ -328,10 +342,7 @@ def manifest_to_dict(manifest: GraphManifest) -> dict[str, Any]:
             }
             for creature in canonical.creatures
         ],
-        "channels": [
-            {"name": channel.name, "description": channel.description}
-            for channel in canonical.channels
-        ],
+        "channels": [_channel_dict(channel) for channel in canonical.channels],
         "listen": [list(edge) for edge in canonical.listen],
         "send": [list(edge) for edge in canonical.send],
     }
@@ -408,10 +419,7 @@ def capture_manifest(
         "revision": revision,
         "graph_id": graph_id,
         "creatures": creatures,
-        "channels": [
-            {"name": channel.name, "description": channel.description}
-            for channel in graph.channels.values()
-        ],
+        "channels": [_channel_dict(channel) for channel in graph.channels.values()],
         "listen": [
             [creature_id, channel]
             for creature_id, channels in graph.listen_edges.items()

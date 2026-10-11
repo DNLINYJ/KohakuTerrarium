@@ -861,6 +861,7 @@ def _channels_for_graph(engine: Terrarium, graph: GraphTopology) -> list[dict]:
                 "name": name,
                 "type": "broadcast",
                 "description": description or "",
+                "direct": bool(getattr(topo_info, "direct", False)),
                 "qsize": int(getattr(runtime_channel, "qsize", 0) or 0),
                 "message_count": len(history),
             }

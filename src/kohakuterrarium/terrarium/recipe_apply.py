@@ -157,7 +157,8 @@ async def _declare_channels(
             await engine.add_channel(
                 graph_id,
                 creature.name,
-                description=f"Direct channel to {creature.name}",
+                description=_topo.direct_channel_description(creature.name),
+                direct=True,
             )
             transaction.record_channel(graph_id, creature.name)
 

@@ -246,6 +246,21 @@ class TestChannelsForGraph:
         out = rg_mod._channels_for_graph(engine, graph)
         assert out[0]["name"] == "chat"
         assert out[0]["description"] == "x"
+        assert out[0]["direct"] is False
+
+    def test_reports_direct_channels(self):
+        graph = GraphTopology(
+            graph_id="g",
+            channels={
+                "alice": ChannelInfo(name="alice", direct=True),
+                "deploy": ChannelInfo(name="deploy", description="ops"),
+            },
+        )
+        engine = _FakeEngine(graphs=[graph])
+        out = {
+            c["name"]: c["direct"] for c in rg_mod._channels_for_graph(engine, graph)
+        }
+        assert out == {"alice": True, "deploy": False}
 
     def test_with_runtime_channel(self):
         graph = GraphTopology(

@@ -104,6 +104,43 @@ class TestReplayFailureAtomicity:
             store.close()
 
 
+class TestDirectFlag:
+    async def test_direct_flag_is_saved_and_replayed(self, tmp_path):
+        t, gid, store = await _engine_with_creature(tmp_path)
+        try:
+            await t.add_channel(gid, "plain", description="p")
+            await t.add_channel(gid, "inbox", description="i", direct=True)
+            topo_snap.snapshot(t, gid)
+            saved = {c["name"]: c for c in store.meta[topo_snap.META_KEY]["channels"]}
+            assert saved["inbox"] == {
+                "name": "inbox",
+                "description": "i",
+                "direct": True,
+            }
+            assert saved["plain"] == {"name": "plain", "description": "p"}
+        finally:
+            await t.shutdown()
+            store.close()
+
+        t, gid, store = await _engine_with_creature(tmp_path)
+        try:
+            store.meta[topo_snap.META_KEY] = {
+                "channels": [
+                    {"name": "inbox", "description": "i", "direct": True},
+                    {"name": "plain", "description": "p", "direct": "yes"},
+                ],
+                "listen_edges": {},
+                "send_edges": {},
+            }
+            await topo_snap.replay(t, gid)
+            channels = t.get_graph(gid).channels
+            assert channels["inbox"].direct is True
+            assert channels["plain"].direct is False
+        finally:
+            await t.shutdown()
+            store.close()
+
+
 class TestMalformedMetadataDefense:
     async def test_malformed_edge_value_is_ignored_not_fatal(self, tmp_path):
         # Stale / hand-damaged persisted metadata must degrade to
