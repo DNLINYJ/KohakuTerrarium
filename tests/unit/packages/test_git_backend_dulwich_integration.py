@@ -25,6 +25,8 @@ import shutil
 from pathlib import Path
 
 import pytest
+from dulwich import porcelain
+from dulwich.repo import Repo
 
 from kohakuterrarium.packages import git_backend
 
@@ -42,6 +44,16 @@ def _force_dulwich(monkeypatch):
     git_backend._reset_backend_cache_for_tests()
 
 
+@pytest.fixture(params=["master", "main", "topic"], autouse=True)
+def _git_default_branch(request, tmp_path, monkeypatch):
+    """Set init.defaultBranch via temporary Git config."""
+    config_file = tmp_path / "gitconfig"
+    config_file.write_text(f"[init]\n\tdefaultBranch = {request.param}\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config_file))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    return request.param
+
+
 def _build_bare_repo(tmp_path: Path) -> tuple[str, dict[str, str]]:
     """Create a local bare repo with two commits, a tag, and a branch.
 
@@ -50,14 +62,15 @@ def _build_bare_repo(tmp_path: Path) -> tuple[str, dict[str, str]]:
     URL is just the absolute path — dulwich's local-clone accepts
     plain paths.
     """
-    from dulwich import porcelain
-    from dulwich.repo import Repo
-
     bare = tmp_path / "origin.git"
-    porcelain.init(str(bare), bare=True)
+    bare_repo = porcelain.init(str(bare), bare=True)
+    bare_repo.refs.set_symbolic_ref(b"HEAD", b"refs/heads/master")
+    bare_repo.close()
 
     work = tmp_path / "work"
-    porcelain.clone(str(bare), str(work))
+    work_repo = porcelain.clone(str(bare), str(work))
+    work_repo.refs.set_symbolic_ref(b"HEAD", b"refs/heads/master")
+    work_repo.close()
 
     author = b"Test <test@example.com>"
 
@@ -92,7 +105,9 @@ def _build_bare_repo(tmp_path: Path) -> tuple[str, dict[str, str]]:
     # Feature branch off v1 with its own commit, then push.
     porcelain.branch_create(str(work), "feature", objectish=sha_v1)
     porcelain.update_head(str(work), "feature")
-    porcelain.reset(Repo(str(work)), "hard", sha_v1.encode())
+    reset_repo = Repo(str(work))
+    porcelain.reset(reset_repo, "hard", sha_v1.encode())
+    reset_repo.close()
     (work / "feature.txt").write_text("on a feature branch")
     porcelain.add(str(work), [str(work / "feature.txt")])
     porcelain.commit(str(work), message=b"feature", author=author, committer=author)
