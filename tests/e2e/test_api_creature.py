@@ -756,7 +756,7 @@ class TestApiCreatureJourney:
     ) -> None:
         """One whole UI session: create + run a turn → saved-session
         list → on-disk history index + per-target read → viewer turns
-        + events → stop → resume → delete."""
+        + events → stop → resume → start → delete."""
         # Create + run a turn over the HTTP chat fallback so the
         # ``.kohakutr`` store fills (frontend: agentAPI.create then a
         # chat POST when the WS path is unavailable).
@@ -851,6 +851,10 @@ class TestApiCreatureJourney:
         assert resumed["type"] == "agent"
         assert resumed["session_name"] == "alice"
         resumed_id = resumed["instance_id"]
+        resumed_creature_id = resumed["session"]["creatures"][0]["creature_id"]
+        resp = client.get(f"/api/sessions/active/{resumed_id}")
+        assert resp.status_code == 200
+        assert resp.json()["creatures"][0]["running"] is False
 
         resp = client.get(
             f"/api/sessions/{resumed_id}/memory/search",
@@ -862,8 +866,8 @@ class TestApiCreatureJourney:
             for result in resp.json()["results"]
         )
 
-        # The resumed session is live again in the active list, and its
-        # restored conversation still carries the original turn.
+        # The restored session is registered in the active list, and its
+        # conversation still carries the original turn.
         resp = client.get("/api/sessions/active")
         assert resp.status_code == 200
         assert [s["session_id"] for s in resp.json()] == [resumed_id]
@@ -883,8 +887,17 @@ class TestApiCreatureJourney:
         }
         assert turn1_branches == {1}
 
-        # The resumed creature accepts a fresh chat turn — proving the
-        # rebuilt agent is fully live, not a frozen snapshot.
+        resp = client.post(f"/api/sessions/{resumed_id}/creatures/alice/start")
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "status": "started",
+            "creature_id": resumed_creature_id,
+        }
+        resp = client.get(f"/api/sessions/active/{resumed_id}")
+        assert resp.status_code == 200
+        assert resp.json()["creatures"][0]["running"] is True
+
+        # The started creature accepts a fresh chat turn.
         resp = client.post(
             f"/api/sessions/{resumed_id}/creatures/alice/chat",
             json={"message": "post-resume turn"},
