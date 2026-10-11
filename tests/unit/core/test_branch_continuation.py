@@ -14,6 +14,7 @@ from kohakuterrarium.core.branch_continuation import (
     selected_branch_view,
 )
 from kohakuterrarium.core.config_types import AgentConfig
+from kohakuterrarium.core.events import EventType, TriggerEvent
 from kohakuterrarium.errors import AgentNotRunningError, ConflictError
 from kohakuterrarium.llm.base import NativeToolCall
 from kohakuterrarium.modules.tool.base import BaseTool, ExecutionMode, ToolResult
@@ -259,6 +260,77 @@ async def test_same_branch_paused_input_runs_after_resume(
         ]
         assert ("assistant", "queued") in _non_system(agent)
     finally:
+        await engine.__aexit__(None, None, None)
+
+
+def _user_events(agent):
+    return [
+        (event["type"], event.get("content"), event["turn_index"], event["branch_id"])
+        for event in agent.session_store.get_events("alice")
+        if event.get("type") in ("user_input", "user_message", "user_input_injected")
+    ]
+
+
+async def test_user_input_folded_behind_a_channel_message_opens_its_turn(tmp_path):
+    engine, creature, agent, provider = await _started(
+        tmp_path, ["A1", "A2", "A3", "A4"], barrier_on_call=2
+    )
+    try:
+        await creature.run("U1", timeout=8)
+        attach_view = selected_branch_view(agent)
+        agent.pause()
+        channel = TriggerEvent(
+            type=EventType.CHANNEL_MESSAGE,
+            content="[channel team] bob: done",
+            context={"channel": "team", "sender": "bob"},
+            stackable=True,
+        )
+        delivered = asyncio.create_task(agent._process_event(channel))
+        await asyncio.sleep(0)
+        folded = await agent.inject_input(
+            "U2", source="web", pending_id="p-u2", branch_view=attach_view
+        )
+        assert folded is False
+        agent.resume()
+        await asyncio.wait_for(provider.entered.wait(), 2)
+        assert live_branch_path(agent) == {1: 1, 2: 1}
+        queued = await agent.inject_input(
+            "Q", source="web", pending_id="p-q", branch_view=attach_view
+        )
+        assert queued is False
+        provider.release.set()
+        await delivered
+        for _ in range(100):
+            if provider.call_count == 3 and not agent.is_processing:
+                break
+            await asyncio.sleep(0.02)
+        assert load_persisted_branch_view(agent.session_store, "alice") == {
+            1: 1,
+            2: 1,
+        }
+        assert await agent.inject_input("U3", source="web", branch_view=attach_view)
+        assert _user_events(agent) == [
+            ("user_input", "U1", 1, 1),
+            ("user_message", "U1", 1, 1),
+            ("user_input", "U2", 2, 1),
+            ("user_message", "U2", 2, 1),
+            ("user_input_injected", "Q", 2, 1),
+            ("user_input", "U3", 3, 1),
+            ("user_message", "U3", 3, 1),
+        ]
+        live = _non_system(agent)
+        assert live[2:] == [
+            ("user", "[channel_message] [channel team] bob: done\n\nU2"),
+            ("assistant", "A2"),
+            ("user", "Q"),
+            ("assistant", "A3"),
+            ("user", "U3"),
+            ("assistant", "A4"),
+        ]
+        agent._reload_conversation_under_branch_view(live_branch_path(agent))
+        assert _non_system(agent) == live
+    finally:
+        provider.release.set()
         await engine.__aexit__(None, None, None)
 
 

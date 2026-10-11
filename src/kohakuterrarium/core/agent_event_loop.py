@@ -232,11 +232,17 @@ class AgentEventLoopMixin:
         # completion claimed in the same batch), so the folded message is
         # stamped under the new (turn_index, branch_id), not the previous
         # turn's stale ids. A rerun primary keeps its pre-incremented branch.
-        if not is_rerun and any(_is_fresh_user_input(e) for e in events):
+        # The first fresh user_input opens the turn even when folded behind a
+        # non-user primary, so the branch tree records the turn it advanced to.
+        opener = (
+            None
+            if is_rerun
+            else next((e for e in events if _is_fresh_user_input(e)), None)
+        )
+        if opener is not None:
             self._advance_turn_for_user_input()
-        if primary.type == "user_input" and not is_rerun:
             if self.session_store is not None:
-                await self._record_primary_user_input(primary)
+                await self._record_primary_user_input(opener)
 
         if (
             primary.type == "user_input"
@@ -264,7 +270,7 @@ class AgentEventLoopMixin:
         # combined delivery banner below instead).
         for evt in events[1:]:
             if evt.type in ("user_input", "trigger"):
-                await self._record_folded_user_event(evt)
+                await self._record_folded_user_event(evt, opens_turn=evt is opener)
 
         self._emit_batch_background_banner(events)
 
@@ -302,12 +308,17 @@ class AgentEventLoopMixin:
             ppath,
         )
 
-    async def _record_folded_user_event(self, evt) -> None:
+    async def _record_folded_user_event(self, evt, *, opens_turn: bool = False) -> None:
         """Record + notify one folded user_input/trigger event so the FE
-        pops its queued banner and replay shows it as its own bubble."""
+        pops its queued banner and replay shows it as its own bubble.
+
+        ``opens_turn``: the event is the turn opener, already recorded as the
+        turn's ``user_input`` pair, so only the frame is sent.
+        """
         content = _to_serializable_content(self._resolve_injected_content(evt))
         pending_id = pending_id_of(evt)
-        await self._record_injected_input_event(content, pending_id=pending_id)
+        if not opens_turn:
+            await self._record_injected_input_event(content, pending_id=pending_id)
         metadata = {
             "content": content,
             "turn_index": self._turn_index,

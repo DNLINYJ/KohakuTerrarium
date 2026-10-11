@@ -156,6 +156,7 @@ class TestBatchingInvariants:
         agent = make_agent()
         agent.attach_session_store(store)
         await agent.start()
+        frames = _spy_activities(agent)
         try:
             before = agent._turn_index
             folded_user = create_user_input_event("hi there")
@@ -171,17 +172,21 @@ class TestBatchingInvariants:
                 "a fresh user_input in the batch must advance the turn even "
                 "when folded behind a non-user primary"
             )
-            injected = [
-                e
+            # The folded input opens the turn: it is recorded as the turn's
+            # user_input pair (the branch tree's turn record), not as injected.
+            records = [
+                (e["type"], e.get("pending_id"), e["turn_index"], e["branch_id"])
                 for e in store.get_events("q_agent")
-                if e["type"] == "user_input_injected"
+                if e["type"] in ("user_input", "user_message", "user_input_injected")
             ]
-            assert len(injected) == 1
-            assert injected[0]["pending_id"] == "c_folded"
-            assert injected[0]["turn_index"] == before + 1, (
-                "the folded user_input's session record must carry the NEW "
-                "turn_index, not the previous turn's"
-            )
+            assert records == [
+                ("user_input", "c_folded", before + 1, 1),
+                ("user_message", "c_folded", before + 1, 1),
+            ]
+            injected_frames = [f for f in frames if f[0] == "user_input_injected"]
+            assert len(injected_frames) == 1
+            assert injected_frames[0][1]["pending_id"] == "c_folded"
+            assert injected_frames[0][1]["turn_index"] == before + 1
         finally:
             await agent.stop()
             store.close()

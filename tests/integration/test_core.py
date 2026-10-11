@@ -1553,6 +1553,8 @@ class TestCoreIntegration:
                 ScriptEntry("second turn reply", match="second question"),
                 ScriptEntry("turn2 regen reply", match="second question"),
                 ScriptEntry("continued original", match="continue original"),
+                ScriptEntry("channel turn reply", match="queued behind channel"),
+                ScriptEntry("after channel reply", match="after channel turn"),
             ]
         )
         agent = creature.agent
@@ -1771,6 +1773,51 @@ class TestCoreIntegration:
             assert persisted[1] == 1
             assert selected_branch_view(agent)[1] == 1
             assert agent._max_branch_id_for_turn(1) >= 2
+
+            # --- a user message folded behind a channel message ---------
+            # It opens the turn, so a later input with an older view continues it.
+            stale_view = selected_branch_view(agent)
+            turn_before = agent._turn_index
+            agent.pause()
+            channel = TriggerEvent(
+                type=EventType.CHANNEL_MESSAGE,
+                content="[channel team] bob: team done",
+                context={"channel": "team", "sender": "bob"},
+                stackable=True,
+            )
+            delivered = asyncio.create_task(agent._process_event(channel))
+            await asyncio.sleep(0)
+            folded = await agent.inject_input(
+                "queued behind channel", source="web", branch_view=stale_view
+            )
+            assert folded is False
+            agent.resume()
+            await delivered
+            for _ in range(500):
+                if agent._turn_index == turn_before + 1 and not agent.is_processing:
+                    break
+                await asyncio.sleep(0.01)
+            assert "channel turn reply" in _assistant_text(agent)
+            opened = [
+                (event["type"], event.get("content"), event["turn_index"])
+                for event in store.get_events(agent.config.name)
+                if event["type"] in ("user_input", "user_message")
+            ][-2:]
+            assert opened == [
+                ("user_input", "queued behind channel", turn_before + 1),
+                ("user_message", "queued behind channel", turn_before + 1),
+            ]
+            await agent.inject_input(
+                "after channel turn", source="web", branch_view=stale_view
+            )
+            assert "after channel reply" in _assistant_text(agent)
+            assert agent._turn_index == turn_before + 2
+            kept = [
+                message.get_text_content()
+                for message in agent.controller.conversation.get_messages()
+                if message.role == "assistant"
+            ]
+            assert kept[-2:] == ["channel turn reply", "after channel reply"]
 
         for mode in ("native", "bracket"):
             folder = tmp_path / mode
