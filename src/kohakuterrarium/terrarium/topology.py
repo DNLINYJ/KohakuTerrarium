@@ -55,6 +55,8 @@ class GraphTopology:
     listen_edges: dict[str, set[str]] = field(default_factory=dict)
     # creature_id -> set of channel names they send to
     send_edges: dict[str, set[str]] = field(default_factory=dict)
+    # child creature_id -> parent creature_id; a link connects like a channel.
+    parent_links: dict[str, str] = field(default_factory=dict)
     # Population cap for runtime spawning; 0 means unbounded.
     max_creatures: int = 0
 
@@ -180,6 +182,9 @@ def remove_creature(
     g.creature_ids.discard(creature_id)
     g.listen_edges.pop(creature_id, None)
     g.send_edges.pop(creature_id, None)
+    g.parent_links.pop(creature_id, None)
+    for child in [c for c, p in g.parent_links.items() if p == creature_id]:
+        del g.parent_links[child]
     state.creature_to_graph.pop(creature_id, None)
 
     if not g.creature_ids:
@@ -198,6 +203,21 @@ def remove_creature(
         )
 
     return _normalize_components(state, g, affected={creature_id})
+
+
+def link_parent(state: TopologyState, child_id: str, parent_id: str) -> bool:
+    """Record ``parent_id`` as ``child_id``'s parent when both share a graph.
+
+    The link keeps the pair in one connected component without a channel.
+    Returns whether a link was recorded.
+    """
+    if child_id == parent_id:
+        return False
+    graph_id = state.creature_to_graph.get(child_id)
+    if graph_id is None or state.creature_to_graph.get(parent_id) != graph_id:
+        return False
+    state.graphs[graph_id].parent_links[child_id] = parent_id
+    return True
 
 
 def add_channel(
@@ -360,15 +380,22 @@ def find_components(g: GraphTopology) -> list[set[str]]:
     """Return the connected components of a graph as creature-id sets.
 
     Two creatures are connected when they share at least one channel
-    (either side listening or sending).  Uses BFS over a bipartite
-    adjacency.
+    (either side listening or sending) or one is the other's parent.
+    Uses BFS over a bipartite adjacency.
     """
     if not g.creature_ids:
         return []
 
     # build creature-to-channels and channel-to-creatures maps
-    c2ch: dict[str, set[str]] = {cid: set() for cid in g.creature_ids}
-    ch2c: dict[str, set[str]] = {name: set() for name in g.channels}
+    c2ch: dict[str, set[str | tuple[str, str]]] = {cid: set() for cid in g.creature_ids}
+    ch2c: dict[str | tuple[str, str], set[str]] = {name: set() for name in g.channels}
+    # A parent link is a private two-member pseudo-channel.
+    for child, parent in g.parent_links.items():
+        if child in c2ch and parent in c2ch:
+            link = ("parent", child)
+            c2ch[child].add(link)
+            c2ch[parent].add(link)
+            ch2c[link] = {child, parent}
     for cid, listens in g.listen_edges.items():
         for ch in listens:
             if ch in ch2c:
@@ -437,6 +464,7 @@ def _merge_graphs(state: TopologyState, a: str, b: str) -> TopologyDelta:
         ga.listen_edges.setdefault(cid, set()).update(listens)
     for cid, sends in gb.send_edges.items():
         ga.send_edges.setdefault(cid, set()).update(sends)
+    ga.parent_links.update(gb.parent_links)
     for cid in gb.creature_ids:
         state.creature_to_graph[cid] = a
     del state.graphs[b]
@@ -467,6 +495,7 @@ def _normalize_components(
     old_channels = dict(g.channels)
     old_listen = {cid: set(edges) for cid, edges in g.listen_edges.items()}
     old_send = {cid: set(edges) for cid, edges in g.send_edges.items()}
+    old_links = dict(g.parent_links)
     original_id = g.graph_id
 
     # biggest component keeps the original graph_id
@@ -478,6 +507,7 @@ def _normalize_components(
     g.creature_ids = set(keep)
     g.listen_edges = {cid: set(old_listen.get(cid, ())) for cid in keep}
     g.send_edges = {cid: set(old_send.get(cid, ())) for cid in keep}
+    g.parent_links = {c: p for c, p in old_links.items() if c in keep}
     used = _channels_used_by(keep, old_listen, old_send)
     g.channels = {n: info for n, info in old_channels.items() if n in used}
 
@@ -494,6 +524,7 @@ def _normalize_components(
             channels=comp_channels,
             listen_edges=comp_listen,
             send_edges=comp_send,
+            parent_links={c: p for c, p in old_links.items() if c in comp},
         )
         state.graphs[new_id] = new_g
         for cid in comp:

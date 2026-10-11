@@ -791,18 +791,17 @@ class TestTerrariumIntegration:
             {"action": "delete", "channel": "worker"}, context=ctx
         )
 
-        # 9. remove — group_remove_node destroys the worker. It was the
-        # only other node so the graph just shrinks back to the lead.
+        # 9. remove — the unwires above left the worker channel-less, yet its
+        # parent link kept it in the lead's group, so the tool can remove it.
+        assert engine.get_creature(worker_id).graph_id == gid
         rm_res = await GroupRemoveNodeTool()._execute(
             {"creature_id": worker_id}, context=ctx
         )
-        assert rm_res.error is not None
-        assert "not a creature in caller" in rm_res.error
-        assert worker_id in service.engine
-        assert {c.creature_id for c in await service.list_creatures()} == {
-            "lead",
-            worker_id,
-        }
+        assert rm_res.error is None, rm_res.error
+        assert json.loads(rm_res.output)["removed"] == worker_id
+        assert worker_id not in service.engine
+        assert {c.creature_id for c in await service.list_creatures()} == {"lead"}
+        assert engine.get_graph(gid).creature_ids == {"lead"}
         # The privileged node may NOT be removed via the tool.
         deny = await GroupRemoveNodeTool()._execute(
             {"creature_id": "lead"}, context=ctx

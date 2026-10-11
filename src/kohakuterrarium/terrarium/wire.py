@@ -162,6 +162,7 @@ def pack_graph_topology(g: GraphTopology) -> dict[str, Any]:
         },
         "listen_edges": {cid: sorted(chans) for cid, chans in g.listen_edges.items()},
         "send_edges": {cid: sorted(chans) for cid, chans in g.send_edges.items()},
+        "parent_links": dict(g.parent_links),
     }
 
 
@@ -176,6 +177,7 @@ def unpack_graph_topology(d: dict[str, Any]) -> GraphTopology:
             cid: set(chans) for cid, chans in d.get("listen_edges", {}).items()
         },
         send_edges={cid: set(chans) for cid, chans in d.get("send_edges", {}).items()},
+        parent_links=dict(d.get("parent_links", {})),
     )
 
 

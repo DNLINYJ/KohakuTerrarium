@@ -14,6 +14,7 @@ from kohakuterrarium.terrarium.topology import (
     connect,
     disconnect,
     find_components,
+    link_parent,
     new_graph_id,
     remove_channel,
     remove_creature,
@@ -138,6 +139,83 @@ class TestRemoveCreature:
         add_creature(s, "new2", graph_id=gid)
         assert remove_creature(s, "new2").kind == "split"
         assert s.graph_count() == 2
+
+
+# ── parent links ─────────────────────────────────────────────────
+
+
+class TestParentLinks:
+    def _team(self):
+        """root -ch- bob, plus a channel-less child linked to root."""
+        s = TopologyState()
+        gid = add_creature(s, "root")
+        add_creature(s, "bob", graph_id=gid)
+        connect(s, "root", "bob", channel="ch")
+        add_creature(s, "kid", graph_id=gid)
+        return s, gid
+
+    def test_link_requires_same_graph_and_distinct_ids(self):
+        s, gid = self._team()
+        other = add_creature(s, "stranger")
+        assert other != gid
+        assert link_parent(s, "stranger", "root") is False
+        assert link_parent(s, "root", "root") is False
+        assert link_parent(s, "ghost", "root") is False
+        assert s.graphs[gid].parent_links == {}
+        assert link_parent(s, "kid", "root") is True
+        assert s.graphs[gid].parent_links == {"kid": "root"}
+
+    def test_link_connects_like_a_channel(self):
+        s, gid = self._team()
+        assert len(find_components(s.graphs[gid])) == 2
+        link_parent(s, "kid", "root")
+        assert find_components(s.graphs[gid]) == [{"root", "bob", "kid"}]
+
+    def test_linked_child_survives_a_split_elsewhere(self):
+        s, gid = self._team()
+        link_parent(s, "kid", "root")
+        delta = remove_creature(s, "bob")
+        assert delta.kind == "nothing"
+        assert s.creature_to_graph["kid"] == gid
+        assert s.graphs[gid].creature_ids == {"root", "kid"}
+
+    def test_unlinked_child_splits_off(self):
+        s, gid = self._team()
+        assert remove_creature(s, "bob").kind == "split"
+        assert s.creature_to_graph["kid"] != s.creature_to_graph["root"]
+
+    def test_removing_the_parent_drops_its_links(self):
+        s, gid = self._team()
+        link_parent(s, "kid", "root")
+        delta = remove_creature(s, "root")
+        assert delta.kind == "split"
+        assert all(not g.parent_links for g in s.graphs.values())
+
+    def test_removing_the_child_drops_its_link(self):
+        s, gid = self._team()
+        link_parent(s, "kid", "root")
+        remove_creature(s, "kid")
+        assert s.graphs[gid].parent_links == {}
+
+    def test_merge_keeps_links_and_split_partitions_them(self):
+        s = TopologyState()
+        g1 = add_creature(s, "a")
+        add_creature(s, "a_kid", graph_id=g1)
+        link_parent(s, "a_kid", "a")
+        g2 = add_creature(s, "b")
+        add_creature(s, "b_kid", graph_id=g2)
+        link_parent(s, "b_kid", "b")
+        _, delta = connect(s, "a", "b", channel="bridge")
+        assert delta.kind == "merge"
+        merged = s.graph_of("a")
+        assert merged.parent_links == {"a_kid": "a", "b_kid": "b"}
+
+        delta = disconnect(s, "a", "b", channel="bridge")
+        assert delta.kind == "split"
+        assert s.graph_of("a").parent_links == {"a_kid": "a"}
+        assert s.graph_of("b").parent_links == {"b_kid": "b"}
+        assert s.graph_of("a_kid") is s.graph_of("a")
+        assert s.graph_of("b_kid") is s.graph_of("b")
 
 
 # ── add_channel / remove_channel ─────────────────────────────────

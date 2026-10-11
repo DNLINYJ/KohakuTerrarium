@@ -440,6 +440,46 @@ class TestStartStop:
             t._drive_runtime = None
             await t.shutdown()
 
+    async def test_parent_link_is_recorded_in_either_add_order(self):
+        t = Terrarium()
+        try:
+            boss = Creature(creature_id="boss", name="boss", agent=_FakeAgent("boss"))
+            gid = (await t.add_creature(boss, start=False)).graph_id
+            await t.add_creature(
+                Creature(creature_id="kid", name="kid", agent=_FakeAgent("kid")),
+                graph=gid,
+                parent_creature_id="boss",
+                start=False,
+            )
+            # Restore can add a child before its parent; the parent adopts it.
+            orphan = Creature(
+                creature_id="late_kid", name="late_kid", agent=_FakeAgent("late_kid")
+            )
+            orphan.parent_creature_id = "late_boss"
+            await t.add_creature(orphan, graph=gid, start=False)
+            assert t.get_graph(gid).parent_links == {"kid": "boss"}
+            await t.add_creature(
+                Creature(
+                    creature_id="late_boss",
+                    name="late_boss",
+                    agent=_FakeAgent("late_boss"),
+                ),
+                graph=gid,
+                start=False,
+            )
+            assert t.get_graph(gid).parent_links == {
+                "kid": "boss",
+                "late_kid": "late_boss",
+            }
+            # With no channels, the re-check after a removal keeps exactly the
+            # linked pair together and splits boss away.
+            await t.remove_creature("kid")
+            late_gid = t.get_creature("late_kid").graph_id
+            assert t.get_creature("late_boss").graph_id == late_gid
+            assert t.get_creature("boss").graph_id != late_gid
+        finally:
+            await t.shutdown()
+
     async def test_stop_graph(self):
         t = (
             await TestTerrariumBuilder()

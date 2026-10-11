@@ -99,6 +99,14 @@ async def add_creature(
         creature.is_privileged = True
     if parent_creature_id is not None:
         creature.parent_creature_id = parent_creature_id
+    if creature.parent_creature_id is not None:
+        _topo.link_parent(
+            engine._topology, creature.creature_id, creature.parent_creature_id
+        )
+    # Restore order is free, so children added before this parent link now.
+    for other in engine._creatures.values():
+        if getattr(other, "parent_creature_id", None) == creature.creature_id:
+            _topo.link_parent(engine._topology, other.creature_id, creature.creature_id)
     if gid not in engine._environments:
         engine._environments[gid] = Environment(env_id=f"env_{gid}")
     graph_env = engine._environments[gid]
