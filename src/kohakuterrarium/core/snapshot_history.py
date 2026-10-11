@@ -43,7 +43,11 @@ def _fresh(store: Any, namespace: str, events: list[dict], watermark: int) -> bo
 
 
 def _prefix(
-    record: dict, selected: dict[int, int], before_turn: int | None
+    record: dict,
+    selected: dict[int, int],
+    before_turn: int | None,
+    *,
+    empty_boundary: bool = False,
 ) -> tuple[list[dict], int] | None:
     pairs = {
         (turn, branch)
@@ -90,11 +94,50 @@ def _prefix(
         elif not exact and open_turn is None:
             return None
         kept.append(message)
-    if not any(message["role"] != "system" for message in kept) and (
-        not exact or any(message["role"] != "system" for message in record["messages"])
+    if (
+        not empty_boundary
+        and not any(message["role"] != "system" for message in kept)
+        and (
+            not exact
+            or any(message["role"] != "system" for message in record["messages"])
+        )
     ):
         return None
     return deepcopy(kept), record["path"][-1][0] if exact else last_turn
+
+
+def _boundary_turn(
+    record: dict, events: list[dict], selected: dict[int, int], before_turn: int | None
+) -> int | None:
+    cutoff = record.get("context_cutoff_event_id", 0)
+    path = dict(record["path"])
+    prior = [
+        event
+        for event in events
+        if event.get("type") == "user_message"
+        and event.get("event_id", 0) <= cutoff
+        and path.get(event.get("turn_index")) == event.get("branch_id")
+    ]
+    if (
+        not cutoff
+        or not prior
+        or any(
+            selected.get(event["turn_index"]) != event["branch_id"] for event in prior
+        )
+    ):
+        return None
+    targets = [
+        event
+        for event in events
+        if event.get("type") == "user_message"
+        and selected.get(event.get("turn_index")) == event.get("branch_id")
+        and (before_turn is None or event.get("turn_index") == before_turn)
+    ]
+    if not (before_turn is None and path == selected) and not any(
+        event.get("event_id", 0) > cutoff for event in targets
+    ):
+        return None
+    return max(event["turn_index"] for event in prior)
 
 
 def _replay_context(
@@ -160,17 +203,26 @@ def prepare_snapshot(
         if event.get("type") == "user_message"
     }
     live_ids = select_live_event_ids(events, branch_view=selected)
+    covered = compact_covered_event_ids(events, selected)
     candidates, repairs = [], []
     for record in records:
         if not set(map(tuple, record["path"])).issubset(raw_pairs) or not _fresh(
             store, namespace, events, record["watermark"]
         ):
             continue
-        prefix = _prefix(record, selected, before_turn)
+        cutoff = record.get("context_cutoff_event_id", 0)
+        boundary_turn = _boundary_turn(record, events, selected, before_turn)
+        if cutoff:
+            if boundary_turn is None:
+                continue
+            repairs.append((boundary_turn, record["watermark"], cutoff, record))
+        prefix = _prefix(
+            record, selected, before_turn, empty_boundary=boundary_turn is not None
+        )
         if prefix is None:
             continue
         messages, last_turn = prefix
-        cutoff = record.get("context_cutoff_event_id", 0)
+        last_turn = max(last_turn, boundary_turn or 0)
         whole = before_turn is None and record["path"] == sorted(
             [t, b] for t, b in selected.items()
         )
@@ -226,7 +278,6 @@ def prepare_snapshot(
             for event in tail
         ):
             continue
-        covered = compact_covered_event_ids(events, selected)
         pending = {
             message.get("metadata", {}).get("job_id")
             for message in messages

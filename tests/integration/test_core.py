@@ -2134,7 +2134,13 @@ class TestCoreIntegration:
                 ],
                 start=1,
             ):
-                fresh_llm = ScriptedLLM([f"fresh answer {cold_step}"])
+                fresh_llm = ScriptedLLM(
+                    [
+                        f"fresh answer {cold_step}",
+                        "first revised",
+                        "old history revised",
+                    ]
+                )
                 fresh_agent, fresh_store = resume_agent(
                     path, io_mode="plain", llm=fresh_llm
                 )
@@ -2154,6 +2160,49 @@ class TestCoreIntegration:
                         fresh_store.get_events("settled")[: len(raw_before)]
                         == raw_before
                     )
+                    if cold_step == 2:
+                        first_new = next(
+                            event
+                            for event in fresh_store.get_events("settled")
+                            if event["type"] == "user_message"
+                            and event["content"] == "new input 1"
+                        )
+                        selector = UserMessageSelector(
+                            first_new["event_id"],
+                            first_new["turn_index"],
+                            first_new["branch_id"],
+                        )
+                        boundary = fresh_agent._context_cutoff_event_id
+                        if notify:
+                            assert await fresh_agent.edit_and_rerun(
+                                -1, "first edited", target=selector
+                            )
+                            expected_first = "first edited"
+                        else:
+                            await fresh_agent.regenerate_last_response(target=selector)
+                            expected_first = "new input 1"
+                        assert prefix(fresh_llm.last_messages) == [
+                            ("user", expected_first)
+                        ]
+                        assert fresh_agent._context_cutoff_event_id == boundary
+                        old_user = next(
+                            event
+                            for event in raw_before
+                            if event["type"] == "user_message"
+                        )
+                        assert await fresh_agent.edit_and_rerun(
+                            -1,
+                            "before clear edited",
+                            target=UserMessageSelector(
+                                old_user["event_id"],
+                                old_user["turn_index"],
+                                old_user["branch_id"],
+                            ),
+                        )
+                        assert prefix(fresh_llm.last_messages) == [
+                            ("user", "before clear edited")
+                        ]
+                        assert fresh_agent._context_cutoff_event_id == 0
                     path = fresh_store.path
                 finally:
                     await fresh_agent.stop()
