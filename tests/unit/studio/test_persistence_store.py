@@ -19,15 +19,20 @@ import pytest
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.studio.persistence import store as store_mod
 from kohakuterrarium.studio.sessions.live import live_sessions
+from kohakuterrarium.utils.config_dir import config_dir
 
 # ── _session_dir ──────────────────────────────────────────────
 
 
 class TestSessionDir:
-    def test_resolves_to_the_sessions_subdir(self):
-        out = store_mod._session_dir()
-        # Sessions live under the '<config home>/sessions' directory.
-        assert out.name == "sessions"
+    def test_resolves_under_the_live_config_dir(self, monkeypatch, tmp_path):
+        # HOME is redirected after import (conftest): an unreplaced default must
+        # still resolve under config_dir(), never the import-time home.
+        monkeypatch.delenv("KT_SESSION_DIR", raising=False)
+        assert store_mod._session_dir() == config_dir() / "sessions"
+        replaced = tmp_path / "pinned"
+        monkeypatch.setattr(store_mod, "_SESSION_DIR", replaced)
+        assert store_mod._session_dir() == replaced
 
     def test_file_uri_env_is_the_named_directory(self, monkeypatch, tmp_path):
         cwd = tmp_path / "cwd"

@@ -40,6 +40,7 @@ logger = get_logger(__name__)
 # Explicit session directories avoid this process-wide default when callers
 # require namespace isolation. Tests also replace the default directly.
 _SESSION_DIR = Path.home() / ".kohakuterrarium" / "sessions"
+_IMPORT_SESSION_DIR = _SESSION_DIR
 
 
 def _session_dir() -> Path:
@@ -53,10 +54,8 @@ def _session_dir() -> Path:
     env = os.environ.get("KT_SESSION_DIR")
     if env:
         return coerce_fs_path(env)
-    # A replaced module default takes precedence; otherwise deriving from
-    # ``config_dir`` keeps configuration-directory overrides isolated.
-    _docs_default = Path.home() / ".kohakuterrarium" / "sessions"
-    if _SESSION_DIR != _docs_default:
+    # Replacement is judged against the import-time value, not a HOME read now.
+    if _SESSION_DIR != _IMPORT_SESSION_DIR:
         return _SESSION_DIR
     return config_dir() / "sessions"
 

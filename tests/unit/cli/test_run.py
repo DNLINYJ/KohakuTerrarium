@@ -171,12 +171,10 @@ class TestSessionDir:
         assert run._session_dir() == explicit
 
     def test_config_dir_supplies_default_root(self, monkeypatch, tmp_path):
+        # HOME is redirected after import (conftest), so the import-time default
+        # no longer equals a HOME read now; it must still count as unreplaced.
         monkeypatch.delenv("KT_SESSION_DIR", raising=False)
-        monkeypatch.setattr(
-            run,
-            "_SESSION_DIR",
-            run.Path.home() / ".kohakuterrarium" / "sessions",
-        )
         monkeypatch.setattr(run, "config_dir", lambda: tmp_path / "config")
+        assert run.Path.home() / ".kohakuterrarium" / "sessions" != run._SESSION_DIR
 
         assert run._session_dir() == tmp_path / "config" / "sessions"

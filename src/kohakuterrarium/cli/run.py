@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from kohakuterrarium.terrarium.engine import Terrarium
 
 _SESSION_DIR = Path.home() / ".kohakuterrarium" / "sessions"
+_IMPORT_SESSION_DIR = _SESSION_DIR
 
 
 def _session_dir() -> Path:
@@ -45,8 +46,8 @@ def _session_dir() -> Path:
     explicit = os.environ.get("KT_SESSION_DIR")
     if explicit:
         return coerce_fs_path(explicit)
-    docs_default = Path.home() / ".kohakuterrarium" / "sessions"
-    if _SESSION_DIR != docs_default:
+    # Replacement is judged against the import-time value, not a HOME read now.
+    if _SESSION_DIR != _IMPORT_SESSION_DIR:
         return _SESSION_DIR
     return config_dir() / "sessions"
 
