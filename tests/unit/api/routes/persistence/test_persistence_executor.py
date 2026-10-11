@@ -17,7 +17,6 @@ uses its own pool.
 import asyncio
 import concurrent.futures
 import threading
-import time
 
 import pytest
 
@@ -61,59 +60,38 @@ class TestPersistenceExecutor:
         assert _MAX_WORKERS >= 32
 
     async def test_runs_on_a_different_pool_than_to_thread(self):
-        """Persistence work must not queue behind ``asyncio.to_thread``.
+        """Persistence work completes while every ``to_thread`` worker is held.
 
-        Saturate ``to_thread``'s default pool with sleeps and
-        concurrently issue ``run_in_persistence_executor`` work. We
-        measure the persist task's OWN elapsed time (not total wall
-        time) — that isolates the signal from CI-side noise where the
-        saturator burst itself queues on a small worker pool.
-
-        With separate pools: persist task completes in ~SLEEP_S.
-        With shared pool: it queues behind the saturators and takes
-        roughly ``SLEEP_S * (num_starvers / default_pool_size)``.
+        Each default-pool worker blocks on an event the test sets only after
+        the persistence call returns, so a shared pool can never run it.
         """
         from kohakuterrarium.api.routes.persistence._executor import (
             run_in_persistence_executor,
         )
 
-        # Use the real default-executor size that ``asyncio.to_thread``
-        # would create (``min(32, os.cpu_count() + 4)``). Saturating
-        # with more than that just queues on the to_thread side and
-        # would inflate the test regardless of pool isolation.
-        with concurrent.futures.ThreadPoolExecutor() as probe_executor:
-            default_pool_size = probe_executor._max_workers
-        # 6x oversaturation guarantees a large serial gap so the
-        # threshold has headroom even on a slow CI runner.
-        starver_count = default_pool_size * 6
-        sleep_s = 0.5
+        loop = asyncio.get_running_loop()
+        default_pool = concurrent.futures.ThreadPoolExecutor()
+        loop.set_default_executor(default_pool)
+        pool_size = default_pool._max_workers
+        held = threading.Event()
+        starver_threads: set[int] = set()
 
-        def _block(s):
-            time.sleep(s)
-            return threading.get_ident()
+        def _hold():
+            starver_threads.add(threading.get_ident())
+            held.wait(30)
 
-        # Saturate the default pool with serial-able workload.
-        starvers = [asyncio.to_thread(_block, sleep_s) for _ in range(starver_count)]
-        # Concurrently issue persistence work; time IT specifically.
-        t0 = time.monotonic()
-        persist_result = await run_in_persistence_executor(_block, sleep_s)
-        persist_elapsed = time.monotonic() - t0
-        # Then collect the starvers (we only care that they ran).
-        starver_results = await asyncio.gather(*starvers)
-
-        # If pools are shared, the persist task queues behind the
-        # starvers and takes ``serial_estimate`` seconds. With
-        # separate pools, the persist task runs concurrently on its
-        # own thread and finishes in ~``sleep_s`` plus scheduler
-        # overhead. We assert it stays under HALF the serial-pool
-        # estimate — that's the only signal that cleanly distinguishes
-        # the two pool topologies regardless of how slow the runner is.
-        serial_estimate = sleep_s * starver_count / max(default_pool_size, 1)
-        max_separate = serial_estimate / 2
-        assert persist_elapsed < max_separate, (
-            f"persistence task waited {persist_elapsed:.2f}s "
-            f"(threshold {max_separate:.2f}s, serial estimate "
-            f"{serial_estimate:.2f}s) — looks serialised behind to_thread"
-        )
-        assert persist_result  # ran on some thread
-        assert len(starver_results) == starver_count
+        gathered = asyncio.gather(*(asyncio.to_thread(_hold) for _ in range(pool_size)))
+        try:
+            for _ in range(1000):
+                if len(starver_threads) == pool_size:
+                    break
+                await asyncio.sleep(0.01)
+            assert len(starver_threads) == pool_size, "default pool never saturated"
+            persist_thread = await asyncio.wait_for(
+                run_in_persistence_executor(threading.get_ident), timeout=10
+            )
+            assert persist_thread not in starver_threads
+        finally:
+            held.set()
+            await gathered
+            default_pool.shutdown(wait=True)

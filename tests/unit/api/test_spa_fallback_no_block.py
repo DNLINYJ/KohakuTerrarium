@@ -10,18 +10,20 @@ These tests pin two properties:
 
 1. ``GET /`` with empty path takes the index-html short-circuit (no
    filesystem walk).
-2. A slow filesystem check (simulated by a sleeping resolver) does
-   NOT block concurrent ``asyncio.sleep`` work — the route off-loads
-   to the dedicated I/O executor.
+2. The static-path filesystem check runs on the dedicated I/O executor,
+   not on the event loop.
 """
 
 import asyncio
-import time
 from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
+
+from kohakuterrarium.api import app as app_mod
+from tests.helpers.loop_witness import LoopWitness
 
 
 @pytest.fixture
@@ -87,66 +89,27 @@ class TestSpaFallback:
 
 
 class TestSpaFallbackOffLoadsToExecutor:
-    async def test_slow_resolve_does_not_block_loop(self, static_dir, monkeypatch):
-        """A slow filesystem check on the static path must not stall
-        the event loop — the off-load to the I/O executor keeps the
-        loop free for other requests.
+    async def test_static_file_check_runs_off_the_loop(self, static_dir, monkeypatch):
+        """The static-path ``is_file`` check runs on the I/O executor, so the
+        loop stays free for other requests while the filesystem is slow."""
+        witness = LoopWitness(asyncio.get_running_loop())
+        original_is_file = Path.is_file
 
-        Without the off-load (the pre-fix path), ``time.sleep(0.3)``
-        inside the resolver would stop every other coroutine for
-        300 ms.  With the off-load, an independent ``asyncio.sleep``
-        coroutine continues ticking at its 20 ms cadence.
-        """
-        from kohakuterrarium.api import app as app_mod
-
-        # Patch run_in_io_executor's wrapped resolver path: the
-        # function we want to slow is built inside ``_mount_spa``.
-        # Instead, slow the underlying ``is_file`` call on Path.
-        from pathlib import Path as _RealPath
-
-        original_is_file = _RealPath.is_file
-
-        def _slow_is_file(self):
-            time.sleep(0.3)
+        def _observed_is_file(self):
+            if self.is_relative_to(static_dir):
+                witness.observe()
             return original_is_file(self)
 
-        monkeypatch.setattr(_RealPath, "is_file", _slow_is_file)
-
+        monkeypatch.setattr(Path, "is_file", _observed_is_file)
         app = FastAPI()
         app_mod._mount_spa(app, static_dir)
-
-        # The slow stat happens INSIDE the route handler, which runs
-        # in an executor (httpx TestClient is sync — to test loop
-        # blocking we need to drive an asyncio loop directly).  Use
-        # the FastAPI app's underlying ASGI callable.
-        loop_alive: list[float] = []
-
-        async def _ping() -> None:
-            for _ in range(8):
-                await asyncio.sleep(0.02)
-                loop_alive.append(time.monotonic())
-
-        async def _request() -> None:
-            # Drive the route via the in-process ``router`` so we run
-            # on the test's event loop (no thread bridge).  The
-            # handler internally awaits ``run_in_io_executor`` for the
-            # blocking is_file call.
-            from fastapi.routing import APIRoute
-
-            handler = None
-            for route in app.routes:
-                if isinstance(route, APIRoute) and route.path == "/{full_path:path}":
-                    handler = route.endpoint
-                    break
-            assert handler is not None, "spa_fallback route not registered"
-            await handler("favicon.ico")
-
-        await asyncio.gather(_request(), _ping())
-
-        gaps = [loop_alive[i + 1] - loop_alive[i] for i in range(len(loop_alive) - 1)]
-        max_gap = max(gaps)
-        assert max_gap < 0.15, (
-            f"event loop stalled during GET /favicon.ico; max ping gap = "
-            f"{max_gap:.3f}s — spa_fallback is running its filesystem "
-            "check on the event loop instead of the I/O executor"
+        handler = next(
+            route.endpoint
+            for route in app.routes
+            if isinstance(route, APIRoute) and route.path == "/{full_path:path}"
+        )
+        await handler("favicon.ico")
+        assert witness.never_blocked, (
+            "spa_fallback ran its filesystem check on the event loop instead of "
+            "the I/O executor"
         )

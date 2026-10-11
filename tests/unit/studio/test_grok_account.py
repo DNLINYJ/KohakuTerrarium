@@ -3,7 +3,6 @@
 import asyncio
 import json
 import math
-import time
 from datetime import datetime, timezone
 
 import httpx
@@ -12,6 +11,7 @@ import pytest
 from kohakuterrarium.llm import grok_auth
 from kohakuterrarium.llm.grok_auth import GROK_CLI_SOURCE, OPENCODE_SOURCE, GrokToken
 from kohakuterrarium.studio.identity import grok_account
+from tests.helpers.loop_witness import LoopWitness
 
 LIVE_FIXTURE = {
     "config": {
@@ -619,31 +619,16 @@ class TestGetUsage:
         assert "secret-access-canary" not in json.dumps(result)
 
     async def test_cli_discovery_load_stays_off_the_event_loop(self, monkeypatch):
-        def slow_candidates():
-            time.sleep(0.2)
+        witness = LoopWitness(asyncio.get_running_loop())
+
+        def observed_candidates():
+            witness.observe()
             return []
 
         monkeypatch.setattr(
-            grok_account.GrokTokens, "load_bootstrap_candidates", slow_candidates
+            grok_account.GrokTokens, "load_bootstrap_candidates", observed_candidates
         )
-        loop = asyncio.get_running_loop()
-        gaps = []
-        stop = asyncio.Event()
-
-        async def heartbeat():
-            previous = loop.time()
-            while not stop.is_set():
-                await asyncio.sleep(0.01)
-                now = loop.time()
-                gaps.append(now - previous)
-                previous = now
-
-        pulse = asyncio.create_task(heartbeat())
-        await asyncio.sleep(0.03)
         result = await grok_account.get_usage()
-        await asyncio.sleep(0.03)
-        stop.set()
-        await pulse
 
         assert result["status"] == "not_logged_in"
-        assert max(gaps) < 0.1
+        assert witness.never_blocked

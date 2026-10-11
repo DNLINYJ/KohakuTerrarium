@@ -1,7 +1,6 @@
 """Unit tests for :mod:`kohakuterrarium.api.routes.persistence.viewer`."""
 
 import asyncio
-import time
 import types
 from pathlib import Path
 
@@ -12,6 +11,7 @@ from httpx import ASGITransport, AsyncClient
 
 from kohakuterrarium.api.routes.persistence import subagents as subagents_mod
 from kohakuterrarium.api.routes.persistence import viewer as viewer_mod
+from tests.helpers.loop_witness import LoopWitness
 
 
 def _app() -> FastAPI:
@@ -383,43 +383,27 @@ class TestLiveSessionResolution:
         store.checkpoint()
         engine = types.SimpleNamespace(_session_stores={"graph_live": store})
 
-        def slow_summary(*_a, **_k):
-            time.sleep(0.3)
+        witness = LoopWitness(asyncio.get_running_loop())
+
+        def observed_summary(*_a, **_k):
+            witness.observe()
             return {"agents": ["alice"]}
 
-        monkeypatch.setattr(viewer_mod, "build_summary_payload", slow_summary)
+        monkeypatch.setattr(viewer_mod, "build_summary_payload", observed_summary)
         monkeypatch.setattr(
             viewer_mod, "resolve_session_path_default", lambda n: store_path
         )
         app = FastAPI()
         app.include_router(viewer_mod.router, prefix="/sessions")
         app.dependency_overrides[get_service] = lambda: engine
-        loop_alive: list[float] = []
-        stop = asyncio.Event()
-
-        async def _ping():
-            while not stop.is_set():
-                loop_alive.append(time.monotonic())
-                await asyncio.sleep(0.02)
-            loop_alive.append(time.monotonic())
-
         try:
             transport = ASGITransport(app=app)
             async with AsyncClient(
                 transport=transport, base_url="http://test"
             ) as client:
-                ping = asyncio.create_task(_ping())
-                await asyncio.sleep(0)
                 resp = await client.get("/sessions/graph_live/summary")
-                stop.set()
-                await ping
             assert resp.status_code == 200, resp.text
-            gaps = [
-                loop_alive[i + 1] - loop_alive[i] for i in range(len(loop_alive) - 1)
-            ]
-            assert (
-                max(gaps) < 0.15
-            ), f"live viewer builder blocked the loop; max gap={max(gaps):.3f}s"
+            assert witness.never_blocked, "live viewer builder blocked the loop"
         finally:
             store.close()
 
@@ -589,43 +573,27 @@ class TestDiff:
         store.checkpoint()
         engine = types.SimpleNamespace(_session_stores={"graph_live": store})
 
-        def slow_load(path, agent_arg, live=None):
-            time.sleep(0.3)
+        witness = LoopWitness(asyncio.get_running_loop())
+
+        def observed_load(path, agent_arg, live=None):
+            witness.observe()
             return [{"role": "user", "content": "hi"}], "graph_live", "alice"
 
-        monkeypatch.setattr(viewer_mod, "_load_messages", slow_load)
+        monkeypatch.setattr(viewer_mod, "_load_messages", observed_load)
         app = FastAPI()
         app.include_router(viewer_mod.router, prefix="/sessions")
         app.dependency_overrides[get_service] = lambda: engine
-        loop_alive: list[float] = []
-        stop = asyncio.Event()
-
-        async def _ping():
-            while not stop.is_set():
-                loop_alive.append(time.monotonic())
-                await asyncio.sleep(0.02)
-            loop_alive.append(time.monotonic())
-
         try:
             transport = ASGITransport(app=app)
             async with AsyncClient(
                 transport=transport, base_url="http://test"
             ) as client:
-                ping = asyncio.create_task(_ping())
-                await asyncio.sleep(0)
                 resp = await client.get("/sessions/graph_live/diff?other=graph_live")
-                stop.set()
-                await ping
             assert resp.status_code == 200, resp.text
             body = resp.json()
             assert body["identical"] is True
             assert body["a"]["total_messages"] == 1
-            gaps = [
-                loop_alive[i + 1] - loop_alive[i] for i in range(len(loop_alive) - 1)
-            ]
-            assert (
-                max(gaps) < 0.15
-            ), f"live diff blocked the loop; max gap={max(gaps):.3f}s"
+            assert witness.never_blocked, "live diff blocked the loop"
         finally:
             store.close()
 

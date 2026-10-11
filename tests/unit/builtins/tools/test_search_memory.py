@@ -19,6 +19,7 @@ from kohakuterrarium.builtins.tools.search_memory import (
 )
 from kohakuterrarium.modules.tool.base import ToolContext
 from kohakuterrarium.session.memory import SearchResult
+from tests.helpers.loop_witness import LoopWitness
 
 
 @pytest.mark.parametrize("phase", ["load", "index", "query"])
@@ -192,53 +193,30 @@ class TestSearchMemoryDisplay:
 class TestEnsureIndexedOffLoop:
     async def test_index_refresh_does_not_block_event_loop(self, tmp_path):
         # S5 negative case: the full-table event scan for index refresh
-        # runs on the store's affinity thread, keeping the loop alive.
-        import asyncio
-        import time
-
-        from kohakuterrarium.modules.tool.base import ToolContext
-        from kohakuterrarium.session.store import SessionStore
-
+        # runs on the store's affinity thread while the loop stays live.
         store = SessionStore(str(tmp_path / "tool-slow.kohakutr"))
         try:
             store.init_meta("sess", "agent", "/p", "/w", ["alice"])
             store.append_event("alice", "user_input", {"content": "hi"})
             store.flush()
             real_get_events = store.get_events
+            witness = LoopWitness(asyncio.get_running_loop())
 
-            def slow_get_events(agent, **kwargs):
-                time.sleep(0.3)
+            def observed_get_events(agent, **kwargs):
+                witness.observe()
                 return real_get_events(agent, **kwargs)
 
-            store.get_events = slow_get_events
+            store.get_events = observed_get_events
 
             agent = type("A", (), {"session_store": store, "config": None})()
             ctx = ToolContext(
                 agent_name="alice", session=None, working_dir=None, agent=agent
             )
             tool = SearchMemoryTool()
-            loop_alive: list[float] = []
-            stop = asyncio.Event()
-
-            async def _ping():
-                while not stop.is_set():
-                    loop_alive.append(time.monotonic())
-                    await asyncio.sleep(0.02)
-                loop_alive.append(time.monotonic())
-
-            ping = asyncio.create_task(_ping())
-            await asyncio.sleep(0)
             result = await tool.execute({"query": "hi", "mode": "fts"}, context=ctx)
             assert result.error is None
             assert "hi" in result.output
-            stop.set()
-            await ping
-            gaps = [
-                loop_alive[i + 1] - loop_alive[i] for i in range(len(loop_alive) - 1)
-            ]
-            assert (
-                max(gaps) < 0.15
-            ), f"index refresh blocked the loop; max={max(gaps):.3f}s"
+            assert witness.never_blocked, "index refresh blocked the loop"
         finally:
             store.close()
 

@@ -1,5 +1,6 @@
 """Unit tests for :mod:`kohakuterrarium.studio.sessions.memory_search`."""
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ from kohakuterrarium.session.embedding import NullEmbedder
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.studio.sessions import memory_build as build_mod
 from kohakuterrarium.studio.sessions import memory_search as mem_mod
+from tests.helpers.loop_witness import LoopWitness
 
 
 def _store(tmp_path, name="s.kohakutr") -> SessionStore:
@@ -308,10 +310,7 @@ class TestSearchSessionMemory:
 
     async def test_saved_search_does_not_block_event_loop(self, tmp_path, monkeypatch):
         # S5 negative case: a large saved session's full event scan runs in
-        # a worker thread, so a ping task keeps the loop alive throughout.
-        import asyncio
-        import time
-
+        # a worker thread while the loop stays live.
         path = tmp_path / "slow-saved.kohakutr"
         store = SessionStore(str(path))
         try:
@@ -322,40 +321,24 @@ class TestSearchSessionMemory:
             store.close()
 
         real_get_events = SessionStore.get_events
+        witness = LoopWitness(asyncio.get_running_loop())
 
-        def slow_get_events(self, agent, **kwargs):
-            time.sleep(0.3)
+        def observed_get_events(self, agent, **kwargs):
+            witness.observe()
             return real_get_events(self, agent, **kwargs)
 
-        monkeypatch.setattr(SessionStore, "get_events", slow_get_events)
+        monkeypatch.setattr(SessionStore, "get_events", observed_get_events)
         monkeypatch.setattr(
             mem_mod, "_live_store_for_path", lambda eng, p: (None, None)
         )
 
-        loop_alive: list[float] = []
-        stop = asyncio.Event()
-
-        async def _ping():
-            while not stop.is_set():
-                loop_alive.append(time.monotonic())
-                await asyncio.sleep(0.02)
-            loop_alive.append(time.monotonic())
-
-        ping = asyncio.create_task(_ping())
-        await asyncio.sleep(0)
         out = await mem_mod.search_session_memory(path, q="needle", mode="fts")
-        stop.set()
-        await ping
         assert out["count"] >= 1
-        gaps = [loop_alive[i + 1] - loop_alive[i] for i in range(len(loop_alive) - 1)]
-        assert max(gaps) < 0.15, f"saved search blocked the loop; max={max(gaps):.3f}s"
+        assert witness.never_blocked, "saved search blocked the event loop"
 
     async def test_live_search_does_not_block_event_loop(self, tmp_path, monkeypatch):
         # S5 negative case: a live store's search dispatches onto the
         # store's affinity thread instead of the caller's loop.
-        import asyncio
-        import time
-
         path = tmp_path / "slow-live.kohakutr"
         live_store = SessionStore(str(path))
         try:
@@ -367,12 +350,13 @@ class TestSearchSessionMemory:
             raise
 
         real_get_events = live_store.get_events
+        witness = LoopWitness(asyncio.get_running_loop())
 
-        def slow_get_events(agent, **kwargs):
-            time.sleep(0.3)
+        def observed_get_events(agent, **kwargs):
+            witness.observe()
             return real_get_events(agent, **kwargs)
 
-        live_store.get_events = slow_get_events
+        live_store.get_events = observed_get_events
         monkeypatch.setattr(
             mem_mod, "_live_store_for_path", lambda eng, p: (None, live_store)
         )
@@ -402,28 +386,10 @@ class TestSearchSessionMemory:
 
         monkeypatch.setattr(mem_mod, "SessionMemory", _FakeMemory)
 
-        loop_alive: list[float] = []
-        stop = asyncio.Event()
-
-        async def _ping():
-            while not stop.is_set():
-                loop_alive.append(time.monotonic())
-                await asyncio.sleep(0.02)
-            loop_alive.append(time.monotonic())
-
         try:
-            ping = asyncio.create_task(_ping())
-            await asyncio.sleep(0)
             out = await mem_mod.search_session_memory(path, q="needle", mode="fts")
-            stop.set()
-            await ping
             assert out["count"] >= 1
-            gaps = [
-                loop_alive[i + 1] - loop_alive[i] for i in range(len(loop_alive) - 1)
-            ]
-            assert (
-                max(gaps) < 0.15
-            ), f"live search blocked the loop; max={max(gaps):.3f}s"
+            assert witness.never_blocked, "live search blocked the event loop"
         finally:
             live_store.close()
 

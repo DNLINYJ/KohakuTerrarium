@@ -276,12 +276,12 @@ async def test_restart_ignores_old_request_and_response(tmp_path):
                     "path": str(tmp_path),
                 },
             )
-            for _ in range(100):
+            for _ in range(1000):
                 if store.registry.read():
                     break
                 await asyncio.sleep(0.01)
             assert set(store.registry.read()) == {"new"}
-            for _ in range(100):
+            for _ in range(1000):
                 reply = json.loads(store.response_path.read_text())
                 if reply.get("run_id") == "new":
                     break

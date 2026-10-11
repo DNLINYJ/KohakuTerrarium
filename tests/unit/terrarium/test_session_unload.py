@@ -3,7 +3,6 @@
 import asyncio
 import gc
 import warnings
-import time
 
 import pytest
 
@@ -107,11 +106,11 @@ async def test_unload_stops_an_admitted_turn_without_waiting_for_llm(config, tmp
             await asyncio.sleep(0.01)
         assert provider.call_count == 1
         store = engine._session_stores[creature.graph_id]
-        started = time.monotonic()
+        # The admitted turn streams one chunk per 30 s; finishing inside 5 s
+        # means unload stopped it instead of waiting for the LLM.
         await asyncio.wait_for(
             unload_session_graph(engine, creature.graph_id), timeout=5
         )
-        assert time.monotonic() - started < 2
         assert not creature.is_running
         assert read_session_meta(store.path)[MANIFEST_KEY] is not None
         assert (

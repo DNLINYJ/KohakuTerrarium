@@ -15,39 +15,31 @@ from kohakuterrarium.session.attachment_service import _emit_lineage
 from kohakuterrarium.session.output import SessionOutput
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.modules.trigger.timer import TimerTrigger
-
-
-def _gaps(stamps: list[float]) -> list[float]:
-    return [stamps[i + 1] - stamps[i] for i in range(len(stamps) - 1)]
+from tests.helpers.loop_witness import LoopWitness, loop_ran_meanwhile
 
 
 async def test_run_does_not_block_event_loop(tmp_path):
     store = SessionStore(str(tmp_path / "aff.kohakutr"))
-    loop_alive: list[float] = []
-    stop = asyncio.Event()
+    witness = LoopWitness(asyncio.get_running_loop())
 
     def _block():
-        time.sleep(0.3)
+        witness.observe()
         return threading.get_ident()
 
-    async def _ping():
-        while not stop.is_set():
-            loop_alive.append(time.monotonic())
-            await asyncio.sleep(0.02)
-        loop_alive.append(time.monotonic())
-
     try:
-        ping = asyncio.create_task(_ping())
-        await asyncio.sleep(0)
         worker_ident = await store.run(_block)
-        stop.set()
-        await ping
     finally:
         store.close()
 
     assert worker_ident != threading.get_ident()
-    gaps = _gaps(loop_alive)
-    assert max(gaps) < 0.15, f"store.run blocked the loop; max gap={max(gaps):.3f}s"
+    assert witness.never_blocked, "store.run blocked the event loop"
+
+
+async def test_loop_witness_fails_a_call_made_on_the_loop_thread():
+    witness = LoopWitness(asyncio.get_running_loop())
+    assert not witness.never_blocked
+    witness.results.append(loop_ran_meanwhile(witness.loop, timeout=0.2))
+    assert witness.never_blocked is False
 
 
 async def test_run_serializes_on_one_worker(tmp_path):

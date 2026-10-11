@@ -47,6 +47,7 @@ from kohakuterrarium.session.resume_async import (
 )
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.testing.llm import ScriptedLLM
+from tests.helpers.loop_witness import LoopWitness
 
 
 @pytest.fixture
@@ -2642,37 +2643,20 @@ class TestInjectSavedState:
 
     async def test_async_injection_does_not_block_event_loop(self, tmp_path):
         # Negative case for S3: a large session's event scan runs on the
-        # store's affinity thread, so a ping task keeps the loop alive.
+        # store's affinity thread while the loop stays live.
         store = SessionStore(str(tmp_path / "slow.kohakutr"))
         try:
             real_get_events = store.get_events
+            witness = LoopWitness(asyncio.get_running_loop())
 
-            def slow_get_events(agent, **kwargs):
-                time.sleep(0.3)
+            def observed_get_events(agent, **kwargs):
+                witness.observe()
                 return real_get_events(agent, **kwargs)
 
-            store.get_events = slow_get_events
-            loop_alive: list[float] = []
-            stop = asyncio.Event()
-
-            async def _ping():
-                while not stop.is_set():
-                    loop_alive.append(time.monotonic())
-                    await asyncio.sleep(0.02)
-                loop_alive.append(time.monotonic())
-
-            ping = asyncio.create_task(_ping())
-            await asyncio.sleep(0)
+            store.get_events = observed_get_events
             agent = _FakeAgentForInject()
             await inject_saved_state_async(agent, store, "alice")
-            stop.set()
-            await ping
-            gaps = [
-                loop_alive[i + 1] - loop_alive[i] for i in range(len(loop_alive) - 1)
-            ]
-            assert (
-                max(gaps) < 0.15
-            ), f"async injection blocked the loop; max gap={max(gaps):.3f}s"
+            assert witness.never_blocked, "async injection blocked the loop"
         finally:
             store.close()
 

@@ -779,7 +779,10 @@ class TestMigrationLockTimeoutBound:
         from kohakuterrarium.terrarium.drive import store_migration as sm
         from kohakuterrarium.utils.file_lock import FileLock
 
+        budgets: list[float | None] = []
+
         def slow_probe(_path, *, timeout_s=None):
+            budgets.append(timeout_s)
             time.sleep(0.5 if timeout_s is None else timeout_s)
             return False
 
@@ -789,11 +792,11 @@ class TestMigrationLockTimeoutBound:
         holder = FileLock(sidecar + ".migrate-lock")
         holder.acquire()
         try:
-            start = time.monotonic()
             with pytest.raises(TimeoutError):
                 with sm._migration_lock(sidecar):
                     pass
-            assert time.monotonic() - start < 0.4
+            # Every probe is handed what is left of the 50 ms budget, never unbounded.
+            assert budgets and all(b is not None and 0 <= b <= 0.05 for b in budgets)
         finally:
             holder.release()
 
@@ -825,13 +828,10 @@ class TestMigrationLockTimeoutBound:
         holder = FileLock(sidecar + ".migrate-lock")
         holder.acquire()  # keep the lock busy so acquire always contends
         try:
-            start = time.monotonic()
             with pytest.raises(TimeoutError):
                 with sm._migration_lock(sidecar):
                     pass
-            elapsed = time.monotonic() - start
             assert probe_calls == []  # deadline enforced BEFORE the slow probe
-            assert elapsed < 0.4  # bounded well under one 0.5s probe
         finally:
             holder.release()
 

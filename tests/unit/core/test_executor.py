@@ -81,11 +81,14 @@ class _ManualReadTool(BaseTool):
 class _UnsafeTool(BaseTool):
     is_concurrency_safe = False
 
-    def __init__(self, hold_seconds=0.05, *, timeout=60.0, name="unsafe"):
+    def __init__(self, hold_seconds=0.05, *, timeout=60.0, name="unsafe", gate=None):
         super().__init__(ToolConfig(timeout=timeout))
         self.hold = hold_seconds
         self.name = name
+        self.gate = gate
         self.starts: list[float] = []
+        self.active = 0
+        self.max_active = 0
 
     @property
     def tool_name(self):
@@ -97,7 +100,15 @@ class _UnsafeTool(BaseTool):
 
     async def _execute(self, args, **kwargs):
         self.starts.append(asyncio.get_event_loop().time())
-        await asyncio.sleep(self.hold)
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            if self.gate is not None:
+                await self.gate.wait()
+            else:
+                await asyncio.sleep(self.hold)
+        finally:
+            self.active -= 1
         return ToolResult(output="ok")
 
 
@@ -562,21 +573,25 @@ class TestSerialLock:
         )
         results = await ex.wait_all(timeout=5.0)
         assert len(results) == 3
-        starts = sorted(tool.starts)
-        for a, b in zip(starts, starts[1:]):
-            assert b - a >= 0.02
+        assert len(tool.starts) == 3
+        assert tool.max_active == 1
 
     async def test_allow_concurrent_skips_serial_lock(self):
         ex = Executor()
-        tool = _UnsafeTool(hold_seconds=0.03)
+        gate = asyncio.Event()
+        tool = _UnsafeTool(gate=gate)
         ex.register_tool(tool)
-        await ex.submit("unsafe", {})
+        first = await ex.submit("unsafe", {})
         await asyncio.sleep(0)
         concurrent = await ex.submit("unsafe", {"allow_concurrent": True})
-        await ex.wait_for(concurrent, timeout=1.0)
-
-        assert len(tool.starts) == 2
-        assert tool.starts[1] - tool.starts[0] < 0.02
+        for _ in range(100):
+            if len(tool.starts) == 2:
+                break
+            await asyncio.sleep(0.01)
+        assert tool.max_active == 2, "allow_concurrent waited for the serial lock"
+        gate.set()
+        await ex.wait_for(concurrent, timeout=5.0)
+        await ex.wait_for(first, timeout=5.0)
 
     async def test_text_allow_concurrent_skips_serial_lock(self):
         ex = Executor()
