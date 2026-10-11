@@ -38,6 +38,26 @@ jobs:
           - os: windows-latest
             python-version: "3.14"
     steps:
+      # The suite creates many small files (per-test roots, SQLite + sidecars);
+      # real-time scanning and NTFS dominate Windows wall time.
+      - name: Disable Defender real-time scanning
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Set-MpPreference -DisableRealtimeMonitoring $true
+      - name: Create Dev Drive
+        if: runner.os == 'Windows'
+        uses: samypr100/setup-dev-drive@v3
+        with:
+          drive-size: 20GB
+          drive-format: ReFS
+      - name: Point TEMP at the Dev Drive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tmp = Join-Path $env:DEV_DRIVE "tmp"
+          New-Item -ItemType Directory -Force $tmp | Out-Null
+          "TEMP=$tmp" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "TMP=$tmp" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - uses: actions/checkout@v4
         with:
           submodules: true
