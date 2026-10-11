@@ -203,11 +203,13 @@ class TestStreaming:
             await out.write_stream("world")
             await out.write_stream("!")
             # Nothing is persisted until a boundary closes the segment.
+            await out.drain()
             store.flush()
             assert [
                 e for e in store.get_events("alice") if e["type"] == "text_chunk"
             ] == []
             await out.on_processing_end()
+            await out.drain()
             store.flush()
             tcs = [e for e in store.get_events("alice") if e["type"] == "text_chunk"]
             assert len(tcs) == 1
@@ -292,6 +294,7 @@ class TestStreaming:
         out2 = SessionOutput("alice", store2, None)
         try:
             await out2.start()
+            await out2.drain()
             store2.flush()
             tcs = [e for e in store2.get_events("alice") if e["type"] == "text_chunk"]
             assert len(tcs) == 1
@@ -347,8 +350,9 @@ class TestStreaming:
         agent2 = _FakeAgent(turn=3, branch=1)
         store2 = SessionStore(path)
         # Constructing the sink is what triggers recovery (no start needed).
-        SessionOutput("alice", store2, agent2)
+        out2 = SessionOutput("alice", store2, agent2)
         try:
+            await out2.drain()
             store2.flush()
             events = store2.get_events("alice")
             tcs = [e for e in events if e["type"] == "text_chunk"]
@@ -370,6 +374,7 @@ class TestStreaming:
         try:
             await out.write_stream("tiny")
             await out.on_processing_end()
+            await out.drain()
             store.flush()
             tcs = [e for e in store.get_events("alice") if e["type"] == "text_chunk"]
             assert [e["content"] for e in tcs] == ["tiny"]
@@ -385,6 +390,7 @@ class TestProcessingLifecycle:
         store, out = _make(tmp_path)
         try:
             await out.on_processing_start()
+            await out.drain()
             store.flush()
             evts = store.get_events("alice")
             assert any(e["type"] == "processing_start" for e in evts)
@@ -539,6 +545,7 @@ class TestStart:
         store, out = _make(tmp_path)
         try:
             await out.stop()
+            await out.drain()
             store.flush()
             assert store.get_events("alice") == []
         finally:
@@ -548,6 +555,7 @@ class TestStart:
         store, out = _make(tmp_path)
         try:
             await out.flush()
+            await out.drain()
             store.flush()
             assert store.get_events("alice") == []
         finally:
@@ -564,7 +572,6 @@ class TestActivityHandlers:
             out.on_activity("tool_start", "[bash] cmd")
             await out.drain()
             store.flush()
-            await out.drain()
             assert store.get_events("alice") == []
         finally:
             store.close()
@@ -577,7 +584,6 @@ class TestActivityHandlers:
             )
             await out.drain()
             store.flush()
-            await out.drain()
             evts = [e for e in store.get_events("alice") if e["type"] == "tool_call"]
             assert len(evts) == 1
             assert evts[0]["name"] == "bash"
@@ -602,6 +608,7 @@ class TestActivityHandlers:
                     "args": {},
                 },
             )
+            await out.drain()
             event = next(
                 e for e in store.get_events("alice") if e["type"] == "tool_call"
             )
@@ -626,7 +633,6 @@ class TestActivityHandlers:
             )
             await out.drain()
             store.flush()
-            await out.drain()
             evts = [e for e in store.get_events("alice") if e["type"] == "tool_result"]
             assert len(evts) == 1
             assert evts[0]["exit_code"] == 0
@@ -724,7 +730,6 @@ class TestActivityHandlers:
             )
             await out.drain()
             store.flush()
-            await out.drain()
             evts = store.get_events("alice")
             call = next(e for e in evts if e["type"] == "subagent_call")
             assert call["name"] == "explore"
@@ -889,7 +894,6 @@ class TestActivityHandlers:
             assert out._total_cached_tokens == 1
             await out.drain()
             store.flush()
-            await out.drain()
             evts = [e for e in store.get_events("alice") if e["type"] == "token_usage"]
             assert len(evts) == 2
         finally:
@@ -986,7 +990,6 @@ class TestActivityHandlers:
             )
             await out.drain()
             store.flush()
-            await out.drain()
             types = [e["type"] for e in store.get_events("alice")]
             assert "compact_start" in types
             assert "compact_complete" in types
@@ -1016,7 +1019,6 @@ class TestActivityHandlers:
             out.on_activity_with_metadata("what_is_this", "[name] x", {"k": 1})
             await out.drain()
             store.flush()
-            await out.drain()
             types = [e["type"] for e in store.get_events("alice")]
             # Falls through to ``activity:<type>``.
             assert "activity:what_is_this" in types
@@ -1114,7 +1116,6 @@ class TestWaveBHandlers:
             )
             await out.drain()
             store.flush()
-            await out.drain()
             evt = next(e for e in store.get_events("alice") if e["type"] == "tool_wait")
             assert evt["wait_ms"] == 50
         finally:
@@ -1265,6 +1266,7 @@ class TestEmitMatch:
             await out.emit(OutputEvent(type="text", content="hi"))
             # Buffered until the segment boundary.
             await out.emit(OutputEvent(type="processing_end", content=""))
+            await out.drain()
             store.flush()
             evts = [e for e in store.get_events("alice") if e["type"] == "text_chunk"]
             assert evts[0]["content"] == "hi"
@@ -1288,6 +1290,7 @@ class TestEmitMatch:
         store, out = _make(tmp_path)
         try:
             await out.emit(OutputEvent(type="user_input", content="ignored"))
+            await out.drain()
             store.flush()
             assert store.get_events("alice") == []
         finally:
@@ -1297,6 +1300,7 @@ class TestEmitMatch:
         store, out = _make(tmp_path)
         try:
             await out.emit(OutputEvent(type="resume_batch", content=""))
+            await out.drain()
             store.flush()
             assert store.get_events("alice") == []
         finally:
@@ -1357,6 +1361,7 @@ class TestEmitMatch:
                     payload={"job_id": "j1"},
                 )
             )
+            await out.drain()
             store.flush()
             evts = [e for e in store.get_events("alice") if e["type"] == "tool_call"]
             assert len(evts) == 1
@@ -1367,6 +1372,7 @@ class TestEmitMatch:
         store, out = _make(tmp_path, capture_activity=False)
         try:
             await out.emit(OutputEvent(type="tool_start", content="[bash]", payload={}))
+            await out.drain()
             store.flush()
             assert store.get_events("alice") == []
         finally:
@@ -1416,6 +1422,7 @@ class TestStartTokenRestore:
                 "total_output_tokens": 40,
                 "total_cached_tokens": 10,
             }
+            await out.drain()
             store.flush()
             await out.start()
             assert out._total_input_tokens == 100
@@ -1517,7 +1524,6 @@ class TestActivityMethods:
             out.on_activity("custom_step", "[stepname] did a thing")
             await out.drain()
             store.flush()
-            await out.drain()
             events = store.get_events("alice")
             # An unknown activity type is recorded under ``activity:<type>``.
             assert any(e.get("type") == "activity:custom_step" for e in events)
@@ -1544,7 +1550,6 @@ class TestActivityMethods:
             )
             await out.drain()
             store.flush()
-            await out.drain()
             events = store.get_events("alice")
             assert any(e.get("type") == "activity:custom_step" for e in events)
         finally:
@@ -1556,7 +1561,6 @@ class TestActivityMethods:
             out.on_activity_with_metadata("custom_step", "[x] ignored", {"weight": 5})
             await out.drain()
             store.flush()
-            await out.drain()
             assert store.get_events("alice") == []
         finally:
             store.close()
