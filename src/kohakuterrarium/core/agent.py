@@ -30,7 +30,12 @@ from kohakuterrarium.core.agent_observability import (
     wire_plugin_hook_timing,
     wire_scratchpad_observer,
 )
+from kohakuterrarium.core.agent_selection import track_plugin_selection
 from kohakuterrarium.core.agent_turn import AgentTurnMixin
+from kohakuterrarium.core.agent_budget_recovery import (
+    attach_recovery_hooks,
+    sync_emergency_drop_conversation,
+)
 from kohakuterrarium.core.branch_continuation import (
     continue_on_branch,
     normalize_branch_view,
@@ -218,8 +223,7 @@ class Agent(
         # Order matters: output before controller (need known_outputs for parser)
         with package_snapshot():
             self._init_llm()
-            if hasattr(self.llm, "on_emergency_drop"):
-                self.llm.on_emergency_drop(self._on_provider_emergency_drop)
+            attach_recovery_hooks(self, self.llm)
             self._init_registry()
             self._init_executor()
             # Instance-injected tools (E7) — registered BEFORE the
@@ -440,6 +444,7 @@ class Agent(
                 self.subagent_manager._parent_plugins = self.plugins
             if hasattr(self, "controller"):
                 self._apply_plugin_hooks()
+            track_plugin_selection(self)
             return
         plugin_cfgs = getattr(self.config, "plugins", []) or []
         self.plugins = init_plugins(
@@ -450,6 +455,7 @@ class Agent(
         )
         if not self.plugins:
             return
+        track_plugin_selection(self)
         if hasattr(self, "controller"):
             self.controller.plugins = self.plugins
         # Compact manager uses on_compact_start as a veto point + on_compact_end callback.

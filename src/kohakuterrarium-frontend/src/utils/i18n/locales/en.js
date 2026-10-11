@@ -278,6 +278,21 @@ export default {
 
   "settings.languageHint": "Choose the interface language for the web UI.",
   "settings.tabs.advanced": "Advanced",
+  "settings.tabs.sessions": "Sessions",
+  "settings.sessionSummary.title": "Session summaries",
+  "settings.sessionSummary.hint":
+    "Every session gets a one-line summary for the history list. It is written after the first turn, again every few turns, and after each context compaction. The model writes it with one short background call; the other sources cost nothing.",
+  "settings.sessionSummary.source": "Written by",
+  "settings.sessionSummary.source.llm": "The model",
+  "settings.sessionSummary.source.compaction": "Compaction summary",
+  "settings.sessionSummary.source.heuristic": "First prompt",
+  "settings.sessionSummary.source.off": "Off",
+  "settings.sessionSummary.every": "Refresh every N turns",
+  "settings.sessionSummary.model": "Summary model",
+  "settings.sessionSummary.modelHint": "Empty uses each session's own model.",
+  "settings.sessionSummary.override":
+    "Overridden for this server by KT_SESSION_SUMMARY_SOURCE={value}.",
+  "settings.sessionSummary.saved": "Saved",
   "settings.tabs.about": "About",
   "advanced.description":
     "Raw access to the framework's top-level YAML / JSON config files. Edits are validated before saving and live caches reload immediately.",
@@ -1247,6 +1262,8 @@ export default {
   "sessionViewer.overview.actions.export": "Export",
   "sessionViewer.overview.actions.delete": "Delete",
   "sessionViewer.overview.empty": "No data captured for this session yet.",
+  "sessionViewer.overview.noSummary": "No summary yet.",
+  "sessionViewer.overview.latestExchange": "Latest exchange",
 
   "sessionViewer.trace.empty": "No turns recorded yet.",
   "sessionViewer.trace.loading": "Loading turns…",
@@ -1373,11 +1390,8 @@ export default {
   "sessionViewer.export.failed": "Export failed",
 
   // ── v2 macro shell ──────────────────────────────────────────────
-  "shell.rail.dashboard": "Dashboard",
   "shell.rail.attached": "Attached",
   "shell.rail.attachedEmpty": "No running targets",
-  "shell.rail.conversations": "Conversations",
-  "shell.rail.conversationsEmpty": "No active conversations",
   "shell.rail.openChat": "Open chat",
   "shell.rail.closeChat": "Close chat",
   "shell.rail.openInspector": "Open inspector",
@@ -1386,9 +1400,6 @@ export default {
   "shell.rail.endConversation": "End conversation",
   "shell.rail.endConfirm": "End this conversation? Its saved history will remain available.",
   "shell.rail.endError": "Failed to end conversation",
-  "shell.rail.quick": "Quick",
-  "shell.rail.pinned": "Pinned",
-  "shell.rail.pinnedEmpty": "No pinned tabs",
   "shell.rail.commandPalette": "Command palette (Cmd/Ctrl+K)",
   "shell.rail.themeToLight": "Switch to light mode",
   "shell.rail.themeToDark": "Switch to dark mode",
@@ -1396,11 +1407,6 @@ export default {
   "shell.rail.collapse": "Collapse sidebar",
   "shell.rail.expand": "Expand sidebar",
 
-  "shell.quick.newCreature": "+ New creature…",
-  "shell.quick.newTerrarium": "+ New terrarium…",
-  "shell.quick.resume": "↻ Resume…",
-  "shell.quick.catalog": "Catalog",
-  "shell.quick.extensions": "Extensions",
   "extensions.title": "Extensions",
   "extensions.subtitle":
     "Plugins, tools, triggers and other modules contributed by installed packages.",
@@ -1410,8 +1416,6 @@ export default {
   "extensions.none": "No extensions found. Install a package to add some.",
   "extensions.editable": "editable",
   "shell.quick.studio": "Studio",
-  "shell.quick.sessions": "Sessions",
-  "shell.quick.stats": "Stats",
   "shell.quick.settings": "Settings",
   "shell.quick.admin": "Admin",
 
@@ -1424,57 +1428,16 @@ export default {
   "shell.tab.closeOthers": "Close other tabs",
   "shell.tab.closeLeft": "Close tabs to the left",
   "shell.tab.closeRight": "Close tabs to the right",
-  "shell.tab.pin": "Pin tab",
-  "shell.tab.unpin": "Unpin tab",
   "shell.tab.dashboardLocked": "The Dashboard tab cannot be closed",
-  "shell.tab.dashboardPinned": "The Dashboard tab is always pinned",
   "shell.tab.suffix.watch": "watch",
   "shell.tab.suffix.creature": "creature",
   "shell.tab.suffix.module": "module",
   "shell.tab.suffix.workspace": "workspace",
-  "shell.rail.savedSessions": "Saved sessions",
-
-  // Dashboard
-  "shell.dashboard.welcome": "Welcome back. Pick up where you left off.",
-  "shell.dashboard.autoRefreshOff": "Auto-refresh: off",
-  "shell.dashboard.autoRefresh5s": "Auto-refresh: 5s",
-  "shell.dashboard.autoRefresh15s": "Auto-refresh: 15s",
-  "shell.dashboard.autoRefresh60s": "Auto-refresh: 60s",
-  "shell.dashboard.quickStart": "Quick start",
-  "shell.dashboard.startCreature": "+ Creature",
-  "shell.dashboard.startCreatureSub": "pick a creature config",
-  "shell.dashboard.startTerrarium": "+ Terrarium",
-  "shell.dashboard.startTerrariumSub": "pick a terrarium recipe",
-  "shell.dashboard.resumeQs": "↻ Resume…",
-  "shell.dashboard.resumeQsSub": "recent saved sessions",
-  "shell.dashboard.advanced": "⚙ Advanced",
-  "shell.dashboard.advancedSub": "custom run options",
-  "shell.dashboard.running": "Running",
-  "shell.dashboard.noRunning": "No running instances. Use Quick start above to launch one.",
-  "shell.dashboard.recentSessions": "Recent sessions",
-  "shell.dashboard.recentLoading": "Loading…",
-  "shell.dashboard.recentEmpty": "No saved sessions yet.",
-  "shell.dashboard.showAll": "All →",
-  "shell.dashboard.showFewer": "Show fewer",
 
   // Recent-session row (Dashboard)
   "shell.recentRow.viewTip": "View this session (read-only)",
   "shell.recentRow.view": "View",
   "shell.recentRow.resumeTip": "Resume — start a live instance from this session",
-
-  // Dashboard "At a glance" stats card
-  "shell.statsCard.title": "At a glance",
-  "shell.statsCard.openStats": "Open Stats →",
-  "shell.statsCard.saved": "Saved",
-  "shell.statsCard.onDisk": "On disk",
-  "shell.statsCard.runningLabel": "Running",
-  "shell.statsCard.last24h": "Last 24h",
-  "shell.statsCard.providersReady": ({ count }) =>
-    `${count} provider${count === 1 ? "" : "s"} ready`,
-  "shell.statsCard.providersUnconfigured": ({ count }) => `${count} unconfigured`,
-  "shell.statsCard.mcpServers": ({ count }) => `${count} MCP server${count === 1 ? "" : "s"}`,
-  "shell.statsCard.llmP95": "LLM p95",
-  "shell.statsCard.errorsPer5m": "Errors / 5m",
 
   // Stats tab
   "shell.stats.title": "Stats",
@@ -1539,19 +1502,6 @@ export default {
   "shell.stats.tokensEmpty": "No token usage observed yet.",
   "shell.stats.errorsTitle": "Errors",
   "shell.stats.errorsAccumulated": "accumulated since startup",
-
-  // Modals (resume / new creature / new terrarium / advanced)
-  "shell.modal.resume.title": "Resume session",
-  "shell.modal.resume.searchPlaceholder": "Search saved sessions…",
-  "shell.modal.resume.matches": "Matches",
-  "shell.modal.resume.recent": "Recent",
-  "shell.modal.resume.empty": "No saved sessions yet.",
-  "shell.modal.resume.noMatches": "No matches.",
-  "shell.modal.resume.alsoOpenInspector": "Also open inspector",
-  "shell.modal.resume.cancel": "Cancel",
-  "shell.modal.resume.resume": "Resume",
-  "shell.modal.resume.resuming": "Resuming…",
-  "shell.modal.resume.loading": "Loading…",
 
   // ─── Cluster (lab-host multi-node UI surface) ───────────────────
   "cluster.pill.hostOnly": "LAB · host-only",
@@ -1866,7 +1816,11 @@ export default {
   "graph.flow.privilegedHint":
     "Privileged node: can reach every channel. Drawn links are where it sends work in and receives results",
   "graph.group.privileged": "Privileged nodes",
-  "graph.layer.control": "Control links",
+  "graph.layer.privilegedListen": "Privileged listens",
+  "graph.layer.privilegedSend": "Privileged sends",
+  "graph.layer.direct": "Direct links",
+  "graph.toolbar.links": "Links",
+  "graph.toolbar.linksHint": "Choose which kinds of links are drawn",
   "graph.tiers.user": "User",
   "graph.tiers.privileged": "privileged",
   "graph.tiers.listens": "listens",
@@ -1903,6 +1857,7 @@ export default {
   "graph.edge.kind.wire": "Output wire",
   "graph.edge.kind.via": "Through channels",
   "graph.edge.kind.lineage": "Spawned by",
+  "graph.edge.kind.direct": "Direct link",
   "graph.edge.bundled": ({ n }) => `${n} connections bundled; expand the group to edit them.`,
   "graph.edge.withContent": "Forward the turn's final text",
   "graph.edge.prompt": "Prompt template",
@@ -1910,6 +1865,9 @@ export default {
   "graph.edge.explain.via": ({ channels }) =>
     `Messages reach the target through: ${channels}. Edit membership on the creatures.`,
   "graph.edge.explain.lineage": "The target was spawned by the source. This link is informational.",
+  "graph.edge.explain.direct": "The source can message the target directly, as a privileged node.",
+  "graph.edge.explain.directAssigned":
+    "The source sends on the target's direct channel, so it messages the target directly.",
   "graph.confirm.splits": ({ n }) => `The session will split into ${n} sessions:`,
   "graph.confirm.removeCreature": ({ name }) => `Remove ${name}?`,
   "graph.confirm.removeCreatureBody": ({ name }) =>
@@ -1960,7 +1918,8 @@ export default {
   "graph.legend.title": "Legend",
   "graph.legend.membership": "Channel membership (arrow = message direction)",
   "graph.legend.handoff": "Handoff: work passing on a channel (label names it)",
-  "graph.legend.control": "Link to or from a privileged node (purple)",
+  "graph.legend.control": "Privileged node listening on or sending to a channel (purple)",
+  "graph.legend.direct": "Direct link: messages the creature it points at, no channel",
   "graph.legend.bundle": "Channel every arrow of a fan carries, named once",
   "graph.legend.wire": "Output wire: turn-end text to another creature",
   "graph.legend.ping": "Ping only: a wire without content",
@@ -2022,8 +1981,6 @@ export default {
   "graph.quickAdd.channel": "Channel",
   "graph.quickAdd.wireFrom": ({ name }) => `The new creature receives ${name}'s turn output.`,
   "graph.quickAdd.sendFrom": ({ name }) => `${name} sends to this channel.`,
-  "graph.quickAdd.fromCreature": "From a creature config",
-  "graph.quickAdd.fromRecipe": "From a terrarium recipe",
   "graph.ws.open": "live",
   "graph.ws.closed": "offline",
   "graph.ws.connecting": "connecting",

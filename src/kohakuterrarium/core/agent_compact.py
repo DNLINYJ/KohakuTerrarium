@@ -16,6 +16,7 @@ from kohakuterrarium.core.snapshot_history import (
     prepare_snapshot,
     replayed_compact_state,
 )
+from kohakuterrarium.llm.base import fork_llm
 from kohakuterrarium.llm.profiles import profile_to_identifier, resolve_controller_llm
 from kohakuterrarium.session.snapshot import load_branch_snapshot
 from kohakuterrarium.utils.logging import get_logger
@@ -47,11 +48,17 @@ class AgentCompactMixin:
             )
 
     async def _compact_overflow_rescue(self) -> list[dict[str, Any]] | None:
-        """Wait out an in-flight compact and retry with the spliced
-        conversation instead of dropping tool data."""
+        """Compact (starting a round if none is running) and retry with the
+        spliced conversation instead of dropping tool data."""
         manager = getattr(self, "compact_manager", None)
-        if manager is None or not manager.is_compacting:
+        if manager is None:
             return None
+        # An overflowing request carries no usage, so usage-driven auto-compact
+        # never starts; the rescue itself must.
+        if not manager.is_compacting:
+            # Like auto-compact, the rescue honours compact.enabled=false.
+            if not manager.config.enabled or not manager.trigger_compact():
+                return None
         # When the compactor fell back to the ACTIVE provider, an
         # overflow inside the summarization call fires this hook from
         # within the compact task itself — waiting would deadlock on
@@ -67,8 +74,8 @@ class AgentCompactMixin:
     def _build_compact_llm(self, compact_cfg: CompactConfig) -> Any:
         """Build an isolated LLM instance for compaction.
 
-        Falls back to the active provider only when a separate provider
-        cannot be constructed.
+        Falls back to a fork of the active provider when a separate provider
+        cannot be constructed, so compaction never shares its transport session.
         """
         profile_name = (
             compact_cfg.compact_model or self._llm_selector or self.config.llm_profile
@@ -95,7 +102,7 @@ class AgentCompactMixin:
                     error=str(e),
                     exc_info=True,
                 )
-        return self.llm
+        return fork_llm(self.llm)
 
 
 def restore_compact_state_from_session(

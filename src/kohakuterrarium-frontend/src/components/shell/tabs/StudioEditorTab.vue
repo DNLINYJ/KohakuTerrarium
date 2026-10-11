@@ -4,7 +4,7 @@
     <StudioHomePage v-if="kind === 'home'" />
 
     <!-- workspace dashboard — entityKind === "workspace" -->
-    <StudioWorkspacePage v-else-if="kind === 'workspace'" :workspace-path-prop="tab.workspace" />
+    <StudioWorkspacePage v-else-if="kind === 'workspace'" :key="tab.workspace" :workspace-path-prop="tab.workspace" />
 
     <!-- creature editor — entityKind === "creature" -->
     <StudioCreaturePage v-else-if="kind === 'creature'" :creature-name-prop="tab.entity" />
@@ -29,15 +29,17 @@ import { STUDIO_NAV_INJECT_KEY } from "@/composables/useStudioNav"
 import { useTabsStore } from "@/stores/tabs"
 import { buildStudioTabId } from "@/utils/tabsUrl"
 
-const props = defineProps({ tab: { type: Object, required: true } })
+/**
+ * A Studio page in a shell tab — the workspace picker, a workspace, a
+ * creature or a module, by `tab.entityKind` — for Studio tabs a browser
+ * still holds; Studio itself is the app the rail switches to.
+ */
+const props = defineProps({
+  tab: { type: Object, required: true },
+})
 
 const tabs = useTabsStore()
 
-// Studio uses ``entityKind`` to pick which page to mount. The
-// "workspace selection + module/creature selection" surface is
-// ``entityKind: "home"`` (workspace picker) or ``entityKind:
-// "workspace"`` (within an opened workspace). Each creature/module
-// editor opens as its own tab via the studioNav provider below.
 const kind = computed(() => props.tab.entityKind || "home")
 
 // v2 navigation — every router.push inside the studio pages becomes a

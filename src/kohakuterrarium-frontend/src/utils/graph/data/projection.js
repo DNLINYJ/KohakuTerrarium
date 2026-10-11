@@ -5,8 +5,9 @@
  * Options:
  *   sessionId    scope to one session, or null for every session
  *   groupBy      "auto" | "none" | "host" | "session"
- *   layers       { channels, wires, lineage, control } visibility; `control` shows a
- *                privileged creature's channel access and the reports wired to it
+ *   layers       visibility per link kind (LAYER_IDS): channel memberships, wires,
+ *                lineage, a privileged creature's listens and assigned sends,
+ *                and direct creature → creature reach
  *   channelMode  "node" (channels drawn as hubs) | "inline" (creature→creature edges labelled by channel)
  *   collapsed    Set of group ids rendered as one aggregate node
  *   search       case-insensitive name filter (non-matches are dimmed)
@@ -19,8 +20,21 @@ export const DEFAULT_LAYERS = Object.freeze({
   channels: true,
   wires: true,
   lineage: false,
-  control: false,
+  privilegedListen: true,
+  privilegedSend: true,
+  direct: true,
 })
+
+export const LAYER_IDS = Object.freeze(Object.keys(DEFAULT_LAYERS))
+
+/** A privileged creature's channel edge narrowed to the directions `layers` show, or null. */
+function controlEdge(e, layers) {
+  const send = layers.privilegedSend && (e.mode === "send" || e.mode === "both")
+  const listen = layers.privilegedListen && (e.mode === "listen" || e.mode === "both")
+  if (!send && !listen) return null
+  const mode = send && listen ? "both" : send ? "send" : "listen"
+  return mode === e.mode ? e : { ...e, mode }
+}
 
 export function groupIdFor(kind, key) {
   return `grp:${kind}:${key}`
@@ -51,7 +65,8 @@ function scopeModel(model, sessionId) {
 /**
  * Privileged creatures form the control plane: when a session has both
  * privileged creatures and workers, the privileged ones share one
- * "privileged nodes" group per session, whatever the grouping.
+ * "privileged nodes" group per session. Grouped by session, they stay in
+ * their session's group instead, so the session boundary holds all of it.
  */
 function controlSessions(scoped) {
   const out = new Set()
@@ -62,12 +77,41 @@ function controlSessions(scoped) {
   return out
 }
 
+function controlLabel(sessions, sessionId) {
+  if (sessions.length < 2) return ""
+  return sessions.find((s) => s.id === sessionId)?.name || sessionId
+}
+
+/**
+ * The privileged-node groups of a projection, for views that lay the control
+ * plane out on its own (flow, bus). Grouped by session they are not render
+ * groups, so they are derived here from the expanded sessions.
+ */
+export function controlGroupsOf(projection) {
+  if (projection.groupBy !== "session") return projection.groups.filter((g) => g.kind === "control")
+  const present = new Set(projection.nodes.map((n) => n.id))
+  return [...controlSessions(projection)]
+    .map((sessionId) => ({
+      id: groupIdFor("control", sessionId),
+      kind: "control",
+      key: sessionId,
+      label: controlLabel(projection.sessions, sessionId),
+      creatureIds: projection.creatures
+        .filter((c) => c.sessionId === sessionId && c.privileged && present.has(c.id))
+        .map((c) => c.id),
+      channelIds: [],
+      busy: 0,
+      attention: 0,
+      collapsed: false,
+    }))
+    .filter((g) => g.creatureIds.length)
+}
+
 function buildGroups(scoped, groupBy, collapsed) {
   const groups = new Map()
   const memberOf = new Map()
   const sessionName = new Map(scoped.sessions.map((s) => [s.id, s.name]))
-  const withControl = controlSessions(scoped)
-  const multiSession = scoped.sessions.length > 1
+  const withControl = groupBy === "session" ? new Set() : controlSessions(scoped)
   const ensure = (kind, key, label) => {
     const id = groupIdFor(kind, key)
     if (!groups.has(id)) {
@@ -88,11 +132,7 @@ function buildGroups(scoped, groupBy, collapsed) {
   for (const c of scoped.creatures) {
     let group = null
     if (c.privileged && withControl.has(c.sessionId)) {
-      group = ensure(
-        "control",
-        c.sessionId,
-        multiSession ? sessionName.get(c.sessionId) || c.sessionId : "",
-      )
+      group = ensure("control", c.sessionId, controlLabel(scoped.sessions, c.sessionId))
     } else if (groupBy === "host") {
       group = ensure("host", c.hostId, c.hostId)
     } else if (groupBy === "session") {
@@ -123,13 +163,14 @@ function buildGroups(scoped, groupBy, collapsed) {
   return { groups: sorted, memberOf }
 }
 
-function inlineChannelEdges(scoped, showControl) {
+function inlineChannelEdges(scoped, layers) {
   const privileged = new Set(scoped.creatures.filter((c) => c.privileged).map((c) => c.id))
-  const visible = (id) => showControl || !privileged.has(id)
+  const sends = (id) => layers.privilegedSend || !privileged.has(id)
+  const listens = (id) => layers.privilegedListen || !privileged.has(id)
   const out = []
   for (const ch of scoped.channels) {
-    for (const s of ch.senders.filter(visible)) {
-      for (const l of ch.listeners.filter(visible)) {
+    for (const s of ch.senders.filter(sends)) {
+      for (const l of ch.listeners.filter(listens)) {
         if (s === l) continue
         out.push({
           id: `via:${s}:${l}:${ch.id}`,
@@ -228,15 +269,21 @@ export function projectGraph(model, options = {}) {
     nodes.push({ id: ch.id, kind: "channel", parent: groupId, channel: ch })
   }
 
-  const showControl = !!layers.control
-  let rawEdges = scoped.edges.filter((e) => {
-    if (e.kind === "channel") return showChannelNodes && (showControl || !e.control)
-    if (e.kind === "wire") return layers.wires && (showControl || !e.report)
-    if (e.kind === "lineage") return layers.lineage
-    return true
-  })
+  let rawEdges = []
+  for (const e of scoped.edges) {
+    if (e.kind === "channel") {
+      const shown = !showChannelNodes ? null : e.control ? controlEdge(e, layers) : e
+      if (shown) rawEdges.push(shown)
+    } else if (e.kind === "wire") {
+      if (layers.wires) rawEdges.push(e)
+    } else if (e.kind === "lineage") {
+      if (layers.lineage) rawEdges.push(e)
+    } else if (e.kind === "direct") {
+      if (layers.direct) rawEdges.push(e)
+    } else rawEdges.push(e)
+  }
   if (layers.channels && channelMode === "inline")
-    rawEdges = rawEdges.concat(inlineChannelEdges(scoped, showControl))
+    rawEdges = rawEdges.concat(inlineChannelEdges(scoped, layers))
 
   const remap = (id) => {
     if (hidden.has(id)) return null

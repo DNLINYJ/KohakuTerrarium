@@ -1,9 +1,5 @@
 <template>
   <div class="group h-8 flex items-center gap-1.5 pl-3 pr-1.5 text-xs border-r border-warm-200 dark:border-warm-700 cursor-pointer select-none shrink-0" :class="active ? 'bg-[var(--kt-shell-tab-active)] dark:bg-warm-950 text-warm-800 dark:text-warm-200 border-b-2 border-b-iolite' : 'text-warm-600 dark:text-warm-500 hover:bg-warm-300/40 dark:hover:bg-warm-800/40'" :draggable="true" @click="$emit('activate')" @mousedown.middle.prevent="onMiddleClick" @dragstart="onDragStart" @dragover.prevent @drop.stop.prevent="$emit('drop', $event)" @contextmenu.prevent="onContextMenu">
-    <!-- Pinned indicator. Dashboard's kind icon is already a house, so
-         we don't render an extra one beside it; the kind icon below
-         is enough on its own. -->
-    <span v-if="isPinned && !isDashboard" class="i-carbon-pin-filled text-iolite text-xs shrink-0" />
     <span :class="[iconClass, isDashboard ? 'text-iolite' : '']" class="text-sm shrink-0" />
     <span class="truncate max-w-32">{{ label }}</span>
     <span v-if="badge" class="text-xs font-bold" :title="badge === '!' ? 'pending attention' : 'completed attention'">{{ badge }}</span>
@@ -11,7 +7,7 @@
     <button v-if="!isDashboard" class="i-carbon-close hover-only-action hover:text-warm-700" :title="t('shell.tab.closeTab')" @click.stop="$emit('close')" />
   </div>
 
-  <TabContextMenu v-if="menuOpen" :tab="tab" :is-pinned="isPinned" :position="menuPos" :index="tabIndex" :total="totalTabs" @close="menuOpen = false" @refresh="onRefresh" @toggle-pin="togglePin" @close-tab="$emit('close')" @close-left="closeLeft" @close-right="closeRight" @close-others="closeOthers" @close-all="closeAll" />
+  <TabContextMenu v-if="menuOpen" :tab="tab" :position="menuPos" :index="tabIndex" :total="totalTabs" @close="menuOpen = false" @refresh="onRefresh" @close-tab="$emit('close')" @close-left="closeLeft" @close-right="closeRight" @close-others="closeOthers" @close-all="closeAll" />
 </template>
 
 <script setup>
@@ -59,7 +55,6 @@ const badge = computed(() => {
 const menuOpen = ref(false)
 const menuPos = ref({ x: 0, y: 0 })
 
-const isPinned = computed(() => tabs.pinnedIds.has(props.tab.id))
 const isDashboard = computed(() => props.tab.id === "dashboard")
 const tabIndex = computed(() => tabs.tabs.findIndex((t) => t.id === props.tab.id))
 const totalTabs = computed(() => tabs.tabs.length)
@@ -85,12 +80,6 @@ function onMiddleClick() {
   // close gesture (matches every browser tab strip).
   if (isDashboard.value) return
   emit("close")
-}
-
-function togglePin() {
-  if (isDashboard.value) return // dashboard is implicitly always-pinned
-  if (isPinned.value) tabs.unpinTab(props.tab.id)
-  else tabs.pinTab(props.tab.id)
 }
 
 function onRefresh() {
@@ -120,9 +109,10 @@ const iconClass = computed(
       attach: "i-carbon-chat",
       inspector: "i-carbon-radar",
       "session-viewer": "i-carbon-recently-viewed",
-      "saved-sessions": "i-carbon-list",
+      "saved-sessions": "i-carbon-recently-viewed",
       "studio-editor": "i-carbon-tool-box",
       catalog: "i-carbon-catalog",
+      extensions: "i-carbon-catalog",
       settings: "i-carbon-settings",
       "code-editor": "i-carbon-code",
       graph: "i-carbon-network-3",
@@ -137,7 +127,7 @@ const label = computed(() => {
   const tab = props.tab
   switch (tab.kind) {
     case "dashboard":
-      return t("shell.rail.dashboard")
+      return t("lab.rail.lab")
     case "attach":
       return tab.config_name ?? tab.target ?? "attach"
     case "inspector":
@@ -145,14 +135,15 @@ const label = computed(() => {
     case "session-viewer":
       return tab.config_name || tab.name || "session"
     case "saved-sessions":
-      return t("shell.rail.savedSessions")
+      return t("lab.history.title")
     case "studio-editor":
       if (tab.entityKind === "creature") return `${tab.entity} · ${t("shell.tab.suffix.creature")}`
       if (tab.entityKind === "module") return `${tab.entity} · ${t("shell.tab.suffix.module")}`
       if (tab.entityKind === "workspace") return `${tab.workspace} · ${t("shell.tab.suffix.workspace")}`
       return t("shell.quick.studio")
     case "catalog":
-      return t("shell.quick.catalog")
+    case "extensions":
+      return t("lab.library.title")
     case "settings":
       return t("shell.quick.settings")
     case "code-editor":

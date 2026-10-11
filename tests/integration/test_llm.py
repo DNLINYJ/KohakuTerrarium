@@ -44,6 +44,7 @@ from PIL import Image
 from websockets import serve
 
 from kohakuterrarium import Terrarium
+from kohakuterrarium.core.agent_budget_recovery import apply_context_repair
 from kohakuterrarium.core.conversation import Conversation
 from kohakuterrarium.llm import antigravity_auth as agy_auth
 from kohakuterrarium.session.history import (
@@ -73,7 +74,7 @@ from kohakuterrarium.llm.base import (
 )
 from kohakuterrarium.llm.codex_auth import CodexTokens
 from kohakuterrarium.llm.codex_provider import CodexOAuthProvider
-from kohakuterrarium.llm.grok_auth import GrokToken, GrokTokens
+from kohakuterrarium.llm.grok_auth import GROK_CLI_BASE_URL, GrokToken, GrokTokens
 from kohakuterrarium.llm.grok_image_gen import GrokImageClient
 from kohakuterrarium.llm.grok_media import GrokMediaClient
 from kohakuterrarium.llm.message import (
@@ -698,6 +699,30 @@ class TestLlmIntegration:
         assert codex_profile.provider == "codex"
         assert codex_profile.backend_type == "codex"
         # bootstrap/llm.py branches on backend_type == "codex" -> CodexOAuthProvider.
+
+        for model in ("gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"):
+            profile = resolve_controller_llm({}, llm=f"codex/{model}")
+            assert profile.model == model
+            assert profile.max_context == 272000
+            assert profile.reasoning_effort == "medium"
+            selected = resolve_controller_llm(
+                {}, llm=f"codex/{model}@reasoning=max,context=1m,speed=fast"
+            )
+            provider = _create_from_profile(selected)
+            assert isinstance(provider, CodexOAuthProvider)
+            assert provider.model == model
+            assert provider.reasoning_effort == "max"
+            assert provider.service_tier == "priority"
+            assert provider._websocket_mode is True
+            assert selected.max_context == 1000000
+            entry = next(
+                e for e in list_all() if e["provider"] == "codex" and e["name"] == model
+            )
+            assert entry["model"] == model
+        with pytest.raises(ValueError, match="ultra"):
+            resolve_controller_llm({}, llm="codex/gpt-6-luna@reasoning=ultra")
+        with pytest.raises(ValueError, match="none"):
+            resolve_controller_llm({}, llm="codex/gpt-6.1-sol@reasoning=none")
 
         daybreak_profile = resolve_controller_llm({}, llm="gpt-daybreak-blue-latest")
         assert daybreak_profile is not None
@@ -1606,6 +1631,55 @@ class TestLlmIntegration:
             return None
 
         monkeypatch.setattr(GrokTokens, "ensure_fresh_cli", no_refresh)
+        subscription_token = GrokToken(
+            access_token="subscription-test",
+            source="grok-cli",
+            base_url=GROK_CLI_BASE_URL,
+        )
+        monkeypatch.setattr(GrokTokens, "load_candidates", lambda: [subscription_token])
+        subscription_requests = []
+
+        def subscription_response(request):
+            body = json.loads(request.content)
+            subscription_requests.append(
+                (
+                    str(request.url),
+                    body["model"],
+                    request.headers["x-grok-model-override"],
+                )
+            )
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text='data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n'
+                "data: [DONE]\n\n",
+            )
+
+        for model in ("grok-4.7", "grok-4.7-build-fast"):
+            selector = f"grok-subscription/{model}-subscription"
+            profile = resolve_controller_llm({"llm": selector})
+            subscription_provider = _create_from_profile(profile)
+            initial_client = subscription_provider._client
+            subscription_provider._client = initial_client.with_options(
+                http_client=httpx.AsyncClient(
+                    transport=httpx.MockTransport(subscription_response)
+                )
+            )
+            await initial_client.close()
+            try:
+                result = [
+                    chunk
+                    async for chunk in subscription_provider.chat([UserMessage("Hi")])
+                ]
+                assert "".join(result) == "ok"
+                assert subscription_requests[-1] == (
+                    f"{GROK_CLI_BASE_URL}/chat/completions",
+                    model,
+                    model,
+                )
+            finally:
+                await subscription_provider._client.close()
+
         monkeypatch.setattr(
             GrokTokens,
             "load_candidates",
@@ -1905,6 +1979,7 @@ class TestLlmIntegration:
             assert restored.to_messages() == saved_history
 
             budget_requests = []
+            image_cap = [50]
 
             def budget_response(request):
                 body = json.loads(request.content)
@@ -1913,7 +1988,7 @@ class TestLlmIntegration:
                     part["type"] == "input_image"
                     for part in body["input"][0]["content"]
                 )
-                if count > 50:
+                if count > image_cap[0]:
                     return httpx.Response(
                         400,
                         json={
@@ -1957,6 +2032,97 @@ class TestLlmIntegration:
                 await responses_provider.chat_complete(budget_history)
             ).content == "bounded"
             assert budget_requests[2]["input"] == budget_requests[1]["input"]
+
+            # Refused images leave the request and the host conversation alike.
+            host = Conversation()
+            host.append("user", budget_history[0].content, metadata={"turn_index": 1})
+            responses_provider.on_context_repair(
+                lambda repair: apply_context_repair(host, repair)
+            )
+            image_cap[0] = 0
+            sent_before = len(budget_requests)
+            repaired = await responses_provider.chat_complete(host.to_messages())
+            assert repaired.content == "bounded"
+            assert len(budget_requests) == sent_before + 2
+            retried = budget_requests[-1]["input"][0]["content"]
+            assert [part["type"] for part in retried] == ["input_text"]
+            assert "56 image(s) removed" in retried[0]["text"]
+            assert "Exceeded maximum number of images" in retried[0]["text"]
+            stored = host.to_messages()[0]["content"]
+            assert stored == [{"type": "text", "text": retried[0]["text"]}]
+            assert host.get_messages()[0].metadata == {"turn_index": 1}
+            host.append("user", "next")
+            await responses_provider.chat_complete(host.to_messages())
+            assert len(budget_requests) == sent_before + 3
+            assert "input_image" not in json.dumps(budget_requests[-1]["input"])
+            assert messages_to_dicts(budget_history) == saved_budget_history
+
+            # A proxy that refuses bodies over a byte limit: the provider learns
+            # a ceiling and refits the images; the host conversation keeps them.
+            body_limit = [1_200_000]
+            size_requests = []
+
+            def size_response(request):
+                size_requests.append(len(request.content))
+                if len(request.content) > body_limit[0]:
+                    return httpx.Response(
+                        413,
+                        text="<html><title>413 Request Entity Too Large</title></html>",
+                        headers={"content-type": "text/html"},
+                    )
+                return httpx.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    content='data: {"type":"response.output_text.delta","delta":"fits"}\n\n',
+                )
+
+            previous_client = responses_provider._client
+            responses_provider._client = previous_client.with_options(
+                http_client=httpx.AsyncClient(
+                    transport=httpx.MockTransport(size_response)
+                )
+            )
+            await previous_client.close()
+            scans = []
+            for seed in range(3):
+                pixels = random.Random(seed).randbytes(700 * 700 * 3)
+                stream = io.BytesIO()
+                Image.frombytes("RGB", (700, 700), pixels).save(stream, "PNG")
+                scan = base64.b64encode(stream.getvalue()).decode()
+                scans.append(ImagePart(url=f"data:image/png;base64,{scan}"))
+            size_host = Conversation()
+            size_host.append("user", scans, metadata={"turn_index": 2})
+            saved_scans = size_host.to_messages()
+            repairs_seen = []
+            responses_provider.on_context_repair(repairs_seen.append)
+            responses_provider.on_context_repair(
+                lambda repair: apply_context_repair(size_host, repair)
+            )
+            fitted = await responses_provider.chat_complete(size_host.to_messages())
+            assert fitted.content == "fits"
+            assert len(size_requests) >= 2
+            assert size_requests[0] > body_limit[0] >= size_requests[-1]
+            assert repairs_seen == []
+            assert size_host.to_messages() == saved_scans
+            learned = responses_provider.request_ceiling().max_bytes
+            assert learned is not None and learned < size_requests[0]
+            # The next turn starts under the learned ceiling: one request, no 413.
+            sent_before = len(size_requests)
+            await responses_provider.chat_complete(size_host.to_messages())
+            assert len(size_requests) == sent_before + 1
+            assert size_requests[-1] <= body_limit[0]
+            # A limit no refit can meet: the images leave request and host alike.
+            body_limit[0] = 5_000
+            again = await responses_provider.chat_complete(size_host.to_messages())
+            assert again.content == "fits"
+            assert [(r.kind, r.scope) for r in repairs_seen] == [
+                ("strip_media", "newest")
+            ]
+            stored = size_host.to_messages()[0]["content"]
+            assert [part["type"] for part in stored] == ["text"]
+            assert "3 image(s) removed" in stored[0]["text"]
+            assert "413 Request Entity Too Large" in stored[0]["text"]
+            assert size_host.get_messages()[0].metadata == {"turn_index": 2}
         finally:
             await responses_provider.close()
 

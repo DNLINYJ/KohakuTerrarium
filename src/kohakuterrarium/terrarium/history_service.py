@@ -39,9 +39,7 @@ class LocalHistoryServiceMixin:
             envelope={
                 "creature_id": creature_id,
                 "session_id": creature.graph_id,
-                "branch_view": encode_branch_view(
-                    selected_branch_view(creature.agent)
-                ),
+                "branch_view": encode_branch_view(selected_branch_view(creature.agent)),
             },
             **kwargs,
         )

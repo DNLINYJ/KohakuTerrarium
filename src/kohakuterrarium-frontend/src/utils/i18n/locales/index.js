@@ -8,6 +8,8 @@ import media from "./media"
 import links from "./links"
 import slash from "./slash"
 import messageActions from "./messageActions"
+import lab from "./lab"
+import studioApp from "./studioApp"
 
 // ``media``/``links``/``slash``/``messageActions`` carry genuine
 // ``chat.media.*`` / ``chat.link.*`` / ``chat.slash.error`` / ``chat.copy*``
@@ -15,13 +17,23 @@ import messageActions from "./messageActions"
 // remaining dictionaries fall back to the English table through
 // ``resolveMessage`` exactly like every other key.
 export const messages = {
-  en: { ...en, ...media.en, ...links.en, ...slash.en, ...messageActions.en },
+  en: {
+    ...en,
+    ...media.en,
+    ...links.en,
+    ...slash.en,
+    ...messageActions.en,
+    ...lab.en,
+    ...studioApp.en,
+  },
   "zh-TW": {
     ...zhTW,
     ...media["zh-TW"],
     ...links["zh-TW"],
     ...slash["zh-TW"],
     ...messageActions["zh-TW"],
+    ...lab["zh-TW"],
+    ...studioApp["zh-TW"],
   },
   "zh-CN": {
     ...zhCN,
@@ -29,6 +41,8 @@ export const messages = {
     ...links["zh-CN"],
     ...slash["zh-CN"],
     ...messageActions["zh-CN"],
+    ...lab["zh-CN"],
+    ...studioApp["zh-CN"],
   },
   ja,
   de,

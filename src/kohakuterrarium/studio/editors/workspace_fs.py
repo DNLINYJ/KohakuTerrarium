@@ -13,7 +13,18 @@ from typing import Any
 
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 
-from kohakuterrarium.studio.editors import creatures_crud, modules_crud
+from kohakuterrarium.packages.resolve import resolve_any_path
+from kohakuterrarium.packages.walk import package_snapshot
+from kohakuterrarium.studio.catalog.catalog_sources import load_workspace_manifest
+from kohakuterrarium.studio.catalog.packages_scan import (
+    invalidate_scan_caches,
+    package_ref,
+)
+from kohakuterrarium.studio.editors import (
+    creatures_crud,
+    modules_crud,
+    workspace_wiring,
+)
 from kohakuterrarium.studio.editors.codegen_init import get_codegen
 from kohakuterrarium.studio.editors.utils_paths import ensure_in_root, sanitize_name
 from kohakuterrarium.studio.editors.workspace_manifest import (
@@ -69,19 +80,103 @@ class LocalWorkspace:
             raise ValueError(f"unknown module kind: {kind!r}")
         return self.modules_dir / kind
 
+    def ref_prefix(self) -> str | None:
+        """The ``@pkg`` reference of the root, or None outside every package."""
+        return package_ref(self.root_path)
+
+    def ref_for(self, path: Path, prefix: str | None) -> str:
+        """The reference a config uses for ``path``: ``@pkg/rel`` or absolute."""
+        if prefix is None:
+            return str(path)
+        return f"{prefix}/{path.relative_to(self.root_path).as_posix()}"
+
     def summary(self) -> dict:
-        return {
-            "root": self.root,
-            "creatures": self.list_creatures(),
-            "modules": {
+        """Everything Studio lists for the workspace.
+
+        Every module file the workspace owns (in ``modules/<kind>/`` or
+        declared by its manifest) carries its ``ref`` and ``users``.
+        """
+        with package_snapshot():
+            prefix = self.ref_prefix()
+            modules = {
                 kind: modules_summary(self, kind, self.list_modules(kind))
                 for kind in KNOWN_KINDS
-            },
+            }
+            own = {
+                kind: [m for m in entries if m.get("editable") and m.get("path")]
+                for kind, entries in modules.items()
+            }
+            users = workspace_wiring.users_by_file(self, own)
+            for kind, entries in own.items():
+                for m in entries:
+                    key = workspace_wiring.module_file_key(self, kind, m)
+                    m["users"] = users[key]
+                    m.setdefault("ref", self.ref_for(key[1], prefix))
+            return {
+                "root": self.root,
+                "ref_prefix": prefix,
+                "is_project": prefix == "@",
+                "creatures": self.list_creatures(),
+                "terrariums": self.list_terrariums(),
+                "modules": modules,
+            }
+
+    def list_terrariums(self) -> list[dict]:
+        """Recipe folders under ``terrariums/`` (a ``terrarium.yaml`` each)."""
+        folder = self.root_path / "terrariums"
+        if not folder.is_dir():
+            return []
+        prefix = self.ref_prefix()
+        declared = {
+            str(e.get("path", "")).strip("/"): e
+            for e in load_workspace_manifest(self).get("terrariums") or []
+            if isinstance(e, dict)
         }
+        results: list[dict] = []
+        for child in sorted(p for p in folder.iterdir() if p.is_dir()):
+            listed = declared.get(f"terrariums/{child.name}", {})
+            cfg = next(
+                (
+                    child / f
+                    for f in ("terrarium.yaml", "terrarium.yml")
+                    if (child / f).exists()
+                ),
+                None,
+            )
+            if cfg is None:
+                continue
+            try:
+                data = load_creature_file(cfg)
+            except Exception as e:
+                data = {"error": f"parse failed: {e}"}
+            body = (
+                data.get("terrarium")
+                if isinstance(data.get("terrarium"), dict)
+                else data
+            )
+            creatures = body.get("creatures") or []
+            results.append(
+                {
+                    "name": body.get("name") or child.name,
+                    "path": str(child),
+                    "ref": self.ref_for(child, prefix),
+                    "description": body.get("description")
+                    or listed.get("description", ""),
+                    "creatures": len(creatures) if isinstance(creatures, list) else 0,
+                    **({"error": data["error"]} if "error" in data else {}),
+                }
+            )
+        return results
 
     def list_creatures(self) -> list[dict]:
         if not self.creatures_dir.is_dir():
             return []
+        prefix = self.ref_prefix()
+        declared = {
+            str(e.get("path", "")).strip("/"): e
+            for e in load_workspace_manifest(self).get("creatures") or []
+            if isinstance(e, dict)
+        }
         results: list[dict] = []
         for child in sorted(self.creatures_dir.iterdir()):
             if not child.is_dir():
@@ -99,6 +194,7 @@ class LocalWorkspace:
                     {
                         "name": child.name,
                         "path": str(child),
+                        "ref": self.ref_for(child, prefix),
                         "description": "",
                         "base_config": None,
                         "error": f"parse failed: {e}",
@@ -109,7 +205,11 @@ class LocalWorkspace:
                 {
                     "name": data.get("name", child.name),
                     "path": str(child),
-                    "description": data.get("description", ""),
+                    "ref": self.ref_for(child, prefix),
+                    "description": data.get("description")
+                    or declared.get(f"creatures/{child.name}", {}).get(
+                        "description", ""
+                    ),
                     "base_config": data.get("base_config"),
                 }
             )
@@ -131,16 +231,28 @@ class LocalWorkspace:
             "effective": compute_effective(cfg_path, data),
         }
 
-    def scaffold_creature(self, name: str, base: str | None) -> dict:
-        creatures_crud.scaffold_creature(self.creatures_dir, name, base)
+    def scaffold_creature(self, name: str, base: str | None, **seed: Any) -> dict:
+        """Create a creature; ``seed`` is starter / description / purpose / model."""
+        creatures_crud.scaffold_creature(self.creatures_dir, name, base, **seed)
+        invalidate_scan_caches()
+        return self.load_creature(name)
+
+    def fork_creature(self, name: str, source: str) -> dict:
+        """Copy the creature at ``source`` (a folder or ``@pkg/...``) in as ``name``."""
+        creatures_crud.fork_creature(
+            self.creatures_dir, name, resolve_any_path(source).expanduser().resolve()
+        )
+        invalidate_scan_caches()
         return self.load_creature(name)
 
     def save_creature(self, name: str, body: dict) -> dict:
         creatures_crud.save_creature(self.creatures_dir, name, body)
+        invalidate_scan_caches()
         return self.load_creature(name)
 
     def delete_creature(self, name: str) -> None:
         creatures_crud.delete_creature(self.creatures_dir, name)
+        invalidate_scan_caches()
 
     def read_prompt(self, creature: str, rel: str) -> str:
         creature = sanitize_name(creature)
@@ -159,6 +271,7 @@ class LocalWorkspace:
         kind_dir = self.module_kind_dir(kind)
         if not kind_dir.is_dir():
             return []
+        prefix = self.ref_prefix()
         results: list[dict] = []
         for child in sorted(kind_dir.iterdir()):
             if child.is_file() and child.suffix in (".py", ".yaml", ".yml"):
@@ -169,6 +282,7 @@ class LocalWorkspace:
                         "path": str(child.relative_to(self.root_path)).replace(
                             "\\", "/"
                         ),
+                        "ref": self.ref_for(child, prefix),
                     }
                 )
         return results
@@ -196,9 +310,36 @@ class LocalWorkspace:
         )
         return envelope
 
-    def scaffold_module(self, kind: str, name: str, template: str | None) -> dict:
+    def scaffold_module(
+        self,
+        kind: str,
+        name: str,
+        template: str | None,
+        plug_into: list[str] | None = None,
+    ) -> dict:
+        missing = [
+            c
+            for c in plug_into or []
+            if _find_config_file(self.creatures_dir / sanitize_name(c)) is None
+        ]
+        if missing:
+            raise FileNotFoundError(", ".join(missing))
         modules_crud.scaffold_module(self.module_kind_dir(kind), kind, name, template)
+        if plug_into:
+            self.plug_module(kind, name, plug_into)
         return self.load_module(kind, name)
+
+    def module_wiring(self, kind: str, name: str) -> dict:
+        return workspace_wiring.module_wiring(self, kind, name)
+
+    def module_users(self, kind: str, name: str) -> list[str]:
+        return workspace_wiring.module_users(self, kind, name)
+
+    def plug_module(self, kind: str, name: str, creatures: list[str]) -> list[str]:
+        return workspace_wiring.plug_module(self, kind, name, creatures)
+
+    def unplug_module(self, kind: str, name: str, creatures: list[str]) -> list[str]:
+        return workspace_wiring.unplug_module(self, kind, name, creatures)
 
     def save_module(self, kind: str, name: str, data: dict) -> dict:
         kind_dir = self.module_kind_dir(kind)

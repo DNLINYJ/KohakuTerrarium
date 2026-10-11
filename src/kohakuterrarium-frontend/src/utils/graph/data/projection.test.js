@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest"
 
 import { buildGraphModel, channelNodeId } from "./model"
-import { groupIdFor, projectGraph, resolveGroupBy } from "./projection"
+import { controlGroupsOf, groupIdFor, projectGraph, resolveGroupBy } from "./projection"
+import { groupBackdrops } from "@/utils/graph/layout/place/elk"
 
 function creature(id, extra = {}) {
   return {
@@ -84,6 +85,45 @@ describe("graph projection", () => {
     expect(parents[channelNodeId("g2", "z")]).toBe(groupIdFor("session", "g2"))
   })
 
+  it("keeps privileged nodes inside their session group when grouping by session", () => {
+    const teams = buildGraphModel({
+      graphs: ["g1", "g2"].map((g) => ({
+        graph_id: g,
+        name: g,
+        creatures: [creature(`${g}-boss`, { is_privileged: true }), creature(`${g}-w`)],
+      })),
+    })
+    const p = projectGraph(teams, { sessionId: null })
+    expect(p.groupBy).toBe("session")
+    expect(p.groups.map((g) => g.kind)).toEqual(["session", "session"])
+    const s1 = p.groups.find((g) => g.key === "g1")
+    expect(s1.creatureIds.sort()).toEqual(["g1-boss", "g1-w"])
+    expect(p.nodes.find((n) => n.id === "g1-boss").parent).toBe(groupIdFor("session", "g1"))
+    const boxes = new Map(
+      p.nodes.map((n, i) => [
+        n.id,
+        { x: i * 300, y: n.id.endsWith("boss") ? 0 : 200, width: 200, height: 70 },
+      ]),
+    )
+    const [back] = groupBackdrops([s1], boxes)
+    const boss = boxes.get("g1-boss")
+    expect(boss.x >= back.x && boss.y >= back.y).toBe(true)
+    expect(boss.x + boss.width <= back.x + back.width).toBe(true)
+    expect(controlGroupsOf(p).map((g) => [g.id, g.label, g.creatureIds])).toEqual([
+      [groupIdFor("control", "g1"), "g1", ["g1-boss"]],
+      [groupIdFor("control", "g2"), "g2", ["g2-boss"]],
+    ])
+    const collapsed = projectGraph(teams, {
+      sessionId: null,
+      collapsed: new Set([groupIdFor("session", "g1")]),
+    })
+    expect(controlGroupsOf(collapsed).map((g) => g.key)).toEqual(["g2"])
+
+    const one = projectGraph(teams, { sessionId: "g1" })
+    expect(one.groups.map((g) => [g.kind, g.creatureIds])).toEqual([["control", ["g1-boss"]]])
+    expect(controlGroupsOf(one)).toEqual(one.groups)
+  })
+
   it("collapses a group into one aggregate node and bundles its edges with counts", () => {
     const w1 = groupIdFor("host", "w1")
     const p = projectGraph(model, { sessionId: "g1", collapsed: new Set([w1]) })
@@ -132,6 +172,58 @@ describe("graph projection", () => {
       layers: { channels: false, wires: false, lineage: true },
     })
     expect(lineage.edges.map((e) => e.kind)).toEqual(["lineage"])
+  })
+
+  it("shows a privileged creature's listens, assigned sends and direct reach, each on its own layer", () => {
+    const team = buildGraphModel({
+      graphs: [
+        {
+          graph_id: "g",
+          creatures: [
+            creature("boss", {
+              is_privileged: true,
+              listen_channels: ["x", "y"],
+              send_channels: ["y"],
+            }),
+            creature("w", { send_channels: ["x"], listen_channels: ["y"] }),
+          ],
+        },
+      ],
+    })
+    const edges = (layers, channelMode = "node") =>
+      projectGraph(team, {
+        sessionId: "g",
+        groupBy: "none",
+        channelMode,
+        layers: { channels: true, wires: true, ...layers },
+      })
+        .edges.map((e) => `${e.kind}:${e.source}>${e.target}${e.mode ? `/${e.mode}` : ""}`)
+        .sort()
+    const x = channelNodeId("g", "x")
+    const y = channelNodeId("g", "y")
+    const all = { privilegedListen: true, privilegedSend: true, direct: true }
+    expect(edges(all)).toEqual([
+      `channel:boss>${x}/listen`,
+      `channel:boss>${y}/both`,
+      `channel:w>${x}/send`,
+      `channel:w>${y}/listen`,
+      "direct:boss>w",
+    ])
+    expect(edges({ ...all, privilegedSend: false, direct: false })).toEqual([
+      `channel:boss>${x}/listen`,
+      `channel:boss>${y}/listen`,
+      `channel:w>${x}/send`,
+      `channel:w>${y}/listen`,
+    ])
+    expect(edges({ ...all, privilegedListen: false })).toEqual([
+      `channel:boss>${y}/send`,
+      `channel:w>${x}/send`,
+      `channel:w>${y}/listen`,
+      "direct:boss>w",
+    ])
+    expect(edges({})).toEqual([`channel:w>${x}/send`, `channel:w>${y}/listen`])
+    expect(edges({ privilegedListen: true }, "inline")).toEqual(["via:w>boss"])
+    expect(edges({ privilegedSend: true }, "inline")).toEqual(["via:boss>w"])
   })
 
   it("dims everything that does not match the search", () => {

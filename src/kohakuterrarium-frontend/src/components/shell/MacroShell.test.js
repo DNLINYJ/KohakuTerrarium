@@ -6,9 +6,11 @@ import { createRouter, createMemoryHistory } from "vue-router"
 vi.mock("@/utils/api", () => ({
   attachAPI: { getCreaturePolicies: vi.fn(), getSessionPolicies: vi.fn() },
   sessionAPI: {
+    list: vi.fn().mockResolvedValue({ sessions: [], total: 0 }),
     listActive: vi.fn().mockResolvedValue([]),
     listOpen: vi.fn().mockResolvedValue([]),
   },
+  runtimeGraphAPI: { snapshot: vi.fn().mockResolvedValue({ graphs: [] }) },
   configAPI: { listCreatures: vi.fn(), listTerrariums: vi.fn(), getServerInfo: vi.fn() },
   settingsAPI: {
     getBackends: vi.fn().mockResolvedValue([]),
@@ -29,8 +31,18 @@ vi.mock("@/utils/api", () => ({
   },
 }))
 
+vi.mock("@/components/studio/app/StudioApp.vue", () => ({
+  __esModule: true,
+  default: { template: "<div data-test='studio-app-stub' />" },
+}))
+vi.mock("@/components/studio/app/rail/StudioRailNav.vue", () => ({
+  __esModule: true,
+  default: { template: "<div data-test='studio-rail-stub' />" },
+}))
+
 import MacroShell from "./MacroShell.vue"
 import RailItem from "./RailItem.vue"
+import TabGroupContainer from "./TabGroupContainer.vue"
 import { useTabsStore } from "@/stores/tabs"
 import { useConversationsStore } from "@/stores/conversations"
 import { sessionAPI } from "@/utils/api"
@@ -81,11 +93,13 @@ describe("MacroShell — render", () => {
     expect(wrapper.text()).toContain("Kohaku")
     expect(wrapper.text()).toContain("Terrarium")
     // Quick group entries
-    expect(wrapper.text()).toContain("Catalog")
+    expect(wrapper.text()).toContain("History")
+    expect(wrapper.text()).toContain("Library")
+    expect(wrapper.text()).not.toContain("Extensions")
     expect(wrapper.text()).toContain("Studio")
     expect(wrapper.text()).toContain("Settings")
-    // Pinned group placeholder
-    expect(wrapper.text()).toContain("No pinned tabs")
+    expect(wrapper.text()).toContain("Nothing running.")
+    expect(wrapper.text()).not.toContain("Pinned")
   })
 
   it("opens a default Dashboard tab on mount when none in URL", async () => {
@@ -135,6 +149,28 @@ describe("MacroShell — render", () => {
   })
 })
 
+describe("MacroShell — Studio mode", () => {
+  it("swaps the tabs for the Studio app and the rail for its navigator, and Settings returns to Terrarium", async () => {
+    storage.set("kt.appMode", "studio")
+    const { _resetAppModeForTests, useAppMode } = await import("@/components/shell/rail/useAppMode")
+    _resetAppModeForTests()
+    const router = makeRouter()
+    const wrapper = mount(MacroShell, { global: { plugins: [router] } })
+    await router.isReady()
+    await flushPromises()
+    expect(wrapper.find("[data-test='studio-app-stub']").exists()).toBe(true)
+    expect(wrapper.find("[data-test='studio-rail-stub']").exists()).toBe(true)
+    expect(wrapper.text()).not.toContain("Nothing running.")
+    expect(wrapper.findComponent(TabGroupContainer).exists()).toBe(false)
+    await wrapper.find("[data-test='rail-settings']").trigger("click")
+    await flushPromises()
+    expect(useAppMode().appMode.value).toBe("terrarium")
+    expect(useTabsStore().activeId).toBe("settings")
+    expect(wrapper.find("[data-test='studio-app-stub']").exists()).toBe(false)
+    expect(wrapper.text()).toContain("Nothing running.")
+  })
+})
+
 describe("MacroShell — density branch", () => {
   it("renders CompactShell (not RailPane) at compact density", async () => {
     // Narrow viewport BEFORE the composable initializes.
@@ -149,8 +185,8 @@ describe("MacroShell — density branch", () => {
     await router.isReady()
     // CompactShell renders a hamburger + density-override button; the
     // regular shell renders the BrandMark with full "Kohaku Terrarium"
-    // text and rail group entries like "No pinned tabs".
-    expect(wrapper.text()).not.toContain("No pinned tabs")
+    // text and rail group entries like "Nothing running.".
+    expect(wrapper.text()).not.toContain("Nothing running.")
 
     // Restore for downstream tests.
     window.innerWidth = 1024
@@ -167,7 +203,7 @@ describe("MacroShell — density branch", () => {
       global: { plugins: [router] },
     })
     await router.isReady()
-    expect(wrapper.text()).toContain("No pinned tabs")
+    expect(wrapper.text()).toContain("Nothing running.")
   })
 })
 

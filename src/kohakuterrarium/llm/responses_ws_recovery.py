@@ -16,10 +16,28 @@ from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Seconds a cancelled request waits for its close handshake before propagating.
+CANCEL_CLOSE_GRACE = 1.0
+
 
 def event_field(value: Any, name: str) -> Any:
     """Read a wire field from SDK objects or JSON dictionaries."""
     return value.get(name) if isinstance(value, dict) else getattr(value, name, None)
+
+
+MESSAGE_TOO_BIG = 1009
+
+
+def oversize_close(error: BaseException) -> bool:
+    """Whether the server closed the socket because a sent frame was too big."""
+    seen: set[int] = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, ConnectionClosed):
+            frame = error.rcvd
+            return frame is not None and frame.code == MESSAGE_TOO_BIG
+        error = error.__cause__ or error.__context__
+    return False
 
 
 def retryable_close(error: BaseException) -> bool:
@@ -55,6 +73,8 @@ class ResponsesWSError(Exception):
         last_event_type: str = "",
         retire_connection: bool = False,
         cache_miss: bool = False,
+        capability_mismatch: bool = False,
+        oversize: bool = False,
     ) -> None:
         super().__init__(message)
         self.mid_stream = mid_stream
@@ -67,6 +87,28 @@ class ResponsesWSError(Exception):
         self.body = {"code": code, "message": message}
         self.retire_connection = retire_connection or transport
         self.cache_miss = cache_miss
+        # The connection cannot serve the hosted tools this request declares.
+        self.capability_mismatch = capability_mismatch
+        # The event exceeds the socket's frame ceiling; the server never ran it.
+        self.oversize = oversize
+
+
+def server_rejected(error: BaseException) -> bool:
+    """Whether the server answered with a rejection, so a reduced resend is safe.
+
+    WS transport failures and failures after output began are uncertain: the
+    request may have run, so they never take the context-recovery path.
+    """
+    if isinstance(error, ResponsesWSError):
+        return not error.mid_stream and not error.transport
+    return True
+
+
+def fresh_recovery(
+    recovery: "WSRecovery | None", policy: RetryPolicy
+) -> "WSRecovery | None":
+    """A new submission budget for a request whose content recovery changed."""
+    return None if recovery is None else WSRecovery(policy, recovery.notify)
 
 
 class WSRecovery:
@@ -143,6 +185,7 @@ class WSRecovery:
             while True:
                 if reset_attempt is not None:
                     reset_attempt()
+                charged = (self.submitted, self.submissions)
                 try:
                     async with aclosing(
                         session._run_turn(base_event, items, pairing_fix, delta, self)
@@ -154,13 +197,35 @@ class WSRecovery:
                             yield event
                     return
                 except ResponsesWSError as exc:
+                    if exc.oversize and not exc.mid_stream:
+                        # The server refused the frame unread: this attempt was
+                        # never submitted, and resending it on WS cannot succeed.
+                        self.submitted, self.submissions = charged
+                        exc.submitted = self.submitted
+                        if exc.retire_connection:
+                            await session.close()
+                        logger.warning(
+                            "Responses WS request exceeds the frame ceiling",
+                            request_id=self._request_id,
+                            ceiling=session.max_message_bytes,
+                            submitted=self.submitted,
+                        )
+                        raise
                     self.submitted |= exc.submitted
                     exc.submitted = self.submitted
                     if exc.retire_connection:
                         await session.close()
                     budget = self.submissions < 1 + max(0, self.policy.max_retries)
                     rejected = exc.cache_miss and not exc.mid_stream
-                    transient = exc.retire_connection and retryable_close(exc)
+                    transient = (
+                        exc.retire_connection
+                        and not exc.capability_mismatch
+                        and retryable_close(exc)
+                    )
+                    # Capability rejections replay only before any server event.
+                    capability_retry = (
+                        exc.capability_mismatch and not exc.mid_stream and replayable
+                    )
                     if not exc.submitted:
                         connect_failures += 1
                     permitted = (
@@ -169,6 +234,7 @@ class WSRecovery:
                         and not self.delivered
                         and (
                             rejected
+                            or capability_retry
                             or (
                                 transient
                                 and connect_failures < 2
@@ -184,7 +250,7 @@ class WSRecovery:
                             reason = "submission_budget_exhausted"
                         elif self.delivered:
                             reason = "content_delivered"
-                        elif not transient:
+                        elif not transient and not rejected and not capability_retry:
                             reason = "non_retryable_error"
                         elif connect_failures >= 2:
                             reason = "connection_attempts_exhausted"
@@ -209,7 +275,7 @@ class WSRecovery:
                             received_events=exc.mid_stream,
                         )
                         raise
-                    if not rejected and exc.submitted:
+                    if not (rejected or capability_retry) and exc.submitted:
                         self.uncertain_replays += 1
                     logger.warning(
                         "Responses WS recovering",
@@ -231,7 +297,7 @@ class WSRecovery:
                         await asyncio.sleep(delay)
                         await self.status("reconnecting")
         except (asyncio.CancelledError, GeneratorExit):
-            await session.close()
+            await session.close(grace=CANCEL_CLOSE_GRACE)
             raise
         finally:
             await self.status(None)

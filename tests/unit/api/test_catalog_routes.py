@@ -23,6 +23,11 @@ from kohakuterrarium.api.routes.catalog import (
     terrariums_scan as terrariums_scan_mod,
     workspace as workspace_mod,
 )
+from kohakuterrarium.packages import locations as loc_mod
+from kohakuterrarium.studio.catalog.packages_scan import (
+    invalidate_scan_caches,
+    scan_creatures_in_dirs,
+)
 
 PREFIX = "/x"
 
@@ -388,6 +393,66 @@ class TestWorkspaceRoute:
         finally:
             catalog_deps.set_workspace(None)
 
+    def test_opens_the_local_project_and_packages_by_ref_with_wiring_refs(
+        self, tmp_path, monkeypatch
+    ):
+        pkgs = tmp_path / "packages"
+        (pkgs / "kit" / "modules" / "tools").mkdir(parents=True)
+        (pkgs / "kit" / "modules" / "tools" / "t.py").write_text("x = 1\n")
+        monkeypatch.setattr(loc_mod, "PACKAGES_DIR", pkgs)
+        monkeypatch.setattr(loc_mod, "PROJECT_DIR", None)
+        invalidate_scan_caches()
+        client = _client(workspace_mod.router)
+        try:
+            info = client.get(PREFIX + "/project").json()
+            assert info == {
+                "root": str(tmp_path / "project"),
+                "ref": "@",
+                "exists": False,
+            }
+            r = client.post(PREFIX + "/open", json={"path": "@"})
+            assert r.status_code == 200
+            body = r.json()
+            assert body["root"] == str((tmp_path / "project").resolve())
+            assert body["ref_prefix"] == "@" and body["is_project"] is True
+            assert client.get(PREFIX + "/project").json()["exists"] is True
+
+            assert scan_creatures_in_dirs([]) == []
+            ws = catalog_deps.get_workspace()
+            ws.scaffold_creature("helper", None)
+            assert [c["path"] for c in scan_creatures_in_dirs([])] == [
+                "@/creatures/helper"
+            ]
+            tool = ws.module_kind_dir("tools")
+            tool.mkdir(parents=True)
+            (tool / "mine.py").write_text("x = 1\n")
+            body = client.get(PREFIX).json()
+            assert [c["ref"] for c in body["creatures"]] == ["@/creatures/helper"]
+            mine = [m for m in body["modules"]["tools"] if m["name"] == "mine"]
+            assert mine[0]["ref"] == "@/modules/tools/mine.py"
+            ws.delete_creature("helper")
+            assert scan_creatures_in_dirs([]) == []
+
+            body = client.post(PREFIX + "/open", json={"path": "@kit"}).json()
+            assert body["ref_prefix"] == "@kit" and body["is_project"] is False
+            [t] = [m for m in body["modules"]["tools"] if m["name"] == "t"]
+            assert t["ref"] == "@kit/modules/tools/t.py"
+
+            plain = tmp_path / "plain"
+            (plain / "modules" / "tools").mkdir(parents=True)
+            (plain / "modules" / "tools" / "p.py").write_text("x = 1\n")
+            body = client.post(PREFIX + "/open", json={"path": str(plain)}).json()
+            assert body["ref_prefix"] is None and body["is_project"] is False
+            [p] = [m for m in body["modules"]["tools"] if m["name"] == "p"]
+            assert p["ref"] == str((plain / "modules" / "tools" / "p.py").resolve())
+
+            r = client.post(PREFIX + "/open", json={"path": "@ghost"})
+            assert r.status_code == 400
+            assert r.json()["detail"]["code"] == "bad_ref"
+        finally:
+            catalog_deps.set_workspace(None)
+            invalidate_scan_caches()
+
 
 # ── /creatures ─────────────────────────────────────────────────
 
@@ -425,6 +490,42 @@ class TestCreaturesRoute:
         # The scaffolded creature is now listable.
         listed = {c["name"] for c in client.get(PREFIX).json()}
         assert "alice" in listed
+
+    def test_scaffold_from_a_starter_and_fork(self, _workspace, tmp_path):
+        client = _client(creatures_mod.router)
+        r = client.post(
+            PREFIX,
+            json={
+                "name": "dev",
+                "starter": "researcher",
+                "description": "finds things",
+                "purpose": "Tracks papers.",
+                "model": "m1",
+            },
+        )
+        assert r.status_code == 201
+        body = r.json()
+        assert body["config"]["description"] == "finds things"
+        assert body["config"]["controller"]["llm"] == "m1"
+        assert [t["name"] for t in body["config"]["tools"]][0] == "web_search"
+        assert "Tracks papers." in body["prompts"]["prompts/system.md"]
+
+        r = client.post(PREFIX, json={"name": "x", "starter": "nope"})
+        assert r.status_code == 400
+        assert r.json()["detail"]["code"] == "unknown_starter"
+
+        forked = client.post(
+            PREFIX,
+            json={"name": "dev2", "fork_from": str(tmp_path / "creatures" / "dev")},
+        )
+        assert forked.status_code == 201
+        assert forked.json()["config"]["name"] == "dev2"
+        assert forked.json()["config"]["tools"] == body["config"]["tools"]
+        missing = client.post(
+            PREFIX, json={"name": "dev3", "fork_from": str(tmp_path / "nowhere")}
+        )
+        assert missing.status_code == 404
+        assert missing.json()["detail"]["code"] == "source_not_found"
 
     def test_scaffold_duplicate(self, _workspace):
         client = _client(creatures_mod.router)
