@@ -23,10 +23,40 @@ pytest tests/ -q
 
 # Coverage for one tier
 pytest tests/unit/ -q --cov=src/kohakuterrarium --cov-report=term-missing
+
+# One focused test: skip the worker spawn
+pytest tests/unit/core/test_executor.py::TestSerialLock -n 0
 ```
 
 `pytest` is configured in `pyproject.toml` with `asyncio_mode = "auto"`
 (no `@pytest.mark.asyncio` needed) and a per-test timeout.
+
+### Parallel runs
+
+Every run is parallel through pytest-xdist (`addopts = "-n auto --dist
+loadgroup"`). `-n auto` resolves in `tests/conftest.py`:
+`KT_TEST_WORKERS` when set, otherwise `min(16, cpu_count)`, never above
+64. Measured on an 86-core machine: 16 workers 204 s, 32 workers 251 s,
+64 workers 306 s (the suite is I/O- and startup-bound past 16). CI sets
+`KT_TEST_WORKERS=8` on its 3–4 vCPU runners.
+
+What keeps tests independent across workers:
+
+- Every test gets a private root (`kt-<uuid>/`): `HOME`, `USERPROFILE`,
+  `XDG_*`, `TMP`/`TEMP`/`TMPDIR` and `tempfile.tempdir` point inside it,
+  and `KT_CONFIG_DIR` points into the test's `tmp_path`. Child processes
+  inherit all of it. The operator's real home is only readable through
+  `tests/helpers/kt_biome.real_home()` (captured before redirection).
+- Tests that share one real resource carry `@pytest.mark.xdist_group(...)`
+  and run in order on one worker: `ports` (probe-a-free-port-then-reuse),
+  `mcp-subprocess` (real `mcp-serve` children), and the whole e2e tier
+  (`e2e`, added automatically). Everything else is distributed per test.
+- "The event loop was not blocked" is witnessed by
+  `tests/helpers/loop_witness.py` (the loop runs a callback while the
+  operation is in flight), never by wall-clock gaps. Ordering and
+  overlap are asserted with counters or events, not elapsed seconds.
+  A new test that bounds elapsed time is a check on the machine, not the
+  design.
 
 **CI policy (`.github/workflows/ci.yml`).** Unit and integration tiers
 run on the full OS × Python matrix (3.12+ on Linux / macOS / Windows).

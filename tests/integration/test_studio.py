@@ -65,6 +65,7 @@ from kohakuterrarium.studio.sessions.live.restore import restore_live_sessions
 from kohakuterrarium.studio.sessions.live.run_classes import CONTINUE_NUDGE
 
 from tests.helpers.antigravity_usage import install_quota_script, assert_quota
+from tests.helpers.kt_biome import find_kt_biome_source
 from kohakuterrarium.studio.identity import antigravity
 
 from tests.helpers.grok_usage_script import (
@@ -80,7 +81,7 @@ from tests.helpers.grok_usage_script import (
     write_metadata_version,
 )
 
-pytestmark = pytest.mark.timeout(30)
+pytestmark = pytest.mark.timeout(60)
 
 
 # ---------------------------------------------------------------------------
@@ -170,29 +171,6 @@ async def _drain_chat(
     async for chunk in studio.sessions.chat.chat(session_id, creature_id, msg):
         chunks.append(chunk)
     return "".join(chunks)
-
-
-def _find_kt_biome_source() -> Path | None:
-    """Locate a kt-biome bundle to install into the isolated catalog.
-
-    Dev machines carry a repo-local ``kt-biome/`` checkout; CI installs
-    kt-biome editable into the operator config dir before the suite
-    runs (see ``.github/workflows/ci.yml``), which leaves a
-    ``kt-biome.link`` pointing at the cloned source.
-    """
-    repo_local = Path(__file__).resolve().parents[2] / "kt-biome"
-    if (repo_local / "kohaku.yaml").exists():
-        return repo_local
-    real_pkgs = Path.home() / ".kohakuterrarium" / "packages"
-    link = real_pkgs / "kt-biome.link"
-    if link.exists():
-        target = Path(link.read_text(encoding="utf-8").strip())
-        if (target / "kohaku.yaml").exists():
-            return target
-    direct = real_pkgs / "kt-biome"
-    if (direct / "kohaku.yaml").exists():
-        return direct
-    return None
 
 
 def _scaffold_creature(studio: Studio, workspace_root: Path, name: str) -> Path:
@@ -1643,7 +1621,7 @@ class TestStudioIntegration:
             # and assert the catalog surfaces it.  The source is the
             # repo-local checkout on dev machines, or the operator-level
             # editable install CI provisions before running the suite.
-            biome_src = _find_kt_biome_source()
+            biome_src = find_kt_biome_source()
             if biome_src is None:
                 pytest.skip("kt-biome source not available on this machine")
             assert studio.catalog.packages.list() == []

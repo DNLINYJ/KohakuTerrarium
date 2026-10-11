@@ -65,7 +65,7 @@ from kohakuterrarium.prompt.template import (
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
 from kohakuterrarium.testing.output import OutputRecorder
 
-pytestmark = pytest.mark.timeout(30)
+pytestmark = pytest.mark.timeout(60)
 
 
 # ---------------------------------------------------------------------------

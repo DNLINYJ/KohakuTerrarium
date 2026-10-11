@@ -5,6 +5,7 @@ import asyncio
 import socket
 
 import httpx
+import pytest
 
 from kohakuterrarium.mcp_server.endpoint import Endpoint, EndpointStore
 from kohakuterrarium.mcp_server.management import manage
@@ -72,6 +73,7 @@ async def test_public_probe_is_bounded_and_matches_instance(monkeypatch):
     assert seen == ["initialize", "initialize"]
 
 
+@pytest.mark.xdist_group("ports")
 async def test_new_supervisor_fences_old_unconfirmed_commands(tmp_path):
     store = EndpointStore(tmp_path / "home")
     with socket.socket() as sock:

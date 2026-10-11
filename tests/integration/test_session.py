@@ -71,7 +71,7 @@ from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.version import FORMAT_VERSION, detect_format_version
 from kohakuterrarium.testing.llm import ScriptedLLM
 
-pytestmark = pytest.mark.timeout(30)
+pytestmark = pytest.mark.timeout(60)
 
 
 # ── deterministic collaborators ──────────────────────────────────
@@ -1620,6 +1620,7 @@ class TestSessionIntegration:
         with pytest.raises((ValueError, RuntimeError)):
             migrate(v1_path, 99)
 
+    @pytest.mark.timeout(180)
     def test_live_store_is_readable_while_it_writes_without_crashing(self, tmp_path):
         """Read a session file through the read view while a live store writes it.
 

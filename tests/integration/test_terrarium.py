@@ -81,7 +81,7 @@ from kohakuterrarium.terrarium.tools_group_status import GroupStatusTool
 from kohakuterrarium.terrarium.tools_group_wire import GroupWireTool
 from kohakuterrarium.testing.llm import ScriptedLLM
 
-pytestmark = pytest.mark.timeout(30)
+pytestmark = pytest.mark.timeout(60)
 
 
 # ---------------------------------------------------------------------------

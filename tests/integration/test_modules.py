@@ -102,7 +102,7 @@ from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
 from kohakuterrarium.testing.output import OutputRecorder
 from kohakuterrarium.utils.file_guard import PathBoundaryGuard
 
-pytestmark = pytest.mark.timeout(30)
+pytestmark = pytest.mark.timeout(60)
 
 
 # ─────────────────────────────────────────────────────────────────────

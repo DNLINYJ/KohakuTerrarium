@@ -135,7 +135,7 @@ from tests.helpers.reasoning_stream import (
     reasoning_segments,
 )
 
-pytestmark = pytest.mark.timeout(30)
+pytestmark = pytest.mark.timeout(60)
 
 
 # ---------------------------------------------------------------------------
@@ -1047,7 +1047,7 @@ class TestLlmIntegration:
         bad_call = NativeToolCall(id="c2", name="read", arguments="{not json")
         assert bad_call.parsed_arguments() == {"_raw": "{not json"}
 
-    @pytest.mark.timeout(60)
+    @pytest.mark.timeout(120)
     async def test_multimodal_message_round_trip_workflow(self, tmp_path, monkeypatch):
         """Build a full multimodal conversation and assert exact wire shape.
 

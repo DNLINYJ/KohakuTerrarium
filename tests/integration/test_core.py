@@ -1530,6 +1530,7 @@ class TestCoreIntegration:
                     owner.cancel()
                 await asyncio.gather(owner, return_exceptions=True)
 
+    @pytest.mark.timeout(120)
     async def test_history_ops(self, make_creature, tmp_path, monkeypatch):
         """One workflow over the three history operations: run a turn,
         ``regenerate_last_response`` opens a new branch, ``edit_and_rerun``

@@ -59,7 +59,7 @@ from kohakuterrarium.skills.registry import Skill
 from kohakuterrarium.testing.llm import ScriptedLLM
 from kohakuterrarium.testing.output import OutputRecorder
 
-pytestmark = pytest.mark.timeout(30)
+pytestmark = pytest.mark.timeout(60)
 
 
 # --------------------------------------------------------------------------

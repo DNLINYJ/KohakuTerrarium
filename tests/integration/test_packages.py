@@ -76,7 +76,7 @@ from kohakuterrarium.studio.catalog import packages as studio_packages
 from kohakuterrarium.terrarium.drive.errors import DriveValidationError
 from kohakuterrarium.terrarium.drive.registration import resolve_registration
 
-pytestmark = pytest.mark.timeout(30)
+pytestmark = pytest.mark.timeout(60)
 
 
 # ── bundle builders — real on-disk package sources ───────────────

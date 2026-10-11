@@ -58,8 +58,9 @@ from kohakuterrarium.studio.sessions import memory_build as _memory_build
 from kohakuterrarium.studio.sessions import memory_search as _memory_search
 from kohakuterrarium.terrarium import LocalTerrariumService, Terrarium
 from kohakuterrarium.testing.llm import ScriptedLLM
+from tests.helpers.kt_biome import find_kt_biome_source
 
-pytestmark = pytest.mark.timeout(30)
+pytestmark = pytest.mark.timeout(60)
 
 # Deterministic assistant replies. The ScriptedLLM matches the *next*
 # unused entry per call; a plain creature turn = one LLM call.
@@ -113,28 +114,6 @@ def scripted_llm(monkeypatch: pytest.MonkeyPatch) -> ScriptedLLM:
         _agent_model, "create_llm_from_profile_name", _fake_from_profile_name
     )
     return llm
-
-
-def _find_kt_biome_source() -> Path | None:
-    """Locate a kt-biome bundle to install into the isolated catalog.
-
-    Dev machines carry a repo-local ``kt-biome/`` checkout; CI installs
-    kt-biome editable into the operator config dir before the suite
-    runs, leaving a ``kt-biome.link`` pointing at the cloned source.
-    """
-    repo_local = Path(__file__).resolve().parents[2] / "kt-biome"
-    if (repo_local / "kohaku.yaml").exists():
-        return repo_local
-    real_pkgs = Path.home() / ".kohakuterrarium" / "packages"
-    link = real_pkgs / "kt-biome.link"
-    if link.exists():
-        target = Path(link.read_text(encoding="utf-8").strip())
-        if (target / "kohaku.yaml").exists():
-            return target
-    direct = real_pkgs / "kt-biome"
-    if (direct / "kohaku.yaml").exists():
-        return direct
-    return None
 
 
 @pytest.fixture
@@ -582,7 +561,7 @@ class TestApiIntegration:
         # repo-shipped ``kt-biome`` editable into the isolated dir first
         # so its summary + extension lists resolve.  An uninstalled name
         # 404s regardless.
-        biome_src = _find_kt_biome_source()
+        biome_src = find_kt_biome_source()
         if biome_src is not None:
             _catalog_packages_ops.install_package_op(str(biome_src), editable=True)
             resp = client.get("/api/studio/packages")

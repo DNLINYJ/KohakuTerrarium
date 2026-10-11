@@ -65,7 +65,7 @@ from kohakuterrarium.parsing.patterns import (
 from kohakuterrarium.parsing.state_machine import parse_full
 from kohakuterrarium.testing.agent import TestAgentBuilder
 
-pytestmark = pytest.mark.timeout(30)
+pytestmark = pytest.mark.timeout(60)
 
 
 # ---------------------------------------------------------------------------

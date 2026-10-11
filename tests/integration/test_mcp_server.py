@@ -23,6 +23,7 @@ from kohakuterrarium.mcp_server.workspaces import WorkspaceRegistry
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
 
 
+@pytest.mark.xdist_group("mcp-subprocess")
 class TestMCPServer:
     @pytest.mark.timeout(300)
     async def test_cli_lifecycle_isolation_restart_and_ingress_failure(self, tmp_path):

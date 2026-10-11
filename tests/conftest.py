@@ -19,6 +19,7 @@ These rules are how we earn the right to claim "covered."
 import os
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
@@ -40,8 +41,30 @@ if str(_SRC) not in sys.path:
 # narrows this to a per-test ``tmp_path`` so tests don't share state.
 _SESSION_CONFIG_DIR = Path(tempfile.mkdtemp(prefix="kt-test-session-config-"))
 os.environ["KT_CONFIG_DIR"] = str(_SESSION_CONFIG_DIR)
+# The operator's home, captured before any fixture redirects HOME; read-only.
+os.environ.setdefault("KT_TEST_REAL_HOME", str(Path.home()))
 
 from kohakuterrarium.llm.api_keys import PROVIDER_KEY_MAP  # noqa: E402
+
+# ``-n auto`` resolves to this many xdist workers unless KT_TEST_WORKERS is set.
+LOCAL_TEST_WORKERS = 16
+MAX_TEST_WORKERS = 64
+_E2E_DIR = _ROOT / "tests" / "e2e"
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_xdist_auto_num_workers(config):
+    """Worker count for ``-n auto``: ``KT_TEST_WORKERS``, else min(16, cpus), cap 64."""
+    raw = os.environ.get("KT_TEST_WORKERS", "").strip()
+    count = int(raw) if raw else min(LOCAL_TEST_WORKERS, os.cpu_count() or 1)
+    return max(0, min(count, MAX_TEST_WORKERS))
+
+
+def pytest_collection_modifyitems(config, items):
+    """Run the e2e tier as one serial group; its journeys share real clusters."""
+    for item in items:
+        if Path(str(item.path)).is_relative_to(_E2E_DIR):
+            item.add_marker(pytest.mark.xdist_group("e2e"))
 
 
 @pytest.fixture(autouse=True)
@@ -129,29 +152,6 @@ def isolate_global_state():
         pass
 
 
-@pytest.fixture
-def tmp_session_dir(tmp_path, monkeypatch):
-    """Override the session-dir resolver to a per-test tmpdir.
-
-    Several modules read ``~/.kohakuterrarium/sessions`` at import or
-    runtime — this fixture redirects so tests never touch real user
-    state.
-    """
-    target = tmp_path / "sessions"
-    target.mkdir()
-    monkeypatch.setenv("KOHAKUTERRARIUM_SESSION_DIR", str(target))
-    return target
-
-
-@pytest.fixture
-def tmp_config_dir(tmp_path, monkeypatch):
-    """Override the config dir likewise."""
-    target = tmp_path / "config"
-    target.mkdir()
-    monkeypatch.setenv("KOHAKUTERRARIUM_CONFIG_DIR", str(target))
-    return target
-
-
 # Make Windows-locale issues go away — every test runs UTF-8.
 os.environ.setdefault("PYTHONUTF8", "1")
 
@@ -206,6 +206,35 @@ def _default_isolated_config_dir(tmp_path, monkeypatch):
     live = sys.modules.get("kohakuterrarium.studio.sessions.live.registry")
     if live is not None:
         live.close_all()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path_factory, monkeypatch):
+    """Give every test a private home and temp root under a uuid-named folder.
+
+    HOME / USERPROFILE / XDG dirs and TMP / TEMP / TMPDIR (inherited by child
+    processes) plus ``tempfile.tempdir`` point inside it, so concurrent workers
+    and concurrent CI jobs never share a path. The folder sits beside, not
+    inside, the test's ``tmp_path``.
+    """
+    root = tmp_path_factory.mktemp(f"kt-{uuid.uuid4().hex[:12]}", numbered=False)
+    home = root / "home"
+    temp = root / "tmp"
+    home.mkdir()
+    temp.mkdir()
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(home))
+    for name, sub in (
+        ("XDG_CONFIG_HOME", ".config"),
+        ("XDG_DATA_HOME", ".local/share"),
+        ("XDG_STATE_HOME", ".local/state"),
+        ("XDG_CACHE_HOME", ".cache"),
+    ):
+        monkeypatch.setenv(name, str(home / sub))
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.setenv(name, str(temp))
+    monkeypatch.setattr(tempfile, "tempdir", str(temp))
+    return root
 
 
 @pytest.fixture(autouse=True)

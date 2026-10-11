@@ -52,7 +52,7 @@ from kohakuterrarium.compose import (
 from kohakuterrarium.core.config_types import AgentConfig, InputConfig, OutputConfig
 from kohakuterrarium.testing.llm import ScriptEntry, ScriptedLLM
 
-pytestmark = pytest.mark.timeout(30)
+pytestmark = pytest.mark.timeout(60)
 
 
 # ---------------------------------------------------------------------------

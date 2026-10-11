@@ -21,7 +21,7 @@ from kohakuterrarium.laboratory._internal.transport_inproc import InProcTranspor
 from kohakuterrarium.laboratory.streams import RemoteStream, StreamDemux
 from kohakuterrarium.laboratory.ws_proxy import WSFrameSink, WSProxyAdapter
 
-pytestmark = pytest.mark.timeout(20)
+pytestmark = pytest.mark.timeout(60)
 
 
 @pytest.fixture(autouse=True)

@@ -187,6 +187,7 @@ def test_desktop_blocking_passes_window_icon_on_windows(monkeypatch, tmp_path):
 # ── find_free_port ──────────────────────────────────────────────
 
 
+@pytest.mark.xdist_group("ports")
 class TestFindFreePort:
     def test_returns_a_port(self):
         port = find_free_port(start=49152, max_tries=10)

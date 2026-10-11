@@ -526,6 +526,7 @@ class TestServingIntegration:
         assert "tool_calls_total" not in snap["counters"]
         assert snap["histograms"]["llm_response_ms"]["unknown|unknown"]["1h"]["n"] == 3
 
+    @pytest.mark.xdist_group("ports")
     def test_web_boot_helpers_port_allocation_and_publish(self, tmp_path):
         """The ``run_web_server`` boot sequence's deterministic core:
         ``find_free_port`` walks upward from a busy port to the first
