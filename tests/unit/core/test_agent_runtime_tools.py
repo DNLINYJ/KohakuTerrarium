@@ -1,16 +1,17 @@
 """Unit tests for :mod:`kohakuterrarium.core.agent_runtime_tools`."""
 
-import asyncio
 import types
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from kohakuterrarium.core.agent_event_loop import AgentEventLoopMixin
 from kohakuterrarium.core.agent_runtime_tools import (
     AgentRuntimeToolsMixin,
     _make_job_label,
 )
 from kohakuterrarium.core.backgroundify import BackgroundifyHandle
+from kohakuterrarium.core.event_inbox import EventInbox
 from kohakuterrarium.core.events import EventType, TriggerEvent
 from kohakuterrarium.llm.message import ImagePart
 from kohakuterrarium.parsing.events import (
@@ -50,8 +51,8 @@ class _Mgr:
         return await self.spawn(event)
 
 
-def _make_mixin(*, running=True, processed=None, notify_meta=None):
-    class _Agent(AgentRuntimeToolsMixin):
+def _make_mixin(*, running=True, notify_meta=None):
+    class _Agent(AgentRuntimeToolsMixin, AgentEventLoopMixin):
         pass
 
     a = _Agent()
@@ -67,13 +68,7 @@ def _make_mixin(*, running=True, processed=None, notify_meta=None):
         "total_tokens": 0,
     }
     a._running = running
-    processed_events = []
-
-    async def proc(evt):
-        processed_events.append(evt)
-
-    a._process_event = proc
-    a._processed = processed_events
+    a._event_inbox = EventInbox()
     return a
 
 
@@ -315,10 +310,10 @@ class TestOnBgComplete:
         assert kind == "tool_done"
         assert metadata["result"] == "result text"
         assert metadata["output_preview"] == "result text"
-        # No reschedule when notify is on.
-        await asyncio.sleep(0.01)
-        # _process_event invoked.
-        assert a._processed
+        queued = a._event_inbox.drain_all()
+        assert len(queued) == 1
+        assert queued[0].event is evt
+        assert queued[0].future is None
 
     async def test_tool_done_renders_multimodal_output_preview(self):
         a = _make_mixin()
@@ -505,6 +500,4 @@ class TestOnBgComplete:
         a._on_bg_complete(evt)
         # State cleared.
         assert "bash_x" not in a._bg_controller_notify
-        # _process_event NOT invoked.
-        await asyncio.sleep(0.01)
-        assert not a._processed
+        assert a._event_inbox.drain_all() == []

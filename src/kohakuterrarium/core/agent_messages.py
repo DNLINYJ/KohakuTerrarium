@@ -19,10 +19,21 @@ from kohakuterrarium.core.agent_raw_history import (
     raw_target_content,
     reload_raw_prefix_for_target,
 )
+from kohakuterrarium.core.branch_continuation import (
+    live_branch_path,
+    persist_branch_view,
+    require_no_active_compact,
+    require_no_running_jobs,
+)
+from kohakuterrarium.core.compact_branch import (
+    compact_source_path_from_event,
+    is_summary_message,
+)
 from kohakuterrarium.core.events import EventType, TriggerEvent
 from kohakuterrarium.errors import ConflictError
 from kohakuterrarium.llm.message import normalize_content_parts
 from kohakuterrarium.session.history import replay_conversation
+from kohakuterrarium.session.snapshot import save_agent_snapshot
 from kohakuterrarium.session.raw_history import (
     UserMessageSelector,
     append_user_event_pair,
@@ -106,21 +117,62 @@ class AgentMessagesMixin:
             return
 
         async with self._get_message_mutation_lock():
-            await self._regenerate_tail_response(request_id=request_id)
+            rerun = await self._regenerate_tail_response(request_id=request_id)
+        if rerun:
+            try:
+                await self._rerun_from_last()
+            finally:
+                self._branch_request_id = None
 
-    async def _regenerate_tail_response(self, *, request_id: str | None) -> None:
-        """Regenerate the current tail while holding the mutation lock."""
+    def _restore_changed_summary_inputs(
+        self, turn_index: int | None, branch_id: int
+    ) -> bool:
+        """Rebuild a summary-dependent mutation prefix before editing its inputs."""
+        if not any(
+            (inputs := compact_source_path_from_event(msg.metadata)) is None
+            or turn_index is None
+            or any(turn >= turn_index for turn, _ in inputs)
+            for msg in self.controller.conversation.get_messages()
+            if is_summary_message(msg)
+        ):
+            return False
+        if self.session_store is None or turn_index is None:
+            raise ConflictError(
+                "Cannot reconstruct summarized history without a persisted target"
+            )
+        targets = [
+            evt
+            for evt in self.session_store.get_events(self.config.name)
+            if evt.get("type") == "user_message"
+            and evt.get("turn_index") == turn_index
+            and evt.get("branch_id") == branch_id
+        ]
+        if len(targets) != 1:
+            raise ConflictError("Cannot identify the summarized turn to mutate")
+        reload_raw_prefix_for_target(
+            self,
+            UserMessageSelector(targets[0]["event_id"], turn_index, branch_id),
+            branch_view=live_branch_path(self),
+        )
+        return True
+
+    async def _regenerate_tail_response(self, *, request_id: str | None) -> bool:
+        """Commit a sibling branch of the current tail, then return whether to rerun."""
         await self._wait_for_history_finalization()
         self._ensure_history_mutation_idle()
         self._ensure_rerun_available()
+        self._restore_changed_summary_inputs(self._turn_index, self._branch_id)
         conv = self.controller.conversation
         last_user = conv.find_last_user_index()
         if last_user < 0:
             logger.warning("No user message to regenerate from")
-            return
+            return False
         removed = conv.truncate_from(last_user + 1)
         # Open a new branch of the current turn.
         self._branch_id = self._max_branch_id_for_turn(self._turn_index) + 1
+        conv.get_messages()[last_user].metadata.update(
+            turn_index=self._turn_index, branch_id=self._branch_id
+        )
         logger.info(
             "Regenerating",
             dropped=len(removed),
@@ -148,11 +200,11 @@ class AgentMessagesMixin:
                 self._branch_id,
                 ppath,
             )
+        persist_branch_view(
+            self.session_store, self.config.name, live_branch_path(self)
+        )
         self._branch_request_id = request_id
-        try:
-            await self._rerun_from_last()
-        finally:
-            self._branch_request_id = None
+        return True
 
     async def edit_and_rerun(
         self,
@@ -165,9 +217,9 @@ class AgentMessagesMixin:
         request_id: str | None = None,
         target: UserMessageSelector | None = None,
     ) -> bool:
-        """Serialize conversation reconstruction and the resulting rerun turn."""
+        """Serialize conversation reconstruction; the rerun turn runs after the lock."""
         async with self._get_message_mutation_lock():
-            return await self._edit_and_rerun_locked(
+            prepared = await self._edit_and_rerun_locked(
                 message_idx,
                 new_content,
                 turn_index=turn_index,
@@ -176,6 +228,13 @@ class AgentMessagesMixin:
                 request_id=request_id,
                 target=target,
             )
+        if prepared:
+            try:
+                await self._rerun_from_last(new_user_content=new_content)
+            finally:
+                self._branch_request_id = None
+            return True
+        return False
 
     async def _edit_and_rerun_locked(
         self,
@@ -239,6 +298,22 @@ class AgentMessagesMixin:
         resolved_user_position = (
             sum(1 for m in msgs[: resolved_idx + 1] if m.role == "user") - 1
         )
+        resolved_turn = turn_index or target.metadata.get("turn_index")
+        if resolved_turn is None:
+            if any(is_summary_message(msg) for msg in msgs):
+                raise ConflictError(
+                    "Cannot identify an untagged target in summarized history"
+                )
+            resolved_turn = self._turn_index_for_user_position(
+                resolved_user_position, branch_view=branch_view
+            )
+        resolved_branch = target.metadata.get("branch_id") or (branch_view or {}).get(
+            resolved_turn, self._branch_id
+        )
+        if self._restore_changed_summary_inputs(resolved_turn, resolved_branch):
+            conv = self.controller.conversation
+            resolved_idx = conv.find_last_user_index()
+        turn_index = resolved_turn
         # Drop the old user message + everything after from the
         # in-memory conversation. Do NOT append the new user message
         # here — the rerun trigger carries it; the controller appends
@@ -297,11 +372,10 @@ class AgentMessagesMixin:
                 self._branch_id,
                 ppath,
             )
+        persist_branch_view(
+            self.session_store, self.config.name, live_branch_path(self)
+        )
         self._branch_request_id = request_id
-        try:
-            await self._rerun_from_last(new_user_content=new_content)
-        finally:
-            self._branch_request_id = None
         return True
 
     async def rewind_to(self, message_idx: int) -> None:
@@ -314,8 +388,11 @@ class AgentMessagesMixin:
             logger.info("Rewound", index=message_idx, dropped=len(removed))
             if self.session_store:
                 try:
-                    self.session_store.save_conversation(
-                        self.config.name, conv.snapshot_messages()
+                    save_agent_snapshot(
+                        self.session_store,
+                        self.config.name,
+                        self,
+                        conv.snapshot_messages(),
                     )
                 except Exception as e:
                     logger.warning(
@@ -344,6 +421,7 @@ class AgentMessagesMixin:
 
     def _ensure_history_mutation_idle(self) -> None:
         """Reject destructive history changes while another turn can observe it."""
+        require_no_active_compact(self)
         processing_lock = getattr(self, "_processing_lock", None)
         inbox = getattr(self, "_event_inbox", None)
         turn_active = processing_lock is not None and processing_lock.locked()
@@ -361,6 +439,7 @@ class AgentMessagesMixin:
             raise ConflictError(
                 "Cannot rerun conversation while the agent is not running"
             )
+        require_no_running_jobs(self)
 
     async def _rerun_from_last(self, new_user_content: str | list = "") -> None:
         """Trigger an LLM turn from the current conversation state.
@@ -484,16 +563,17 @@ class AgentMessagesMixin:
     def _reload_conversation_under_branch_view(
         self,
         branch_view: dict[int, int],
-    ) -> None:
-        """Replay ``branch_view`` and align the conversation and agent state.
-
-        Branch selection changes only the displayed view, so runtime state must
-        be reseated before an edit or retry can resolve the intended message.
-        """
-        _reload_branch_view(
+        *,
+        events=None,
+        apply: bool = True,
+    ):
+        """Replay ``branch_view`` and optionally install it on the agent."""
+        return _reload_branch_view(
             self,
             branch_view,
             replay=replay_conversation,
+            events=events,
+            apply=apply,
         )
 
     def _previous_branch_user_content(self):

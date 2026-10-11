@@ -7,12 +7,33 @@ agent resumes onto, or must be rebuilt from the event log.
 
 from typing import Any
 
+from kohakuterrarium.core.agent_message_history import (
+    replay_with_settled_tools,
+    snapshot_needs_settled_tool_replay as snapshot_needs_settled_tool_replay,
+)
+from kohakuterrarium.core.branch_continuation import load_persisted_branch_view
 from kohakuterrarium.core.conversation_elide import TOOL_FEEDBACK_KIND
+from kohakuterrarium.core.snapshot_history import prepare_snapshot
 from kohakuterrarium.session.history import (
-    normalize_resumable_events,
-    replay_conversation,
+    index_parent_paths,
+    resolve_selected_branches,
     select_live_event_ids,
 )
+
+
+def prepare_saved_snapshot(store, namespace: str, events: list[dict]) -> dict | None:
+    """Select a branch checkpoint under the persisted resume view."""
+    selected = resolve_selected_branches(
+        events, index_parent_paths(events), load_persisted_branch_view(store, namespace)
+    )
+    return prepare_snapshot(
+        store,
+        namespace,
+        events,
+        selected,
+        replay=replay_with_settled_tools,
+        needs_replay=snapshot_needs_settled_tool_replay,
+    )
 
 
 def snapshot_has_turn_metadata(snapshot: list[dict]) -> bool:
@@ -232,6 +253,10 @@ def replayed_messages_for(
             return []
     if not events:
         return []
-    return replay_conversation(
-        normalize_resumable_events(events), include_metadata=True
+    persisted = load_persisted_branch_view(store, agent_name)
+    return replay_with_settled_tools(
+        events,
+        branch_view=persisted,
+        include_metadata=True,
+        resumable=True,
     )

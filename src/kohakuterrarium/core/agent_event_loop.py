@@ -7,8 +7,10 @@ per run. The processing lock allows shutdown to join an in-flight turn.
 """
 
 import asyncio
+from typing import Any
 
 from kohakuterrarium.core.agent_mid_turn import _to_serializable_content
+from kohakuterrarium.core.controller_context import declare_message_origin
 from kohakuterrarium.core.agent_runtime_tools import _make_job_label
 from kohakuterrarium.core.event_inbox import EventEnvelope, TurnOutcome
 from kohakuterrarium.core.metrics_hook import metrics
@@ -21,18 +23,8 @@ from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Settle window (in cooperative yields) applied after a wake before the
-# claim, so producers whose event reaches the inbox across several
-# create_task / done-callback hops still land in the SAME batch. A
-# background TOOL completion reaches the inbox in ~1 hop
-# (``_run_tool`` → ``_on_bg_complete`` → ``create_task(_process_event)``);
-# a backgroundified SUB-AGENT completion in ~3 (``_on_task_done``
-# done-callback → ``create_task(_on_backgroundify_complete)`` →
-# ``create_task(_process_event)``). A single yield would coalesce only
-# the shallower path, letting a simultaneous sub-agent completion slip to
-# a second turn. This budget spans that gap with margin. It is NOT a poll:
-# a FIXED, bounded number of immediate reschedules — no timed sleep and no
-# drain-until-empty loop — so a steady event stream can never extend it.
+# Fixed cooperative yields coalesce synchronous tool admission with
+# promoted tool/sub-agent done callbacks before the inbox claim.
 _COALESCE_HOPS = 3
 
 
@@ -398,12 +390,40 @@ class AgentEventLoopMixin:
             },
         )
 
+    def _message_origin(self, events: list) -> dict[str, Any]:
+        """Branch provenance for the user message this batch produces.
+
+        A batch that mixes real user input with job results merges both into
+        one message without naming the jobs, so nothing proves which turns it
+        came from and it is marked unknown. A pure feedback round does name
+        them (``job_ids``), which is resolvable downstream.
+        """
+        turn_index = self._turn_index
+        branch_id = self._branch_id
+        if not isinstance(turn_index, int) or not isinstance(branch_id, int):
+            return {}
+        pure_feedback = bool(events) and all(
+            getattr(evt, "type", None) == "tool_complete" for evt in events
+        )
+        carries_results = any(
+            getattr(evt, "type", None) in {"tool_complete", "subagent_output"}
+            for evt in events
+        )
+        return {
+            "turn_index": turn_index,
+            "branch_id": branch_id,
+            "origin_known": pure_feedback or not carries_results,
+        }
+
     async def _process_batch_with_controller(self, events: list, controller) -> None:
         """Push the whole stackable run to the controller (one combined
         ``role=user`` message) and drive the controller loop. Cancellable
         via ``interrupt()``."""
         primary = events[0]
         self._prepare_processing_cycle(primary, controller)
+        # The controller turns this batch into one user message; declare the
+        # branch it is written on so a later compaction can attribute its text.
+        declare_message_origin(controller, self._message_origin(events))
         for event in events:
             await controller.push_event(event)
         await self.output_router.emit(

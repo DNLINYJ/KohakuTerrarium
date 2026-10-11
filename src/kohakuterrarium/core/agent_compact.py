@@ -7,9 +7,18 @@ import asyncio
 from typing import Any
 
 from kohakuterrarium.bootstrap.llm import create_llm_from_profile_name
+from kohakuterrarium.core.agent_message_history import (
+    replay_with_settled_tools,
+    snapshot_needs_settled_tool_replay,
+)
 from kohakuterrarium.core.compact import CompactConfig, CompactManager
+from kohakuterrarium.core.snapshot_history import (
+    prepare_snapshot,
+    replayed_compact_state,
+)
 from kohakuterrarium.llm.base import fork_llm
 from kohakuterrarium.llm.profiles import profile_to_identifier, resolve_controller_llm
+from kohakuterrarium.session.snapshot import load_branch_snapshot
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -108,6 +117,37 @@ def restore_compact_state_from_session(
     if state is None:
         return
     try:
+        if f"{agent_name}:branch_snapshots" in state:
+            agent = manager._agent
+            selected = dict(getattr(agent, "_parent_branch_path", None) or [])
+            if getattr(agent, "_turn_index", 0) > 0:
+                selected[agent._turn_index] = agent._branch_id
+            messages = agent.controller.conversation.snapshot_messages(
+                preserve_pending_tail=True
+            )
+            record = load_branch_snapshot(session_store, agent_name, selected)
+            matches = (
+                record is not None
+                and record["watermark"] <= session_store.max_event_id(agent_name)
+                and record["messages"] == messages[: len(record["messages"])]
+            )
+            if not matches:
+                record = prepare_snapshot(
+                    session_store,
+                    agent_name,
+                    session_store.get_events(agent_name),
+                    selected,
+                    replay=replay_with_settled_tools,
+                    needs_replay=snapshot_needs_settled_tool_replay,
+                )
+            compact = (
+                record["compact_state"]
+                if record is not None
+                else replayed_compact_state(messages)
+            )
+            manager._compact_count = compact["compact_count"]
+            manager._last_compact_time = compact["last_compact_time"]
+            return
         saved_count = state.get(f"{agent_name}:compact_count")
         if saved_count is not None:
             manager._compact_count = int(saved_count)

@@ -1,9 +1,12 @@
 """Branch-aware history lookup helpers for agent message mutations."""
 
+import re
 from collections.abc import Callable
 from typing import Any
 
 from kohakuterrarium.core.conversation_elide import (
+    ELISION_MARKER,
+    TOOL_FEEDBACK_KIND,
     elide_stale_tool_results,
     estimate_tokens,
 )
@@ -11,7 +14,14 @@ from kohakuterrarium.core.message_locator import (
     user_message_indices_for_content,
     user_message_indices_for_turn,
 )
+from kohakuterrarium.core.snapshot_history import (
+    prepare_snapshot,
+    replayed_compact_state,
+)
+from kohakuterrarium.core.tool_output import render_content_text
 from kohakuterrarium.session.history import (
+    compact_covered_event_ids,
+    normalize_resumable_events,
     normalize_tool_call_events,
     replay_conversation,
     resolve_branch_view_strict,
@@ -194,62 +204,299 @@ def user_message_content_for_turn(
     return None
 
 
-def reload_conversation_under_branch_view(
-    agent: Any,
-    branch_view: dict[int, int],
-    *,
-    replay: Callable[..., list[dict[str, Any]]] = replay_conversation,
-) -> None:
-    """Replay a selected subtree and align conversation and branch state."""
-    if agent.session_store is None:
-        return
-    try:
-        events = agent.session_store.get_events(agent.config.name)
-    except Exception as exc:
-        logger.warning(
-            "Failed to read events for branch_view reload",
-            error=str(exc),
-            exc_info=True,
-        )
-        return
+def _tool_identity(event: dict[str, Any]) -> str:
+    return str(event.get("call_id") or event.get("job_id") or "")
 
-    selected = resolve_branch_view_strict(events, branch_view)
-    live_event_ids = select_live_event_ids(events, branch_view=branch_view)
-    replay_events = [
+
+def include_settled_tool_results(
+    events: list[dict[str, Any]],
+    live_event_ids: set[int],
+    *,
+    covered_event_ids: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Attach completed results to live calls without rewriting settled pairs.
+
+    Background results are stamped with the live turn at completion. A later
+    sibling of that later turn would otherwise drop the result and sanitize the
+    ancestor call away. Already-paired live results keep their original order.
+    """
+    live_events = [
         event
         for event in events
         if not isinstance(event.get("event_id"), int)
         or event["event_id"] in live_event_ids
     ]
-    messages = replay(
-        normalize_tool_call_events(replay_events),
-        branch_view=branch_view,
-    )
-    metadata_by_turn = {
-        int(event["turn_index"]): {
-            "event_id": event.get("event_id"),
-            "turn_index": event.get("turn_index"),
-            "branch_id": event.get("branch_id"),
-        }
-        for event in events
-        if event.get("type") == "user_message"
-        and isinstance(event.get("turn_index"), int)
+    live_calls: set[str] = {
+        identity
+        for event in live_events
+        if event.get("type") == "tool_call" and (identity := _tool_identity(event))
     }
-    for message in messages:
-        if message.get("role") != "user":
+    live_result_ids: set[str] = {
+        identity
+        for event in live_events
+        if event.get("type") == "tool_result" and (identity := _tool_identity(event))
+    }
+    late_results: dict[str, dict[str, Any]] = {}
+    for event in events:
+        if event.get("type") != "tool_result":
             continue
-        for metadata in metadata_by_turn.values():
-            if message.get("content") == next(
+        identity = _tool_identity(event)
+        eid = event.get("event_id")
+        if eid in (covered_event_ids or ()):
+            continue
+        if (
+            identity
+            and identity in live_calls
+            and identity not in live_result_ids
+            and identity not in late_results
+        ):
+            projected = dict(event)
+            projected["_source_event_id"] = projected.pop("event_id", None)
+            projected["_settled_from_call"] = True
+            late_results[identity] = projected
+        elif (
+            identity
+            and identity in live_calls
+            and isinstance(eid, int)
+            and eid in live_event_ids
+            and identity not in late_results
+        ):
+            # Result is live but recorded after a later user turn; move it
+            # next to the call so pairing survives sanitizer.
+            call_turn = next(
                 (
-                    event.get("content")
-                    for event in events
-                    if event.get("event_id") == metadata.get("event_id")
+                    ev.get("turn_index")
+                    for ev in live_events
+                    if ev.get("type") == "tool_call" and _tool_identity(ev) == identity
                 ),
                 None,
+            )
+            result_turn = event.get("turn_index")
+            if (
+                isinstance(call_turn, int)
+                and isinstance(result_turn, int)
+                and result_turn > call_turn
             ):
-                message["metadata"] = metadata
-                break
+                projected = dict(event)
+                projected["_source_event_id"] = projected.pop("event_id", None)
+                projected["_settled_from_call"] = True
+                late_results[identity] = projected
+    replay_events: list[dict[str, Any]] = []
+    for event in live_events:
+        identity = _tool_identity(event)
+        if event.get("type") == "tool_result" and identity in late_results:
+            continue
+        replay_events.append(event)
+        if event.get("type") == "tool_call" and identity in late_results:
+            replay_events.append(late_results[identity])
+    return replay_events
 
+
+def replay_with_settled_tools(
+    events: list[dict[str, Any]],
+    *,
+    branch_view: dict[int, int] | None = None,
+    include_metadata: bool = False,
+    resumable: bool = False,
+) -> list[dict[str, Any]]:
+    """Replay a branch, keeping completed results with their live calls."""
+    live_event_ids = select_live_event_ids(events, branch_view=branch_view)
+    covered_ids = compact_covered_event_ids(events, branch_view)
+    replay_events = include_settled_tool_results(
+        events, live_event_ids, covered_event_ids=covered_ids
+    )
+    if resumable:
+        replay_events = normalize_resumable_events(
+            replay_events, covered_event_ids=covered_ids
+        )
+    else:
+        replay_events = normalize_tool_call_events(
+            replay_events, covered_event_ids=covered_ids
+        )
+    return replay_conversation(
+        replay_events,
+        branch_view=branch_view,
+        include_metadata=include_metadata,
+    )
+
+
+def snapshot_needs_settled_tool_replay(
+    events: list[dict],
+    branch_view: dict[int, int] | None,
+    snapshot: list[dict] | None = None,
+) -> bool:
+    """Whether the snapshot still lacks a completed result for a live call."""
+    if not events:
+        return False
+    live_ids = select_live_event_ids(events, branch_view=branch_view)
+    projected = include_settled_tool_results(
+        events,
+        live_ids,
+        covered_event_ids=compact_covered_event_ids(events, branch_view),
+    )
+    needed: dict[str, set[str]] = {}
+    provider_ids: dict[str, str] = {}
+    alias_owners: dict[str, set[str]] = {}
+    for event in projected:
+        if event.get("type") != "tool_call":
+            continue
+        job_id = str(event.get("call_id") or event.get("job_id") or "")
+        provider_id = str(event.get("tool_call_id") or "")
+        if job_id:
+            alias_owners.setdefault(job_id, set()).add(job_id)
+            if provider_id:
+                provider_ids[job_id] = provider_id
+                alias_owners.setdefault(provider_id, set()).add(job_id)
+    for event in projected:
+        if not event.get("_settled_from_call"):
+            continue
+        job_id = str(event.get("call_id") or event.get("job_id") or "")
+        if not job_id:
+            continue
+        names = {
+            job_id,
+            provider_ids.get(job_id, ""),
+            str(event.get("tool_call_id") or ""),
+        }
+        names.discard("")
+        needed[job_id] = names
+        for name in names:
+            alias_owners.setdefault(name, set()).add(job_id)
+    if not needed:
+        return False
+    if not snapshot:
+        return True
+    present: set[str] = set()
+    for message in snapshot:
+        identities = _snapshot_result_identities(message)
+        if not identities:
+            continue
+        if not _snapshot_result_is_final(message):
+            continue
+        for identity in identities:
+            owners = alias_owners.get(identity, set())
+            if len(owners) == 1:
+                present.update(owners & needed.keys())
+    return any(job_id not in present for job_id in needed)
+
+
+def _snapshot_result_identities(message: dict) -> set[str]:
+    role = message.get("role")
+    metadata = (
+        message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+    )
+    names: set[str] = set()
+    if role != "tool" and not (
+        role == "user" and metadata.get("kind") == TOOL_FEEDBACK_KIND
+    ):
+        return names
+    for key in ("job_id", "call_id"):
+        if metadata.get(key):
+            names.add(str(metadata[key]))
+    job_ids = metadata.get("job_ids")
+    if isinstance(job_ids, list):
+        names.update(str(value) for value in job_ids if value)
+    if names:
+        return names
+    if role == "tool":
+        identity = str(message.get("tool_call_id") or "")
+        return {identity} if identity else set()
+    content = render_content_text(message.get("content") or "")
+    names.update(
+        re.findall(
+            r"(?:\A|\n\n)\[Tool ([^\]\n]+?) "
+            r"(?:completed|failed(?:, exit [^\]\n]+)?|cancelled)\](?=\n|\Z)",
+            content,
+        )
+    )
+    return names
+
+
+def _snapshot_result_is_final(message: dict) -> bool:
+    metadata = (
+        message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+    )
+    phase = metadata.get("tool_result_phase")
+    if phase == "pending":
+        return False
+    if phase == "final":
+        return True
+    content = render_content_text(message.get("content") or "")
+    if re.match(
+        r"^(?:\[[^\]\n]+\] )?(?:Running in background — task delegated\.|"
+        r"Promoted to background\. Result arrives in a later turn\.)",
+        content,
+    ):
+        return False
+    if metadata.get("tool_results_elided") or ELISION_MARKER in content:
+        return True
+    if message.get("role") == "user" and metadata.get("kind") == TOOL_FEEDBACK_KIND:
+        return bool(_snapshot_result_identities(message))
+    return True
+
+
+def reload_conversation_under_branch_view(
+    agent: Any,
+    branch_view: dict[int, int],
+    *,
+    replay: Callable[..., list[dict[str, Any]]] = replay_conversation,
+    events: list[dict[str, Any]] | None = None,
+    apply: bool = True,
+):
+    """Replay a selected subtree and optionally install it on the agent."""
+    if agent.session_store is None:
+        if apply:
+            return None
+        raise RuntimeError("Cannot prepare a selected branch without a session store")
+    if events is None:
+        events = agent.session_store.get_events(agent.config.name)
+
+    selected = resolve_branch_view_strict(events, branch_view)
+    prepared = prepare_snapshot(
+        agent.session_store,
+        agent.config.name,
+        events,
+        selected,
+        replay=replay_with_settled_tools,
+        needs_replay=snapshot_needs_settled_tool_replay,
+    )
+    if prepared is not None:
+        if apply:
+            apply_prepared_branch_view(agent, prepared)
+            return None
+        return prepared
+    if replay is replay_conversation:
+        messages = replay_with_settled_tools(
+            events, branch_view=branch_view, include_metadata=True
+        )
+    else:
+        live_event_ids = select_live_event_ids(events, branch_view=branch_view)
+        covered_ids = compact_covered_event_ids(events, branch_view)
+        replay_events = include_settled_tool_results(
+            events, live_event_ids, covered_event_ids=covered_ids
+        )
+        messages = replay(
+            normalize_tool_call_events(replay_events, covered_event_ids=covered_ids),
+            branch_view=branch_view,
+            include_metadata=True,
+        )
+    prepared = {"messages": messages, "selected": selected}
+    if apply:
+        apply_prepared_branch_view(agent, prepared)
+        return None
+    return prepared
+
+
+def apply_prepared_branch_view(agent: Any, prepared: dict[str, Any]) -> None:
+    """Install a prepared subtree onto the live agent."""
+    messages = prepared["messages"]
+    selected = prepared["selected"]
+    agent._context_cutoff_event_id = prepared.get("context_cutoff_event_id", 0)
+    manager = getattr(agent, "compact_manager", None)
+    if manager is not None:
+        state = prepared.get("compact_state") or replayed_compact_state(messages)
+        manager._compact_count = state["compact_count"]
+        manager._last_compact_time = state["last_compact_time"]
     conversation = agent.controller.conversation
     existing_system = [
         message for message in conversation.get_messages() if message.role == "system"
@@ -281,9 +528,6 @@ def reload_conversation_under_branch_view(
             extra["extra_fields"] = extra_fields
         conversation.append(role, message.get("content", ""), **extra)
 
-    # Rebuilds restore tool outputs elided during live turns; re-apply
-    # elision when the estimated prompt is already past the compact
-    # threshold so reloads stay bounded (elision is a compact companion).
     controller = agent.controller
     config = getattr(controller, "config", None)
     if config is not None and getattr(config, "elide_tool_results", False):

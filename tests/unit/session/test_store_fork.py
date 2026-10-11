@@ -2,7 +2,12 @@
 
 import pytest
 
+from kohakuterrarium.core.branch_continuation import load_persisted_branch_view
 from kohakuterrarium.session.errors import ForkNotStableError
+from kohakuterrarium.session.history import (
+    replay_conversation,
+    resolve_branch_view_strict,
+)
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.store_fork import (
     _build_lineage,
@@ -252,19 +257,53 @@ class TestPerformForkHappy:
         finally:
             s.close()
 
-    def test_events_beyond_fork_excluded(self, tmp_path):
+    @pytest.mark.parametrize(
+        ("fork_point", "drop_last", "expected"),
+        [
+            ("original", False, ["original"]),
+            ("sibling", False, ["original"]),
+            ("continuation", False, ["original", "continuation"]),
+            ("continuation", True, ["original"]),
+        ],
+    )
+    def test_events_beyond_fork_excluded(
+        self, tmp_path, fork_point, drop_last, expected
+    ):
         s = _store(tmp_path)
         try:
-            s.append_event("alice", "x", {})  # eid=1
-            s.append_event("alice", "x", {})  # eid=2
-            s.append_event("alice", "x", {})  # eid=3
+            points = {}
+            for content, turn, branch, parent in (
+                ("original", 1, 1, []),
+                ("sibling", 1, 2, []),
+                ("continuation", 2, 1, [[1, 1]]),
+            ):
+                _, points[content] = s.append_event(
+                    "alice",
+                    "user_message",
+                    {"content": content},
+                    turn_index=turn,
+                    branch_id=branch,
+                    parent_branch_path=parent,
+                )
+            s.state["alice:branch_view"] = {"1": 1, "2": 1}
             s.flush()
-            child = perform_fork(s, str(tmp_path / "child.kohakutr"), at_event_id=2)
+            child = perform_fork(
+                s,
+                str(tmp_path / "child.kohakutr"),
+                at_event_id=points[fork_point],
+                mutate=(lambda event: None) if drop_last else None,
+            )
             try:
                 evts = child.get_events("alice")
-                assert len(evts) == 2
-                # All copied events have event_id <= 2.
-                assert all(e["event_id"] <= 2 for e in evts)
+                assert all(e["event_id"] <= points[fork_point] for e in evts)
+                view = load_persisted_branch_view(child, "alice")
+                resolve_branch_view_strict(evts, view)
+                assert [
+                    message["content"]
+                    for message in replay_conversation(evts, branch_view=view)
+                    if message["role"] == "user"
+                ] == expected
+                assert s.get_events("alice")[-1]["content"] == "continuation"
             finally:
                 child.close(update_status=False)
         finally:

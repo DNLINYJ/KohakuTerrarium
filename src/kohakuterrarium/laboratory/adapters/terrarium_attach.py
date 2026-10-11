@@ -4,6 +4,10 @@ import asyncio
 import time
 from typing import Any
 
+from kohakuterrarium.core.branch_continuation import (
+    encode_branch_view,
+    selected_branch_view,
+)
 from kohakuterrarium.core.pending_input import new_pending_id
 from kohakuterrarium.laboratory.protocols import LabRegistrar
 from kohakuterrarium.laboratory.ws_proxy import WSFrameSink, WSProxyAdapter
@@ -149,6 +153,7 @@ class TerrariumAttachAdapter(WSProxyAdapter):
             "model": agent.config.model,
             "agent_name": creature.name,
             "model_recovery": model_recovery_snapshot(agent),
+            "branch_view": encode_branch_view(selected_branch_view(agent)),
             "ts": time.time(),
         }
         return {"setup": session_info}
@@ -224,6 +229,7 @@ class TerrariumAttachAdapter(WSProxyAdapter):
                         content,
                         target_name_eff,
                         pending_id,
+                        branch_view=frame.get("branch_view"),
                     )
                 )
         except asyncio.CancelledError:
@@ -385,12 +391,15 @@ class TerrariumAttachAdapter(WSProxyAdapter):
         content: Any,
         source_name: str,
         pending_id: str,
+        branch_view: dict | None = None,
     ) -> None:
         try:
+            options = {"branch_view": branch_view} if branch_view is not None else {}
             dispatched = await agent.inject_input(
                 content,
                 source="web",
                 pending_id=pending_id,
+                **options,
             )
         except asyncio.CancelledError:
             raise

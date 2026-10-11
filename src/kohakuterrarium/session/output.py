@@ -19,6 +19,7 @@ from kohakuterrarium.session.output_activity import (
     _token_metadata as _token_metadata,  # noqa: F401
 )
 from kohakuterrarium.session.run_state import RunTracker
+from kohakuterrarium.session.snapshot import compact_state
 from kohakuterrarium.session.text_buffer import (
     OpenTextSegment,
     last_persisted_turn_branch,
@@ -312,6 +313,9 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         messages: list | None = None
         branch_tag: dict | None = None
         state_kwargs: dict = {}
+        saved_compact_state = compact_state(
+            getattr(self._agent, "compact_manager", None)
+        )
         try:
             if self._agent and hasattr(self._agent, "controller"):
                 messages = self._agent.controller.conversation.snapshot_messages()
@@ -331,6 +335,9 @@ class SessionOutput(SessionActivityMixin, OutputModule):
                     "turn_index": turn_index,
                     "branch_id": branch_id,
                     "parent_branch_path": getattr(agent, "_parent_branch_path", None),
+                    "context_cutoff_event_id": getattr(
+                        agent, "_context_cutoff_event_id", 0
+                    ),
                 }
             if agent and hasattr(agent, "session") and agent.session:
                 pad = agent.session.scratchpad
@@ -344,16 +351,23 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         persist = getattr(self._store, "run", None)
         if callable(persist):
             await persist(
-                self._persist_turn_snapshot, messages, branch_tag, state_kwargs
+                self._persist_turn_snapshot,
+                messages,
+                branch_tag,
+                state_kwargs,
+                saved_compact_state,
             )
         else:
-            self._persist_turn_snapshot(messages, branch_tag, state_kwargs)
+            self._persist_turn_snapshot(
+                messages, branch_tag, state_kwargs, saved_compact_state
+            )
 
     def _persist_turn_snapshot(
         self,
         messages: list | None,
         branch_tag: dict | None,
         state_kwargs: dict,
+        saved_compact_state: dict | None = None,
     ) -> None:
         """Persist the post-turn snapshot, watermark, and state.
 
@@ -376,7 +390,17 @@ class SessionOutput(SessionActivityMixin, OutputModule):
                     eid = evt.get("event_id")
                     if isinstance(eid, int) and eid > last_event_id:
                         last_event_id = eid
-            self._store.save_conversation(self._event_key_prefix, messages)
+            saver = getattr(self._store, "save_branch_snapshot", None)
+            if callable(saver):
+                saver(
+                    self._event_key_prefix,
+                    messages,
+                    branch=branch_tag,
+                    watermark=last_event_id,
+                    compact_state=saved_compact_state,
+                )
+            else:
+                self._store.save_conversation(self._event_key_prefix, messages)
             try:
                 self._store.state[f"{self._event_key_prefix}:snapshot_event_id"] = (
                     last_event_id

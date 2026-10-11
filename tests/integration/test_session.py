@@ -31,6 +31,7 @@ import pytest
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
 from kohakuterrarium.core.agent import Agent
+from kohakuterrarium.core.branch_continuation import selected_branch_view
 from kohakuterrarium.core.events import create_user_input_event
 from kohakuterrarium.modules.tool.base import BaseTool, ExecutionMode, ToolResult
 from kohakuterrarium.modules.trigger.timer import TimerTrigger
@@ -285,6 +286,7 @@ class TestSessionIntegration:
             # turn-end; seed a value and run one more turn so it persists
             # and the snapshot covers every activity event above.
             agent.session.scratchpad.set("project", "terrarium")
+            agent.compact_manager._compact_count = 3
             await agent._process_event(create_user_input_event("remember the project"))
         finally:
             await agent.stop()
@@ -336,10 +338,6 @@ class TestSessionIntegration:
         assert any(
             "channel" in str(h.get("meta", {}).get("type", "")) for h in search_hits
         )
-
-        # Persist compact state the way the runtime does (compact_manager
-        # writes this; attach_session_store reads it back on resume).
-        store.save_state("scribe", compact_count=3)
 
         # The append-only event log is the source of truth on resume.
         # The ``user_input`` events ARE exactly the real user turns
@@ -652,7 +650,6 @@ class TestSessionIntegration:
             )
             # Scratchpad restored exactly.
             assert resumed_agent.session.scratchpad.get("project") == "terrarium"
-            # Compact state restored from store.state.
             assert resumed_agent.compact_manager._compact_count == 3
             # The store was re-attached and marked running for continued
             # recording.
@@ -1016,6 +1013,7 @@ class TestSessionIntegration:
             "First response.",
             "Second response.",
             "Third response.",
+            "Third response regenerated.",
         ]
         agent = Agent.from_path(config_path)
         agent.attach_session_store(store)
@@ -1024,6 +1022,10 @@ class TestSessionIntegration:
             await agent._process_event(create_user_input_event("turn one"))
             await agent._process_event(create_user_input_event("turn two"))
             await agent._process_event(create_user_input_event("turn three"))
+            await agent.regenerate_last_response()
+            assert agent.controller.conversation.to_messages()[-1]["content"] == (
+                "Third response regenerated."
+            )
         finally:
             await agent.stop()
 
@@ -1044,11 +1046,11 @@ class TestSessionIntegration:
         )
         store.flush()
         all_events = store.get_events("brancher")
-        # Pick the fork point: the user_input event for "turn two".
+        # Fork at the persisted user message for "turn two".
         turn_two_evt = next(
             e
             for e in all_events
-            if e["type"] == "user_input" and e.get("content") == "turn two"
+            if e["type"] == "user_message" and e.get("content") == "turn two"
         )
         fork_point_id = turn_two_evt["event_id"]
         assert store.get_event_by_id("brancher", fork_point_id) == turn_two_evt
@@ -1123,6 +1125,40 @@ class TestSessionIntegration:
             )
         finally:
             mutated_child.close()
+
+        for child_path, expected_users in (
+            (fork_path, ["turn one", "turn two"]),
+            (mutated_path, ["turn one", "[redacted]"]),
+        ):
+            provider = ScriptedLLM(["Fork continuation response."])
+            resumed, resumed_store = resume_agent(
+                child_path, io_mode="plain", llm=provider
+            )
+            try:
+                assert [
+                    message["content"]
+                    for message in resumed.controller.conversation.to_messages()
+                    if message["role"] == "user"
+                ] == expected_users
+                await resumed.start()
+                await resumed.inject_input(
+                    "child continuation", branch_view=selected_branch_view(resumed)
+                )
+                assert provider.last_user_message == "child continuation"
+            finally:
+                await resumed.stop()
+                resumed_store.close()
+            restored, restored_store = resume_agent(
+                child_path, io_mode="plain", llm=ScriptedLLM([])
+            )
+            try:
+                assert [
+                    message["content"]
+                    for message in restored.controller.conversation.to_messages()
+                    if message["role"] == "user"
+                ] == [*expected_users, "child continuation"]
+            finally:
+                restored_store.close()
 
         # Forking onto an existing path is refused (no silent overwrite).
         with pytest.raises(FileExistsError):

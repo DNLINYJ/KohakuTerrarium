@@ -11,11 +11,23 @@ import time
 
 import pytest
 
+import kohakuterrarium.session.resume as resume_mod
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
+from kohakuterrarium.core.agent_compact import restore_compact_state_from_session
+from kohakuterrarium.core.compact import CompactConfig, CompactManager
+from kohakuterrarium.core.agent_handlers import _BG_PLACEHOLDER
+from kohakuterrarium.core.agent_message_history import replay_with_settled_tools
+from kohakuterrarium.core.controller_context import format_events_for_context
 from kohakuterrarium.core.conversation import Conversation
+from kohakuterrarium.core.events import create_tool_complete_event
+from kohakuterrarium.core.branch_continuation import persist_branch_view
+from kohakuterrarium.core.conversation_elide import ELISION_MARKER, TOOL_FEEDBACK_KIND
 from kohakuterrarium.errors import SessionNotResumableError
-from kohakuterrarium.session.resume_branch import snapshot_mismatches_branch
+from kohakuterrarium.session.resume_branch import (
+    snapshot_mismatches_branch,
+    snapshot_needs_settled_tool_replay,
+)
 
 from kohakuterrarium.session.resume import (
     IO_MODES,
@@ -520,6 +532,88 @@ class TestAlignAgentName:
 
 
 class TestLoadConversationFallback:
+    @pytest.mark.parametrize(
+        "rejection", ["compact_after_snapshot", "future_watermark"]
+    )
+    def test_rejected_branch_record_cannot_reuse_its_latest_mirror(
+        self, tmp_path, rejection, monkeypatch
+    ):
+        store = SessionStore(tmp_path / "rejected.kohakutr")
+        try:
+            store.append_event(
+                "alice",
+                "user_message",
+                {"content": "raw user"},
+                turn_index=1,
+                branch_id=1,
+            )
+            store.append_event(
+                "alice",
+                "text_chunk",
+                {"content": "raw answer", "chunk_seq": 0},
+                turn_index=1,
+                branch_id=1,
+            )
+            store.save_branch_snapshot(
+                "alice",
+                [
+                    {
+                        "role": "user",
+                        "content": "snapshot user",
+                        "metadata": {"turn_index": 1, "branch_id": 1},
+                    },
+                    {"role": "assistant", "content": "snapshot answer"},
+                ],
+                branch={"turn_index": 1, "branch_id": 1},
+                watermark=(
+                    999
+                    if rejection == "future_watermark"
+                    else store.max_event_id("alice")
+                ),
+            )
+            if rejection == "compact_after_snapshot":
+                store.append_event(
+                    "alice",
+                    "compact_complete",
+                    {
+                        "summary": "new summary",
+                        "round": 1,
+                        "replaced_from_event_id": 1,
+                        "replaced_to_event_id": 2,
+                        "compact_path": [[1, 1]],
+                        "compact_source_path": [[1, 1]],
+                    },
+                    turn_index=1,
+                    branch_id=1,
+                )
+                expected = [
+                    "[Previous context summary (compact round 1)]\n\nnew summary"
+                ]
+            else:
+                expected = ["raw user", "raw answer"]
+            preparations = []
+            prepare = resume_mod.prepare_saved_snapshot
+
+            def observe_prepare(*args):
+                preparations.append(True)
+                return prepare(*args)
+
+            monkeypatch.setattr(resume_mod, "prepare_saved_snapshot", observe_prepare)
+            assert [
+                m["content"]
+                for m in _load_conversation_with_replay_fallback(store, "alice")
+            ] == expected
+            assert preparations == [True]
+            assert [
+                m["content"]
+                for m in _load_conversation_with_replay_fallback(
+                    store, "alice", prepared=None
+                )
+            ] == expected
+            assert preparations == [True]
+        finally:
+            store.close()
+
     def test_no_events_returns_snapshot(self, tmp_path):
         store = SessionStore(str(tmp_path / "x.kohakutr"))
         try:
@@ -1664,6 +1758,402 @@ class TestInjectSavedState:
         finally:
             store.close()
 
+    def _late_result_events(self, store, outputs=("RESULT_reviewbg",)):
+        calls = [
+            {
+                "id": f"b{index}",
+                "type": "function",
+                "function": {"name": "slowbg", "arguments": "{}"},
+            }
+            for index in range(1, len(outputs) + 1)
+        ]
+        store.append_event(
+            "alice", "user_message", {"content": "start bg"}, turn_index=1, branch_id=1
+        )
+        store.append_event(
+            "alice",
+            "assistant_tool_calls",
+            {"tool_calls": calls},
+            turn_index=1,
+            branch_id=1,
+        )
+        for index in range(1, len(outputs) + 1):
+            store.append_event(
+                "alice",
+                "tool_call",
+                {
+                    "name": "slowbg",
+                    "call_id": f"slowbg_{index}",
+                    "tool_call_id": f"b{index}",
+                },
+                turn_index=1,
+                branch_id=1,
+            )
+        store.append_event(
+            "alice",
+            "user_message",
+            {"content": "second"},
+            turn_index=2,
+            branch_id=2,
+            parent_branch_path=[(1, 1)],
+        )
+        store.append_event(
+            "alice",
+            "text_chunk",
+            {"content": "t2-sibling", "chunk_seq": 0},
+            turn_index=2,
+            branch_id=2,
+            parent_branch_path=[(1, 1)],
+        )
+        for index, output in enumerate(outputs, 1):
+            _, eid = store.append_event(
+                "alice",
+                "tool_result",
+                {"name": "slowbg", "call_id": f"slowbg_{index}", "output": output},
+                turn_index=2,
+                branch_id=1,
+                parent_branch_path=[(1, 1)],
+            )
+        persist_branch_view(store, "alice", {1: 1, 2: 2})
+        store.state["alice:snapshot_event_id"] = eid
+        store.flush()
+        return calls
+
+    def _contents(self, agent):
+        return [
+            message.content
+            for message in agent.controller.conversation.get_messages()
+            if message.role != "system"
+        ]
+
+    @pytest.mark.parametrize(
+        "content,metadata,complete",
+        [
+            pytest.param("RESULT_reviewbg", {}, True, id="final"),
+            pytest.param("", {}, True, id="empty"),
+            pytest.param(
+                f"head\n… {ELISION_MARKER} — 400 chars dropped from slowbg",
+                {"tool_results_elided": True},
+                True,
+                id="elided",
+            ),
+            pytest.param(_BG_PLACEHOLDER, {}, False, id="bare_ack"),
+            pytest.param(f"[slowbg] {_BG_PLACEHOLDER}", {}, False, id="native_ack"),
+            pytest.param(
+                "[slowbg] Promoted to background. Result arrives in a later turn.",
+                {},
+                False,
+                id="promoted_ack",
+            ),
+            pytest.param(
+                f"[slowbg] {_BG_PLACEHOLDER}\n… {ELISION_MARKER} — 400 chars dropped",
+                {"tool_results_elided": True},
+                False,
+                id="elided_ack",
+            ),
+            pytest.param(
+                "dispatch accepted",
+                {"job_id": "slowbg_1", "tool_result_phase": "pending"},
+                False,
+                id="typed_ack",
+            ),
+            pytest.param(
+                f"[slowbg] {_BG_PLACEHOLDER}",
+                {"job_id": "slowbg_1", "tool_result_phase": "final"},
+                True,
+                id="final_ack_text",
+            ),
+        ],
+    )
+    def test_snapshot_result_phase_preserves_or_rebuilds(
+        self, tmp_path, content, metadata, complete
+    ):
+        output = (
+            content
+            if complete and not metadata.get("tool_results_elided")
+            else "RESULT_reviewbg"
+        )
+        store = SessionStore(str(tmp_path / "x.kohakutr"))
+        try:
+            calls = self._late_result_events(store, (output,))
+            snapshot = [
+                {"role": "user", "content": "start bg"},
+                {"role": "assistant", "content": "", "tool_calls": calls},
+                {
+                    "role": "tool",
+                    "tool_call_id": "b1",
+                    "name": "slowbg",
+                    "content": content,
+                    "metadata": metadata,
+                },
+                {"role": "user", "content": "second"},
+                {"role": "assistant", "content": "t2-sibling"},
+                {"role": "assistant", "content": "SNAPSHOT_ONLY_SUMMARY"},
+            ]
+            store.save_conversation("alice", snapshot)
+            store.flush()
+            agent = _FakeAgentForInject()
+            inject_saved_state(agent, store, "alice")
+            assert self._contents(agent) == (
+                [
+                    "start bg",
+                    "",
+                    content,
+                    "second",
+                    "t2-sibling",
+                    "SNAPSHOT_ONLY_SUMMARY",
+                ]
+                if complete
+                else ["start bg", "", output, "second", "t2-sibling"]
+            )
+            tools = [
+                m
+                for m in agent.controller.conversation.get_messages()
+                if m.role == "tool"
+            ]
+            assert [(m.tool_call_id, m.name, m.content) for m in tools] == [
+                ("b1", "slowbg", content if complete else output)
+            ]
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize(
+        "representation,batched",
+        [
+            (kind, batched)
+            for kind in ("legacy", "typed", "elided")
+            for batched in (False, True)
+        ]
+        + [("ordinary_user", True)],
+    )
+    def test_tool_feedback_user_message_keeps_marker(
+        self, tmp_path, batched, representation
+    ):
+        store = SessionStore(str(tmp_path / "x.kohakutr"))
+        try:
+            self._late_result_events(store, ("RESULT_reviewbg", "RESULT_second"))
+            events = [
+                create_tool_complete_event(
+                    job_id="slowbg_1", content="RESULT_reviewbg", exit_code=0
+                ),
+                create_tool_complete_event(
+                    job_id="slowbg_2", content="RESULT_second", exit_code=0
+                ),
+            ]
+            groups = [events] if batched else [[event] for event in events]
+            base_metadata = {
+                "legacy": {"kind": TOOL_FEEDBACK_KIND},
+                "typed": {"kind": TOOL_FEEDBACK_KIND, "tool_result_phase": "final"},
+                "elided": {
+                    "kind": TOOL_FEEDBACK_KIND,
+                    "tool_result_phase": "final",
+                    "tool_results_elided": True,
+                },
+                "ordinary_user": {},
+            }[representation]
+            snapshot = []
+            for group in groups:
+                metadata = dict(base_metadata)
+                if "tool_result_phase" in metadata:
+                    metadata["job_ids"] = [event.job_id for event in group]
+                content = (
+                    f"head\n… {ELISION_MARKER} — 400 chars dropped"
+                    if metadata.get("tool_results_elided")
+                    else format_events_for_context(group)
+                )
+                snapshot.append(
+                    {"role": "user", "content": content, "metadata": metadata}
+                )
+            if representation == "ordinary_user":
+                assert snapshot_needs_settled_tool_replay(
+                    list(store.get_events("alice")), {1: 1, 2: 2}, snapshot
+                )
+                return
+            snapshot.append({"role": "assistant", "content": "SNAPSHOT_ONLY_SUMMARY"})
+            store.save_conversation("alice", snapshot)
+            store.flush()
+            agent = _FakeAgentForInject()
+            inject_saved_state(agent, store, "alice")
+            assert self._contents(agent) == [message["content"] for message in snapshot]
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize(
+        "coverage",
+        [
+            "covered",
+            "outside",
+            "late",
+            "sibling",
+            "legacy",
+            "projected_consumed",
+            "projected_late",
+            "projected_duplicate",
+        ],
+    )
+    def test_compact_coverage_controls_settled_replay(self, tmp_path, coverage):
+        store = SessionStore(str(tmp_path / "x.kohakutr"))
+        try:
+            self._late_result_events(store)
+            events = list(store.get_events("alice"))
+            call = next(e for e in events if e["type"] == "tool_call")
+            result = next(e for e in events if e["type"] == "tool_result")
+            payload = {
+                "summary": "SUMMARY",
+                "replaced_from_event_id": events[0]["event_id"],
+                "replaced_to_event_id": (
+                    result["event_id"]
+                    if coverage not in {"outside", "late"}
+                    else call["event_id"] - (coverage == "outside")
+                ),
+            }
+            if coverage == "projected_duplicate":
+                store.append_event(
+                    "alice",
+                    "tool_result",
+                    {
+                        key: value
+                        for key, value in result.items()
+                        if key not in {"event_id", "ts", "type"}
+                    },
+                    turn_index=2,
+                    branch_id=1,
+                    parent_branch_path=[(1, 1)],
+                )
+            projected = coverage.startswith("projected_")
+            branch_view = {1: 1, 2: 2 if projected else 1}
+            if projected:
+                payload["compact_result_event_ids"] = (
+                    [result["event_id"]]
+                    if coverage in {"projected_consumed", "projected_duplicate"}
+                    else []
+                )
+            if coverage != "legacy":
+                payload["compact_path"] = [
+                    [1, 1],
+                    [2, 2 if projected or coverage == "sibling" else 1],
+                ]
+            store.append_event(
+                "alice",
+                "compact_complete",
+                payload,
+                turn_index=2,
+                branch_id=branch_view[2],
+            )
+            events = list(store.get_events("alice"))
+            snapshot = [{"role": "assistant", "content": "SNAPSHOT_SUMMARY"}]
+            needs_replay = coverage in {"outside", "late", "sibling", "projected_late"}
+            assert (
+                snapshot_needs_settled_tool_replay(events, branch_view, snapshot)
+                is needs_replay
+            )
+            replayed = replay_with_settled_tools(
+                events, branch_view=branch_view, resumable=True
+            )
+            tools = [m for m in replayed if m["role"] == "tool"]
+            assert [(m["tool_call_id"], m["content"]) for m in tools] == (
+                [("b1", "RESULT_reviewbg")] if needs_replay else []
+            )
+            assert [c["id"] for m in replayed for c in m.get("tool_calls", [])] == (
+                ["b1"] if needs_replay else []
+            )
+            if needs_replay:
+                call_index = next(
+                    i for i, m in enumerate(replayed) if m.get("tool_calls")
+                )
+                assert replayed[call_index]["tool_calls"] == [
+                    {
+                        "id": "b1",
+                        "type": "function",
+                        "function": {"name": "slowbg", "arguments": "{}"},
+                    }
+                ]
+                assert replayed[call_index + 1]["role"] == "tool"
+                assert replayed[call_index + 1]["content"] == "RESULT_reviewbg"
+            assert any(m.get("content") == "SUMMARY" for m in replayed) is (
+                coverage != "sibling"
+            )
+            assert list(store.get_events("alice")) == events
+            if coverage == "projected_duplicate":
+                store.append_event(
+                    "alice",
+                    "tool_result",
+                    {
+                        "name": "slowbg",
+                        "call_id": "slowbg_1",
+                        "output": "LATER_DISTINCT",
+                    },
+                    turn_index=2,
+                    branch_id=1,
+                    parent_branch_path=[(1, 1)],
+                )
+                later = list(store.get_events("alice"))
+                assert snapshot_needs_settled_tool_replay(later, branch_view, snapshot)
+                assert [
+                    m["content"]
+                    for m in replay_with_settled_tools(
+                        later, branch_view=branch_view, resumable=True
+                    )
+                    if m["role"] == "tool"
+                ] == ["LATER_DISTINCT"]
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize("explicit_identity", [False, True])
+    def test_reused_provider_alias_cannot_prove_two_results(
+        self, tmp_path, explicit_identity
+    ):
+        store = SessionStore(str(tmp_path / "x.kohakutr"))
+        try:
+            self._late_result_events(store)
+            store.append_event(
+                "alice",
+                "tool_call",
+                {"name": "slowbg", "call_id": "slowbg_2", "tool_call_id": "b1"},
+                turn_index=2,
+                branch_id=2,
+                parent_branch_path=[(1, 1)],
+            )
+            store.append_event(
+                "alice",
+                "user_message",
+                {"content": "third"},
+                turn_index=3,
+                branch_id=1,
+                parent_branch_path=[(1, 1), (2, 2)],
+            )
+            store.append_event(
+                "alice",
+                "tool_result",
+                {"name": "slowbg", "call_id": "slowbg_2", "output": "RESULT_second"},
+                turn_index=3,
+                branch_id=1,
+                parent_branch_path=[(1, 1), (2, 2)],
+            )
+            message = {
+                "role": "tool",
+                "tool_call_id": "b1",
+                "content": "RESULT_reviewbg",
+            }
+            if explicit_identity:
+                message["metadata"] = {"job_id": "slowbg_1"}
+            events = list(store.get_events("alice"))
+            assert snapshot_needs_settled_tool_replay(
+                events, {1: 1, 2: 2, 3: 1}, [message]
+            )
+            if explicit_identity:
+                second = {
+                    "role": "tool",
+                    "tool_call_id": "b1",
+                    "content": "RESULT_second",
+                    "metadata": {"job_id": "slowbg_2"},
+                }
+                assert not snapshot_needs_settled_tool_replay(
+                    events, {1: 1, 2: 2, 3: 1}, [message, second]
+                )
+        finally:
+            store.close()
+
     def test_loads_conversation(self, tmp_path):
         store = SessionStore(str(tmp_path / "x.kohakutr"))
         try:
@@ -2491,7 +2981,8 @@ class TestResumeAgent:
         finally:
             store.close()
 
-    def test_crowded_resume_elides_stale_tool_results(self, tmp_path):
+    @pytest.mark.parametrize("snapshot_kind", ["legacy", "branch"])
+    def test_crowded_resume_elides_stale_tool_results(self, tmp_path, snapshot_kind):
         store = SessionStore(str(tmp_path / "x.kohakutr"))
         try:
             big = "y" * 1_000_000
@@ -2532,10 +3023,48 @@ class TestResumeAgent:
                     {"role": "assistant", "content": "latest"},
                 ],
             )
+            cooldown = time.time()
+            if snapshot_kind == "branch":
+                messages = store.load_conversation("alice")
+                for turn, message in enumerate(
+                    (msg for msg in messages if msg["role"] == "user"), 1
+                ):
+                    message["metadata"] = {"turn_index": turn, "branch_id": 1}
+                    store.append_event(
+                        "alice",
+                        "user_message",
+                        {"content": message["content"]},
+                        turn_index=turn,
+                        branch_id=1,
+                        parent_branch_path=[(t, 1) for t in range(1, turn)],
+                    )
+                store.save_branch_snapshot(
+                    "alice",
+                    messages,
+                    branch={
+                        "turn_index": 2,
+                        "branch_id": 1,
+                        "parent_branch_path": [[1, 1]],
+                    },
+                    watermark=store.max_event_id("alice"),
+                    compact_state={"compact_count": 2, "last_compact_time": cooldown},
+                )
             agent = _FakeAgentForInject()
             agent.config = _ElideConfig()
             agent.controller.config = _ElideConfig()
+            agent.compact_manager = CompactManager(
+                CompactConfig(max_tokens=2000, cooldown_seconds=30)
+            )
+            agent.compact_manager._agent = agent
             inject_saved_state(agent, store, "alice")
+            if snapshot_kind == "branch":
+                for _ in range(2):
+                    restore_compact_state_from_session(
+                        agent.compact_manager, store, "alice"
+                    )
+                    assert agent.compact_manager._compact_count == 2
+                    assert agent.compact_manager._last_compact_time == cooldown
+                    assert not agent.compact_manager.should_compact(2000)
             from kohakuterrarium.core.conversation_elide import ELISION_MARKER
 
             contents = [

@@ -1,6 +1,7 @@
 """Clear live conversation context while preserving recorded session history."""
 
 from kohakuterrarium.builtins.user_commands.registry import register_user_command
+from kohakuterrarium.session.snapshot import save_agent_snapshot
 from kohakuterrarium.modules.user_command.base import (
     BaseUserCommand,
     CommandLayer,
@@ -11,7 +12,7 @@ from kohakuterrarium.modules.user_command.base import (
 )
 
 
-def _do_clear(context: UserCommandContext) -> str:
+async def _do_clear(context: UserCommandContext) -> str:
     """Clear context, emit its activity, persist the empty snapshot, and summarize."""
     agent = context.agent
     msgs = len(agent.controller.conversation.get_messages())
@@ -26,8 +27,13 @@ def _do_clear(context: UserCommandContext) -> str:
 
     # Persisting after mutation ensures resume restores the cleared state.
     if agent.session_store:
-        agent.session_store.save_conversation(
+        session_output = getattr(agent, "_session_output", None)
+        if session_output is not None:
+            await session_output.drain()
+        save_agent_snapshot(
+            agent.session_store,
             agent.config.name,
+            agent,
             agent.controller.conversation.snapshot_messages(),
         )
 
@@ -49,7 +55,7 @@ class ClearCommand(BaseUserCommand):
 
         # Confirming frontends resubmit with ``--force`` to avoid a second prompt.
         if args.strip() == "--force":
-            msg = _do_clear(context)
+            msg = await _do_clear(context)
             return UserCommandResult(
                 output=msg,
                 data=ui_notify("Context cleared", level="success"),
@@ -59,7 +65,7 @@ class ClearCommand(BaseUserCommand):
 
         # Interactive terminal input provides an immediate command path.
         if context.input_module:
-            msg = _do_clear(context)
+            msg = await _do_clear(context)
             return UserCommandResult(output=msg)
 
         # Frontends without an input module must confirm before destructive clearing.

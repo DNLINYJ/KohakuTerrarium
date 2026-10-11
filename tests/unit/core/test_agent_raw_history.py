@@ -175,10 +175,7 @@ def _compact_event(event_id, replaced_from, replaced_to, summary="[S]"):
     }
 
 
-def test_reload_keeps_compact_baseline_for_compacted_target():
-    # turn1-2 were compacted (replaced 1..4). Editing turn2 must keep the
-    # summary for turn1 and materialize only the target — no resurrection of
-    # the compacted prefix.
+def test_reload_discards_summary_covering_the_edited_target():
     events = [
         _event(1, "user_message", turn=1, content="U1"),
         _event(2, "text_chunk", turn=1, content="R1"),
@@ -198,7 +195,8 @@ def test_reload_keeps_compact_baseline_for_compacted_target():
     messages = agent.controller.conversation.get_messages()
     assert [(m.role, m.content) for m in messages] == [
         ("system", "current runtime prompt"),
-        ("assistant", "[S]"),
+        ("user", "U1"),
+        ("assistant", "R1"),
         ("user", "U2"),
     ]
 
@@ -213,7 +211,11 @@ def test_reload_keeps_compact_baseline_for_later_target():
         _event(4, "text_chunk", turn=2, content="R2", path=[[1, 1]]),
         _event(5, "user_message", turn=3, content="U3", path=[[1, 1], [2, 1]]),
         _event(6, "text_chunk", turn=3, content="R3", path=[[1, 1], [2, 1]]),
-        _compact_event(7, 1, 4),
+        {
+            **_compact_event(7, 1, 4),
+            "compact_source_path": [[1, 1], [2, 1]],
+            "compact_path": [[1, 1], [2, 1], [3, 1]],
+        },
     ]
     agent = _agent(events)
 
@@ -283,8 +285,6 @@ def test_reload_ignores_sibling_branch_compact():
     # branch-2 turn 2 under turn1-branch1) must not be kept as the target
     # branch's baseline — replay would otherwise see a foreign rule and (for
     # legacy pathless data) could resurrect or mis-summarize the prefix.
-    # A compact that DOES cover a shared ancestor (e.g. path [[1,1],[2,1]])
-    # is still kept — that is the existing baseline-preservation behavior.
     events = [
         _event(1, "user_message", turn=1, content="U1"),
         _event(2, "text_chunk", turn=1, content="R1"),
@@ -333,10 +333,7 @@ def test_reload_ignores_sibling_branch_compact():
 
 
 def test_reload_ignores_sibling_compact_sharing_ancestor():
-    # Two compactions on branches that share a prefix (turns 1-2) then diverge
-    # at turn 3. Editing branch-2's turn 3 must keep ONLY branch-2's compact
-    # baseline — branch-1's summary is a foreign baseline that shares the same
-    # ancestor prefix and must not stack on top of branch-2's.
+    # Both summaries depend on turn 3; neither is safe before regenerating it.
     events = [
         _event(1, "user_message", turn=1, content="U1"),
         _event(2, "text_chunk", turn=1, content="R1"),
@@ -391,7 +388,10 @@ def test_reload_ignores_sibling_compact_sharing_ancestor():
     messages = agent.controller.conversation.get_messages()
     assert [(m.role, m.content) for m in messages] == [
         ("system", "current runtime prompt"),
-        ("assistant", "[S2]"),
+        ("user", "U1"),
+        ("assistant", "R1"),
+        ("user", "U2"),
+        ("assistant", "R2"),
         ("user", "U3b"),
     ]
 
@@ -410,9 +410,7 @@ def _compact_complete_event(event_id, replaced_from, replaced_to, summary="[S]")
     }
 
 
-def test_reload_keeps_v2_compact_complete_baseline():
-    # Runtime compaction persists compact_complete; editing a turn covered by
-    # it must keep the baseline (summary) instead of resurrecting full history.
+def test_reload_discards_v2_summary_covering_the_edited_target():
     events = [
         _event(1, "user_message", turn=1, content="U1"),
         _event(2, "text_chunk", turn=1, content="R1"),
@@ -429,6 +427,7 @@ def test_reload_keeps_v2_compact_complete_baseline():
     messages = agent.controller.conversation.get_messages()
     assert [(m.role, m.content) for m in messages] == [
         ("system", "current runtime prompt"),
-        ("assistant", "[S]"),
+        ("user", "U1"),
+        ("assistant", "R1"),
         ("user", "U2"),
     ]

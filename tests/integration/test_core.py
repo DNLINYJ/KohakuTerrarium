@@ -31,16 +31,24 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+import kohakuterrarium.core.agent_message_history as branch_history
 from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
 from kohakuterrarium.builtins.tools.canvas_image import CanvasImageTool
 from kohakuterrarium.builtins.tools.stop_task import StopTaskTool
 from kohakuterrarium.core.agent import Agent
+from kohakuterrarium.core.branch_continuation import (
+    live_branch_path,
+    load_persisted_branch_view,
+    persist_branch_view,
+    selected_branch_view,
+)
 from kohakuterrarium.core.config_types import (
     AgentConfig,
     InputConfig,
     OutputConfig,
 )
+from kohakuterrarium.builtins.user_commands.clear import ClearCommand
 from kohakuterrarium.core.conversation import Conversation
 from kohakuterrarium.core.events import (
     EventType,
@@ -48,7 +56,7 @@ from kohakuterrarium.core.events import (
     create_tool_complete_event,
     create_user_input_event,
 )
-from kohakuterrarium.core.turn import TurnCapture
+from kohakuterrarium.core.turn import Activity, TurnCapture
 from kohakuterrarium.llm.message import FilePart, ImagePart, TextPart
 from kohakuterrarium.llm.artifact_resolve import (
     file_reference_path,
@@ -58,6 +66,8 @@ from kohakuterrarium.llm.base import NativeToolCall
 from kohakuterrarium.llm.codex_format import to_responses_input
 from kohakuterrarium.llm.recovery import drop_last_tool_round
 from kohakuterrarium.session.raw_history import UserMessageSelector
+from kohakuterrarium.modules.user_command.base import UserCommandContext
+from kohakuterrarium.session.resume import resume_agent
 from kohakuterrarium.session.resume_build import build_conversation
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.reader import SessionReader
@@ -86,9 +96,10 @@ from kohakuterrarium.testing.output import OutputRecorder
 class _HistoryReplayLLM(ScriptedLLM):
     """Supply native/text tool calls and a cancellable response for history workflows."""
 
-    def __init__(self, native):
+    def __init__(self, native, plan=None):
         super().__init__(["OK"])
         self.native = native
+        self.plan = plan
         self.started = asyncio.Event()
         self.last_tool_calls = []
 
@@ -100,6 +111,14 @@ class _HistoryReplayLLM(ScriptedLLM):
             if item.get("type") == "function_call":
                 assert re.fullmatch(r"[a-zA-Z0-9_-]+", item["name"])
         self.last_tool_calls = []
+        if self.plan is not None:
+            step = self.plan[min(self.call_count - 1, len(self.plan) - 1)]
+            if isinstance(step, list):
+                self.last_tool_calls = step
+                yield ""
+            else:
+                yield step
+            return
         if self.call_count == 1:
             if self.native:
                 self.last_tool_calls = [
@@ -126,6 +145,10 @@ class _EchoTool(BaseTool):
     ``[echo/]`` onto the ``content`` argument.
     """
 
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
     @property
     def tool_name(self) -> str:
         return "echo"
@@ -139,12 +162,20 @@ class _EchoTool(BaseTool):
         return ExecutionMode.DIRECT
 
     async def _execute(self, args, **kwargs):
+        self.calls += 1
         return ToolResult(output=f"echoed:{args.get('content', '')}")
 
 
 class _SlowBackgroundTool(BaseTool):
     """BACKGROUND tool: yields after a short sleep so the controller
     must promote it and pick the result up on a later turn."""
+
+    def __init__(self, *, gated=False):
+        super().__init__()
+        self.calls = 0
+        self.gated = gated
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
 
     @property
     def tool_name(self) -> str:
@@ -159,7 +190,12 @@ class _SlowBackgroundTool(BaseTool):
         return ExecutionMode.BACKGROUND
 
     async def _execute(self, args, **kwargs):
-        await asyncio.sleep(0.05)
+        self.calls += 1
+        self.started.set()
+        if self.gated:
+            await self.release.wait()
+        else:
+            await asyncio.sleep(0.05)
         return ToolResult(output="background-finished")
 
 
@@ -1494,7 +1530,7 @@ class TestCoreIntegration:
                     owner.cancel()
                 await asyncio.gather(owner, return_exceptions=True)
 
-    async def test_history_ops(self, make_creature, tmp_path):
+    async def test_history_ops(self, make_creature, tmp_path, monkeypatch):
         """One workflow over the three history operations: run a turn,
         ``regenerate_last_response`` opens a new branch, ``edit_and_rerun``
         replaces the user message and re-runs, ``rewind_to`` drops the
@@ -1516,6 +1552,7 @@ class TestCoreIntegration:
                 # A second turn, then a turn-targeted regenerate of it.
                 ScriptEntry("second turn reply", match="second question"),
                 ScriptEntry("turn2 regen reply", match="second question"),
+                ScriptEntry("continued original", match="continue original"),
             ]
         )
         agent = creature.agent
@@ -1714,35 +1751,26 @@ class TestCoreIntegration:
             # The override map stays empty after the rejected set.
             assert agent.native_tool_options.list() == {}
 
-            # --- branch-view replay: reseat the conversation -----------
-            # ``_reload_conversation_under_branch_view`` is the frontend
-            # "select an older branch" path: it replays the event log
-            # under a chosen ``branch_view`` and reseats the in-memory
-            # conversation + agent turn/branch state to that subtree's
-            # leaf. Selecting turn 1's branch 1 (the original) reseats
-            # the agent onto turn 1 / branch 1.
-            agent._reload_conversation_under_branch_view({1: 1})
-            assert agent._turn_index == 1
-            assert agent._branch_id == 1
-            # The replayed conversation carries turn 1's branch-1 user
-            # message ("first question") and original assistant reply.
-            replayed = " ".join(
-                m.get_text_content()
-                for m in agent.controller.conversation.get_messages()
-            )
-            assert "first question" in replayed
-            assert "original reply" in replayed
-            replay_messages = agent.controller.conversation.get_messages()
-            replay_tool_index = next(
-                i
-                for i, message in enumerate(replay_messages)
-                if message.role == "tool" and message.tool_call_id == replay_call_id
-            )
-            replay_announcement = replay_messages[replay_tool_index - 1]
-            assert replay_announcement.role == "assistant"
-            assert replay_call_id in {
-                call["id"] for call in replay_announcement.tool_calls
-            }
+            # Live path is the latest subtree. inject_input must reseat
+            # onto the original branch without a prior private reload.
+            assert live_branch_path(agent).get(1) != 1
+            await agent.inject_input("continue original", branch_view={1: 1})
+            continued = [
+                (message.get("role"), message.get("content"))
+                for message in agent.llm.call_log[-1]
+                if message.get("role") != "system"
+            ]
+            assert continued[0] == ("user", "first question")
+            assert ("assistant", "original reply") in continued
+            assert continued[-1] == ("user", "continue original")
+            assert ("assistant", "regenerated reply") not in continued
+            assert ("assistant", "edited reply") not in continued
+            assert ("user", "second question") not in continued
+            assert "continued original" in _assistant_text(agent)
+            persisted = load_persisted_branch_view(store, agent.config.name)
+            assert persisted[1] == 1
+            assert selected_branch_view(agent)[1] == 1
+            assert agent._max_branch_id_for_turn(1) >= 2
 
         for mode in ("native", "bracket"):
             folder = tmp_path / mode
@@ -1816,6 +1844,621 @@ class TestCoreIntegration:
                 assert [(call["id"], call["function"]["name"]) for call in calls] == [
                     (expected_id, "scratchpad")
                 ]
+
+        def prefix(messages):
+            rows = []
+            for message in messages:
+                role = message["role"]
+                if role == "system":
+                    continue
+                if message.get("tool_calls"):
+                    rows.append(
+                        (
+                            "calls",
+                            [
+                                (
+                                    c["id"],
+                                    c["function"]["name"],
+                                    c["function"]["arguments"],
+                                )
+                                for c in message["tool_calls"]
+                            ],
+                        )
+                    )
+                elif role == "tool":
+                    rows.append(
+                        (
+                            role,
+                            message["tool_call_id"],
+                            message.get("name"),
+                            message["content"],
+                        )
+                    )
+                else:
+                    rows.append((role, message["content"]))
+            return rows
+
+        for notify in (True, False):
+            echo, bg = _EchoTool(), _SlowBackgroundTool(gated=True)
+            bg.config.notify_controller_on_background_complete = notify
+            plan = [
+                [
+                    NativeToolCall("c1", "echo", '{"content":"a"}'),
+                    NativeToolCall("c2", "echo", '{"content":"b"}'),
+                ],
+                "direct done",
+                [NativeToolCall("b1", "slowbg", "{}")],
+                "later done",
+                "completion done" if notify else "snapshot done",
+                "later sibling",
+                "orig cont",
+                "sib cont",
+                "resume one",
+                "resume two",
+            ]
+            llm = _HistoryReplayLLM(True, plan=plan)
+            async with Terrarium(session_dir=tmp_path / f"settled-{notify}") as engine:
+                creature = await engine.add_creature(
+                    AgentConfig(
+                        name="settled", system_prompt="plain", tool_format="native"
+                    ),
+                    llm=llm,
+                    tools=[echo, bg],
+                    io="headless",
+                    start=True,
+                )
+                agent = creature.agent
+                agent.controller.config.include_job_status = False
+                cold_store = None
+                try:
+                    await creature.run("do two", timeout=8)
+                    direct = [
+                        ("user", "do two"),
+                        (
+                            "calls",
+                            [
+                                ("c1", "echo", '{"content":"a"}'),
+                                ("c2", "echo", '{"content":"b"}'),
+                            ],
+                        ),
+                        ("tool", "c1", "echo", "echoed:a"),
+                        ("tool", "c2", "echo", "echoed:b"),
+                    ]
+                    assert prefix(llm.call_log[1]) == direct
+                    await creature.run("launch", timeout=8)
+                    await asyncio.wait_for(bg.started.wait(), 2)
+                    job = agent.executor.get_running_jobs()[0]
+                    job_id = job.job_id
+                    task = agent.executor._tasks[job_id]
+                    ack = next(
+                        m
+                        for m in agent.controller.conversation.get_messages()
+                        if m.role == "tool" and m.tool_call_id == "b1"
+                    )
+                    assert ack.metadata == {
+                        "job_id": job_id,
+                        "tool_result_phase": "pending",
+                    }
+                    await creature.run("later", timeout=8)
+                    if notify:
+                        async with creature.attach() as stream:
+                            bg.release.set()
+                            while True:
+                                event = await asyncio.wait_for(anext(stream), 8)
+                                if (
+                                    isinstance(event, Activity)
+                                    and event.kind == "processing_end"
+                                ):
+                                    break
+                        completion = agent._turn_completion
+                        if completion is not None:
+                            await asyncio.wait_for(asyncio.shield(completion), 8)
+                        assert (
+                            agent.controller.conversation.get_last_assistant_message().content
+                            == "completion done"
+                        )
+                        await task
+                        feedback = next(
+                            m
+                            for m in agent.controller.conversation.get_messages()
+                            if m.metadata.get("kind") == "tool_results"
+                        )
+                        assert feedback.metadata == {
+                            "kind": "tool_results",
+                            "job_ids": [job_id],
+                            "tool_result_phase": "final",
+                            "turn_index": 3,
+                            "branch_id": 1,
+                            "origin_known": True,
+                        }
+                    else:
+                        bg.release.set()
+                        await asyncio.wait_for(task, 8)
+                        assert len(agent._event_inbox) == 0
+                        await creature.run("save ack snapshot", timeout=8)
+                        snapshot = agent.session_store.load_conversation("settled")
+                        assert (
+                            next(m for m in snapshot if m.get("tool_call_id") == "b1")[
+                                "metadata"
+                            ]["tool_result_phase"]
+                            == "pending"
+                        )
+                        path = agent.session_store.path
+                        await engine.remove_creature(creature)
+                        agent.session_store.close()
+                        agent, cold_store = resume_agent(path, io_mode="plain", llm=llm)
+                        restored_bg = [
+                            m
+                            for m in agent.controller.conversation.get_messages()
+                            if m.role == "tool" and m.tool_call_id == "b1"
+                        ]
+                        assert [(m.name, m.content) for m in restored_bg] == [
+                            ("slowbg", "background-finished")
+                        ]
+                        await agent.start()
+                    original = dict(live_branch_path(agent))
+                    await agent.regenerate_last_response(turn_index=agent._turn_index)
+                    sibling = dict(live_branch_path(agent))
+                    assert sibling != original
+                    expected = direct + [
+                        ("assistant", "direct done"),
+                        ("user", "launch"),
+                        ("calls", [("b1", "slowbg", "{}")]),
+                        ("tool", "b1", "slowbg", "background-finished"),
+                        ("user", "later"),
+                    ]
+                    if not notify:
+                        expected += [
+                            ("assistant", "later done"),
+                            ("user", "save ack snapshot"),
+                        ]
+                    original_tail = (
+                        [("assistant", "later done"), ("assistant", "completion done")]
+                        if notify
+                        else [("assistant", "snapshot done")]
+                    )
+                    await agent.inject_input("continue original", branch_view=original)
+                    assert prefix(llm.last_messages) == expected + original_tail + [
+                        ("user", "continue original")
+                    ]
+                    await agent.inject_input("continue sibling", branch_view=sibling)
+                    selected = expected + [
+                        ("assistant", "later sibling"),
+                        ("user", "continue sibling"),
+                    ]
+                    assert prefix(llm.last_messages) == selected
+                    selected += [("assistant", "sib cont")]
+                    await agent._session_output.drain()
+                    manager = agent.compact_manager
+                    manager.config.keep_recent_turns = 1
+                    summary_llm = ScriptedLLM(["summary SIBLING"])
+                    manager._llm = summary_llm
+                    assert manager.trigger_compact()
+                    await asyncio.wait_for(manager.wait_for_current(), 8)
+                    await agent._session_output.drain()
+                    assert "background-finished" in str(summary_llm.last_messages)
+                    messages = agent.controller.conversation.to_messages()
+                    assert not any(
+                        m.get("tool_calls") or m["role"] == "tool" for m in messages
+                    )
+                    raw_compacted = agent.session_store.get_events("settled")
+                    bg_result = next(
+                        e
+                        for e in raw_compacted
+                        if e["type"] == "tool_result" and e.get("call_id") == job_id
+                    )
+                    compact_event = next(
+                        e
+                        for e in reversed(raw_compacted)
+                        if e["type"] == "compact_complete"
+                    )
+                    assert (
+                        bg_result["event_id"]
+                        in compact_event["compact_result_event_ids"]
+                    )
+                    if notify:
+                        assert [3, 1] not in compact_event["compact_source_path"]
+                    selected = prefix(messages)
+                    assert selected[-3:] == [
+                        (
+                            "assistant",
+                            "[Previous context summary (compact round 1)]\n\nsummary SIBLING",
+                        ),
+                        ("user", "continue sibling"),
+                        ("assistant", "sib cont"),
+                    ]
+                    saved_view = selected_branch_view(agent)
+                    path = agent.session_store.path
+                finally:
+                    bg.release.set()
+                    if cold_store is not None:
+                        await agent.stop()
+                        cold_store.close()
+
+            for prompt, response in (
+                ("after resume", "resume one"),
+                ("after second resume", "resume two"),
+            ):
+                restored, store = resume_agent(path, io_mode="plain", llm=llm)
+                try:
+                    assert selected_branch_view(restored) == saved_view
+                    assert (
+                        prefix(restored.controller.conversation.to_messages())
+                        == selected
+                    )
+                    await restored.start()
+                    await restored.inject_input(prompt)
+                    selected += [("user", prompt)]
+                    assert prefix(llm.last_messages) == selected
+                    selected += [("assistant", response)]
+                    saved_view = selected_branch_view(restored)
+                    path = store.path
+                finally:
+                    await restored.stop()
+                    store.close()
+
+            sibling_view = dict(live_branch_path(restored))
+            switch_llm = ScriptedLLM(["before empty"])
+            switch_agent, store = resume_agent(path, io_mode="plain", llm=switch_llm)
+            try:
+                switch_agent.controller.config.include_job_status = False
+                await switch_agent.start()
+                await switch_agent.inject_input("before clear", branch_view=original)
+                assert "background-finished" in str(switch_llm.last_messages)
+                assert "summary SIBLING" not in str(switch_llm.last_messages)
+                raw_before = list(store.get_events("settled"))
+                sibling_checkpoint = store.load_branch_snapshot("settled", sibling_view)
+                if notify:
+                    await ClearCommand()._execute(
+                        "--force", UserCommandContext(agent=switch_agent)
+                    )
+                else:
+                    await switch_agent.rewind_to(0)
+                assert prefix(switch_agent.controller.conversation.to_messages()) == []
+                path = store.path
+            finally:
+                await switch_agent.stop()
+                store.close()
+
+            for cold_step, (cold_input, expected_provider) in enumerate(
+                [
+                    ("new input 1", [("user", "new input 1")]),
+                    (
+                        "new input 2",
+                        [
+                            ("user", "new input 1"),
+                            ("assistant", "fresh answer 1"),
+                            ("user", "new input 2"),
+                        ],
+                    ),
+                ],
+                start=1,
+            ):
+                fresh_llm = ScriptedLLM(
+                    [
+                        f"fresh answer {cold_step}",
+                        "first revised",
+                        "old history revised",
+                    ]
+                )
+                fresh_agent, fresh_store = resume_agent(
+                    path, io_mode="plain", llm=fresh_llm
+                )
+                try:
+                    fresh_agent.controller.config.include_job_status = False
+                    await fresh_agent.start()
+                    await fresh_agent.inject_input(cold_input)
+                    assert prefix(fresh_llm.last_messages) == expected_provider
+                    assert fresh_agent.compact_manager._compact_count == 0
+                    assert (
+                        fresh_store.load_branch_snapshot("settled", sibling_view)[
+                            "messages"
+                        ]
+                        == sibling_checkpoint["messages"]
+                    )
+                    assert (
+                        fresh_store.get_events("settled")[: len(raw_before)]
+                        == raw_before
+                    )
+                    if cold_step == 2:
+                        first_new = next(
+                            event
+                            for event in fresh_store.get_events("settled")
+                            if event["type"] == "user_message"
+                            and event["content"] == "new input 1"
+                        )
+                        selector = UserMessageSelector(
+                            first_new["event_id"],
+                            first_new["turn_index"],
+                            first_new["branch_id"],
+                        )
+                        boundary = fresh_agent._context_cutoff_event_id
+                        if notify:
+                            assert await fresh_agent.edit_and_rerun(
+                                -1, "first edited", target=selector
+                            )
+                            expected_first = "first edited"
+                        else:
+                            await fresh_agent.regenerate_last_response(target=selector)
+                            expected_first = "new input 1"
+                        assert prefix(fresh_llm.last_messages) == [
+                            ("user", expected_first)
+                        ]
+                        assert fresh_agent._context_cutoff_event_id == boundary
+                        old_user = next(
+                            event
+                            for event in raw_before
+                            if event["type"] == "user_message"
+                        )
+                        assert await fresh_agent.edit_and_rerun(
+                            -1,
+                            "before clear edited",
+                            target=UserMessageSelector(
+                                old_user["event_id"],
+                                old_user["turn_index"],
+                                old_user["branch_id"],
+                            ),
+                        )
+                        assert prefix(fresh_llm.last_messages) == [
+                            ("user", "before clear edited")
+                        ]
+                        assert fresh_agent._context_cutoff_event_id == 0
+                    path = fresh_store.path
+                finally:
+                    await fresh_agent.stop()
+                    fresh_store.close()
+            assert echo.calls == 2
+            assert bg.calls == 1
+
+        compact_bg = _SlowBackgroundTool(gated=True)
+        compact_bg.config.notify_controller_on_background_complete = True
+        compact_llm = _HistoryReplayLLM(
+            True,
+            plan=[
+                [NativeToolCall("b1", "slowbg", "{}")],
+                "launched",
+                "completion done",
+                "third done",
+                "fourth done",
+            ],
+        )
+        async with Terrarium(session_dir=tmp_path / "compact-cold") as engine:
+            creature = await engine.add_creature(
+                AgentConfig(
+                    name="compactcold", system_prompt="plain", tool_format="native"
+                ),
+                llm=compact_llm,
+                tools=[compact_bg],
+                io="headless",
+                pwd=tmp_path,
+                start=True,
+            )
+            agent = creature.agent
+            agent.controller.config.include_job_status = False
+            try:
+                await creature.run("launch", timeout=8)
+                await asyncio.wait_for(compact_bg.started.wait(), 2)
+                await creature.run("second", timeout=8)
+                async with creature.attach() as stream:
+                    compact_bg.release.set()
+                    while True:
+                        event = await asyncio.wait_for(anext(stream), 8)
+                        if (
+                            isinstance(event, Activity)
+                            and event.kind == "processing_end"
+                        ):
+                            break
+                completion = agent._turn_completion
+                if completion is not None:
+                    await asyncio.wait_for(asyncio.shield(completion), 8)
+                assert (
+                    agent.controller.conversation.get_last_assistant_message().content
+                    == "completion done"
+                )
+                await creature.run("third", timeout=8)
+                await creature.run("fourth", timeout=8)
+                await agent._session_output.drain()
+
+                manager = agent.compact_manager
+                manager.config.keep_recent_turns = 1
+                summary_llm = ScriptedLLM(["summary OLD_LAUNCH"])
+                manager._llm = summary_llm
+                assert manager.trigger_compact()
+                await asyncio.wait_for(manager.wait_for_current(), 8)
+                await agent._session_output.drain()
+                assert manager._compact_count == 1
+                compacted = prefix(agent.controller.conversation.to_messages())
+                assert compacted == [
+                    (
+                        "assistant",
+                        "[Previous context summary (compact round 1)]\n\nsummary OLD_LAUNCH",
+                    ),
+                    ("user", "fourth"),
+                    ("assistant", "fourth done"),
+                ]
+
+                raw = agent.session_store.get_events("compactcold")
+                compact_event = [
+                    event for event in raw if event["type"] == "compact_complete"
+                ][-1]
+                assert compact_event["summary"] == "summary OLD_LAUNCH"
+                assert compact_event["compact_source_path"] == [
+                    [t, 1] for t in range(1, 4)
+                ]
+                tool_events = [
+                    event
+                    for event in raw
+                    if event["type"] in ("tool_call", "tool_result")
+                ]
+                assert [event["type"] for event in tool_events] == [
+                    "tool_call",
+                    "tool_result",
+                ]
+                for event in tool_events:
+                    assert (
+                        compact_event["replaced_from_event_id"]
+                        <= event["event_id"]
+                        <= compact_event["replaced_to_event_id"]
+                    ), event
+                assert compact_event["replaced_to_event_id"] < compact_event["event_id"]
+                assert (
+                    load_persisted_branch_view(agent.session_store, "compactcold")
+                    is None
+                )
+                compact_path = agent.session_store.path
+                raw_before_resume = list(raw)
+            finally:
+                compact_bg.release.set()
+
+        resumed_llm = ScriptedLLM(
+            [
+                "after compact",
+                "edited tail",
+                "rerun tail",
+                "edited launch",
+                "switch A reply",
+            ]
+        )
+        restored, restored_store = resume_agent(
+            compact_path, io_mode="plain", llm=resumed_llm
+        )
+        try:
+            await restored.start()
+            await restored.inject_input("after reopen")
+            assert prefix(resumed_llm.last_messages) == compacted + [
+                ("user", "after reopen")
+            ]
+            assert prefix(restored.controller.conversation.to_messages()) == (
+                compacted + [("user", "after reopen"), ("assistant", "after compact")]
+            )
+            assert compact_bg.calls == 1
+            raw_after = restored_store.get_events("compactcold")
+            assert raw_after[: len(raw_before_resume)] == raw_before_resume
+            appended = raw_after[len(raw_before_resume) :]
+            assert not any(
+                event["type"] in ("tool_call", "tool_result", "compact_complete")
+                for event in appended
+            ), appended
+            assert [
+                event["type"] for event in appended if event["type"] == "user_message"
+            ] == ["user_message"]
+            tail = next(
+                evt
+                for evt in raw_before_resume
+                if evt["type"] == "user_message" and evt["content"] == "fourth"
+            )
+            await restored.edit_and_rerun(
+                -1,
+                "fourth edited",
+                target=UserMessageSelector(
+                    tail["event_id"], tail["turn_index"], tail["branch_id"]
+                ),
+            )
+            assert prefix(resumed_llm.last_messages) == [
+                compacted[0],
+                ("user", "fourth edited"),
+            ]
+            await restored.regenerate_last_response()
+            assert prefix(resumed_llm.last_messages) == [
+                compacted[0],
+                ("user", "fourth edited"),
+            ]
+            launch = next(
+                evt
+                for evt in raw_before_resume
+                if evt["type"] == "user_message" and evt["content"] == "launch"
+            )
+            await restored.edit_and_rerun(
+                -1,
+                "launch edited",
+                target=UserMessageSelector(
+                    launch["event_id"], launch["turn_index"], launch["branch_id"]
+                ),
+            )
+            assert prefix(resumed_llm.last_messages) == [("user", "launch edited")]
+            assert "OLD_LAUNCH" not in str(resumed_llm.last_messages)
+            assert restored.compact_manager._compact_count == 0
+            await restored.stop()
+            await restored.start()
+            assert restored.compact_manager._compact_count == 0
+            original_view = {turn: 1 for turn in range(1, 6)}
+            checkpoint = restored_store.load_branch_snapshot(
+                "compactcold", original_view
+            )
+            replayed_ids = []
+            original_replay = branch_history.replay_with_settled_tools
+
+            def observe_replay(events, **kwargs):
+                replayed_ids.extend(
+                    evt["event_id"] for evt in events if "event_id" in evt
+                )
+                return original_replay(events, **kwargs)
+
+            with monkeypatch.context() as observation:
+                observation.setattr(
+                    branch_history, "replay_with_settled_tools", observe_replay
+                )
+                await restored.inject_input("switch A", branch_view=original_view)
+            assert all(event_id > checkpoint["watermark"] for event_id in replayed_ids)
+            assert prefix(resumed_llm.last_messages) == compacted + [
+                ("user", "after reopen"),
+                ("assistant", "after compact"),
+                ("user", "switch A"),
+            ]
+            assert restored.compact_manager._compact_count == 1
+            counter_reads = []
+            original_events = restored_store.get_events
+
+            def observe_counter_reads(*args, **kwargs):
+                counter_reads.append(args)
+                return original_events(*args, **kwargs)
+
+            with monkeypatch.context() as observation:
+                observation.setattr(restored_store, "get_events", observe_counter_reads)
+                restored.attach_session_store(restored_store)
+            assert counter_reads == []
+            assert restored.compact_manager._compact_count == 1
+            assert (
+                restored_store.get_events("compactcold")[: len(raw_before_resume)]
+                == raw_before_resume
+            )
+            assert summary_llm.call_count == 1
+            assert compact_bg.calls == 1
+            persist_branch_view(
+                restored_store, "compactcold", {turn: 1 for turn in range(1, 7)}
+            )
+        finally:
+            await restored.stop()
+            restored_store.close()
+        retained_llm = ScriptedLLM(["retained A"])
+        retained, retained_store = resume_agent(
+            compact_path, io_mode="plain", llm=retained_llm
+        )
+        try:
+            await retained.start()
+            assert retained.compact_manager._compact_count == 1
+            await retained.inject_input("from retained A")
+            assert prefix(retained_llm.last_messages) == compacted + [
+                ("user", "after reopen"),
+                ("assistant", "after compact"),
+                ("user", "switch A"),
+                ("assistant", "switch A reply"),
+                ("user", "from retained A"),
+            ]
+            await retained.rewind_to(
+                retained.controller.conversation.find_last_user_index() + 1
+            )
+            assert [
+                m["content"]
+                for m in retained_store.load_branch_snapshot("compactcold", {1: 2})[
+                    "messages"
+                ]
+                if m["role"] == "user"
+            ] == ["launch edited"]
+
+        finally:
+            await retained.stop()
+            retained_store.close()
 
     async def test_inject_event_and_unified_trigger_model(self, make_creature):
         """The unified ``TriggerEvent`` model: a non-user-input event

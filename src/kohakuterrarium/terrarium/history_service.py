@@ -2,6 +2,10 @@
 
 from typing import Protocol
 
+from kohakuterrarium.core.branch_continuation import (
+    encode_branch_view,
+    selected_branch_view,
+)
 from kohakuterrarium.session.history_paging import page_channels
 from kohakuterrarium.session.history_records import history_detail, history_page
 from kohakuterrarium.terrarium.creature_ops import agent_live_job_ids
@@ -32,7 +36,11 @@ class LocalHistoryServiceMixin:
             snapshot=getattr(creature.agent, "conversation_history", None),
             is_processing=bool(creature.agent.is_processing),
             live_job_ids=tuple(sorted(agent_live_job_ids(creature.agent))),
-            envelope={"creature_id": creature_id, "session_id": creature.graph_id},
+            envelope={
+                "creature_id": creature_id,
+                "session_id": creature.graph_id,
+                "branch_view": encode_branch_view(selected_branch_view(creature.agent)),
+            },
             **kwargs,
         )
 

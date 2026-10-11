@@ -21,27 +21,31 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from kohakuterrarium.errors import ConflictError
+from kohakuterrarium.parsing import SubAgentCallEvent
 from kohakuterrarium.bootstrap import llm as bootstrap_llm
-from kohakuterrarium.builtins.inputs.none import NoneInput
 from kohakuterrarium.core.agent import Agent
-from kohakuterrarium.core.event_inbox import EventEnvelope
 from kohakuterrarium.core.config_types import (
     AgentConfig,
     InputConfig,
     OutputConfig,
 )
+from kohakuterrarium.core.event_inbox import EventEnvelope
 from kohakuterrarium.core.events import (
     create_tool_complete_event,
     create_user_input_event,
 )
 from kohakuterrarium.core.turn import TurnCapture
+from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
+from kohakuterrarium.testing.output import OutputRecorder
+from kohakuterrarium.builtins.inputs.none import NoneInput
+from kohakuterrarium.modules.subagent.config import SubAgentConfig
+from kohakuterrarium.modules.subagent.result import SubAgentResult
 from kohakuterrarium.modules.tool.base import (
     BaseTool,
     ExecutionMode,
     ToolResult,
 )
-from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
-from kohakuterrarium.testing.output import OutputRecorder
 
 # ── deterministic tool stubs ─────────────────────────────────────
 
@@ -3605,30 +3609,31 @@ class TestMaybeTriggerCompactWithTokens:
 
 
 class TestDispatchSubAgentEventDirect:
-    async def test_full_dispatch_with_handle(self, make_agent):
-        """Drive the sub-agent dispatch helper directly to cover all
-        the registration and back-grounding branches."""
-        from kohakuterrarium.parsing import SubAgentCallEvent
-        from kohakuterrarium.modules.subagent.config import SubAgentConfig
-
+    @pytest.mark.parametrize("notify", [True, False])
+    async def test_full_dispatch_with_handle(self, make_agent, notify):
         agent = make_agent()
+        release, admitted = asyncio.Event(), asyncio.Event()
+        jid = "agent_x_42"
 
-        async def fake_spawn(event):
-            # Return job_id + is_background tuple.
-            jid = "agent_x_42"
-            # Inject a real-ish task that's already done.
-            done = asyncio.Future()
-            done.set_result(None)
-            agent.subagent_manager._tasks[jid] = done
+        async def work():
+            await release.wait()
+            return SubAgentResult(output="scouted")
+
+        async def spawn(event):
+            agent.subagent_manager._tasks[jid] = asyncio.create_task(work())
             return jid, True
 
-        agent.subagent_manager.spawn_from_event = fake_spawn
-        agent.subagent_manager._configs = {
-            "explore": SubAgentConfig(
-                name="explore",
-                notify_controller_on_background_complete=False,
-            )
-        }
+        complete = agent._on_backgroundify_complete
+
+        async def on_complete(job_id, result):
+            await complete(job_id, result)
+            admitted.set()
+
+        agent._on_backgroundify_complete = on_complete
+        agent.subagent_manager.spawn_from_event = spawn
+        agent.subagent_manager._configs["explore"] = SubAgentConfig(
+            name="explore", notify_controller_on_background_complete=notify
+        )
         evt = SubAgentCallEvent(
             name="explore",
             args={"task": "scout area", "_tool_call_id": "call_99"},
@@ -3636,20 +3641,47 @@ class TestDispatchSubAgentEventDirect:
         )
         await agent.start()
         try:
-            handles = {}
-            order = []
-            tcids = {}
             await agent._dispatch_subagent_event(
-                evt, agent.controller, handles, order, tcids, True
+                evt, agent.controller, {}, [], {}, True
             )
-            # ``fake_spawn`` returns ``is_background=True`` — the dispatch
-            # promotes the sub-agent and appends a ``tool``-role
-            # placeholder to the conversation rather than tracking a
-            # direct handle.
-            assert any(
-                m.role == "tool" for m in agent.controller.conversation.get_messages()
+            handle = agent._active_handles[jid]
+            assert handle.promoted
+            placeholder = agent.controller.conversation.get_messages()[-1]
+            assert (placeholder.role, placeholder.tool_call_id, placeholder.name) == (
+                "tool",
+                "call_99",
+                "explore",
             )
+            assert placeholder.metadata == {
+                "job_id": jid,
+                "tool_result_phase": "pending",
+            }
+            with pytest.raises(ConflictError):
+                agent._ensure_rerun_available()
+            release.set()
+            await handle.task
+            assert handle.done
+            assert agent._active_handles[jid] is handle
+            with pytest.raises(ConflictError):
+                agent._ensure_rerun_available()
+            await asyncio.wait_for(admitted.wait(), 2)
+            assert agent._active_handles == {}
+            assert jid not in agent._bg_controller_notify
+            await agent.inject_input("after settlement")
+            user_text = "\n\n".join(
+                m.content
+                for m in agent.controller.conversation.get_messages()
+                if m.role == "user"
+            )
+            assert user_text == (
+                f"[Tool {jid} completed]\nscouted\n\nafter settlement"
+                if notify
+                else "after settlement"
+            )
+            agent._ensure_history_mutation_idle()
+            agent._ensure_rerun_available()
         finally:
+            release.set()
             await agent.stop()
 
     async def test_real_dispatch_start_metadata_uses_resolved_child_provider(

@@ -2,10 +2,19 @@
 
 from typing import Any, Protocol
 
+from kohakuterrarium.core.agent_message_history import (
+    replay_with_settled_tools,
+    snapshot_needs_settled_tool_replay,
+)
+from kohakuterrarium.core.compact_branch import compact_rule_from_event
 from kohakuterrarium.core.conversation import Conversation
+from kohakuterrarium.core.snapshot_history import (
+    prepare_snapshot,
+    replayed_compact_state,
+)
 from kohakuterrarium.llm.message import dicts_to_messages
 from kohakuterrarium.session.history import (
-    compact_path_from_event,
+    compact_covered_event_ids,
     normalize_tool_call_events,
     replay_conversation,
 )
@@ -47,13 +56,7 @@ def reload_raw_prefix_for_target(
     *,
     branch_view: dict[int, int] | None = None,
 ) -> None:
-    """Reseat one agent on the branch prefix ending at target.
-
-    The target branch's compaction baseline is preserved: a compact_replace
-    that covers the target is kept but truncated so it never swallows the
-    edited turn — earlier turns stay summarized, the target is materialized
-    verbatim, and the new branch compacts independently from here on.
-    """
+    """Restore the target prefix using only summaries with unchanged inputs."""
     if agent.session_store is None:
         raise ValueError("raw persisted history is unavailable")
     current_conversation = agent.controller.conversation
@@ -63,42 +66,18 @@ def reload_raw_prefix_for_target(
         selector=target,
         branch_view=branch_view,
     )
-    # A compact_replace that fired AFTER the target in the event stream still
-    # covers it by id range. Keep its summary as the branch's compact baseline
-    # but cap the range just below the target so the edited turn materializes.
-    # Only compacts whose path intersects the target branch's lineage are kept
-    # (a sibling-branch compact covering the same id range must not restore a
-    # foreign baseline; legacy pathless compacts are kept for the v1 migration
-    # fallback). Replay then selects the single deepest matching rule.
-    target_id = prefix.target.get("event_id")
     target_path: set[tuple[int, int]] = {
         (turn, branch)
         for turn, branch in prefix.branch_view.items()
         if turn < prefix.target.get("turn_index")
     }
-    covering_compacts: list[dict[str, Any]] = []
-    if isinstance(target_id, int):
-        for evt in all_events:
-            if evt.get("type") not in ("compact_replace", "compact_complete"):
-                continue
-            frm = evt.get("replaced_from_event_id")
-            to = evt.get("replaced_to_event_id")
-            if not isinstance(frm, int) or not isinstance(to, int):
-                continue
-            evt_path = compact_path_from_event(evt)
-            # Pathless legacy rules apply to the whole range; path-carrying
-            # rules only when they intersect the target branch's lineage.
-            if evt_path is not None and not evt_path & target_path:
-                continue
-            # Keep the branch's compaction baseline whenever it covers
-            # anything BEFORE the target; cap the range below the target so
-            # the edited turn is never swallowed by the summary. A compact
-            # that starts at/after the target has nothing before it to keep.
-            if frm < target_id:
-                capped = dict(evt)
-                if to >= target_id:
-                    capped["replaced_to_event_id"] = target_id - 1
-                covering_compacts.append(capped)
+    reusable_compacts = [
+        evt
+        for evt in all_events
+        if (rule := compact_rule_from_event(evt)) is not None
+        and (inputs := rule.inputs()) is not None
+        and inputs.issubset(target_path)
+    ]
     raw_events = [
         event
         for event in prefix.events
@@ -109,16 +88,35 @@ def reload_raw_prefix_for_target(
             "conversation_snapshot",
         }
     ]
-    raw_events.extend(covering_compacts)
+    raw_events.extend(reusable_compacts)
     raw_events.append(prefix.target)
     # A covering compact can carry an event_id larger than the target's;
     # restore stream order so replay sees a monotonic event stream (its
     # pending-summary flush/drop logic assumes one).
     raw_events.sort(key=lambda evt: evt.get("event_id", 0))
-    messages = replay_conversation(
-        normalize_tool_call_events(raw_events),
-        branch_view=prefix.branch_view,
-        include_metadata=True,
+    prepared = prepare_snapshot(
+        agent.session_store,
+        agent.config.name,
+        all_events,
+        prefix.branch_view,
+        replay=replay_with_settled_tools,
+        needs_replay=snapshot_needs_settled_tool_replay,
+        before_turn=target.turn_index,
+    )
+    messages = (
+        prepared["messages"]
+        + replay_conversation([prefix.target], include_metadata=True)
+        if prepared
+        else replay_conversation(
+            normalize_tool_call_events(
+                raw_events,
+                covered_event_ids=compact_covered_event_ids(
+                    raw_events, prefix.branch_view
+                ),
+            ),
+            branch_view=prefix.branch_view,
+            include_metadata=True,
+        )
     )
     persisted_messages = dicts_to_messages(messages)
     for raw_message, message in zip(messages, persisted_messages):
@@ -138,6 +136,16 @@ def reload_raw_prefix_for_target(
     for message in persisted_messages:
         conversation.append_message(message)
     agent.controller.conversation = conversation
+    agent._context_cutoff_event_id = (
+        prepared.get("context_cutoff_event_id", 0) if prepared is not None else 0
+    )
+    manager = getattr(agent, "compact_manager", None)
+    if manager is not None:
+        state = (
+            prepared["compact_state"] if prepared else replayed_compact_state(messages)
+        )
+        manager._compact_count = state["compact_count"]
+        manager._last_compact_time = state["last_compact_time"]
     agent._turn_index = target.turn_index
     agent._branch_id = target.branch_id
     agent._parent_branch_path = [

@@ -1,12 +1,16 @@
 """Unit tests for :mod:`kohakuterrarium.core.agent_messages`."""
 
 import asyncio
+from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 
 import kohakuterrarium.core.agent_messages as agent_messages_module
 
+from kohakuterrarium.core.agent_message_history import replay_with_settled_tools
 from kohakuterrarium.core.agent_messages import AgentMessagesMixin
+from kohakuterrarium.core.compact_splice import splice_conversation
 from kohakuterrarium.core.conversation import Conversation
 from kohakuterrarium.errors import ConflictError
 from kohakuterrarium.session.history import InvalidBranchViewError
@@ -308,6 +312,70 @@ class TestPreviousBranchUserContent:
 
 
 class TestRegenerateLastResponse:
+    @pytest.mark.parametrize(
+        "operation, source",
+        [
+            ("edit", "covered"),
+            ("turn_rerun", "covered"),
+            ("tail_rerun", "covered"),
+            ("edit", "safe"),
+            ("edit", "unknown"),
+        ],
+    )
+    async def test_summary_mutation_uses_canonical_turn_without_stale_content(
+        self, agent, operation, source
+    ):
+        conv = agent.controller.conversation
+        conv.append("system", "sys")
+        agent._apply_user_input("u1")
+        agent._emit_assistant("a1")
+        agent._apply_user_input("u2")
+        agent._emit_assistant("OLD_STALE_RESPONSE")
+        if source != "unknown":
+            conv.get_messages()[3].metadata.update(turn_index=2, branch_id=1)
+        assert splice_conversation(
+            conv,
+            3 if source == "safe" else 5,
+            "SAFE_PREFIX" if source == "safe" else "OLD_STALE_RESPONSE",
+            1,
+            retain_latest_user=source != "safe",
+            source_path=(
+                {(1, 1)}
+                if source == "safe"
+                else ({(1, 1), (2, 1)} if source == "covered" else None)
+            ),
+        )
+        before = conv.snapshot_messages(), agent.session_store.get_events("alice")
+        agent.compact_manager = SimpleNamespace(is_compacting=True)
+        with pytest.raises(ConflictError):
+            await agent.regenerate_last_response()
+        assert (
+            conv.snapshot_messages(),
+            agent.session_store.get_events("alice"),
+        ) == before
+        agent.compact_manager.is_compacting = False
+        if source == "unknown":
+            with pytest.raises(ConflictError):
+                await agent.edit_and_rerun(2, "changed")
+            assert (
+                conv.snapshot_messages(),
+                agent.session_store.get_events("alice"),
+            ) == before
+            return
+        if operation == "edit":
+            assert await agent.edit_and_rerun(2, "changed")
+        elif operation == "turn_rerun":
+            await agent.regenerate_last_response(turn_index=2)
+        else:
+            await agent.regenerate_last_response()
+        assert "OLD_STALE_RESPONSE" not in str(
+            agent.controller.conversation.to_messages()
+        )
+        assert (agent._turn_index, agent._branch_id) == (2, 2)
+        if source == "safe":
+            assert "SAFE_PREFIX" in str(agent.controller.conversation.to_messages())
+        assert agent.session_store.get_events("alice")[: len(before[1])] == before[1]
+
     async def test_no_user_message_no_op(self, agent):
         await agent.regenerate_last_response()
         # No process_event call.
@@ -603,7 +671,7 @@ class TestReloadConversationUnderBranchView:
         monkeypatch.setattr(
             agent_messages_module,
             "replay_conversation",
-            lambda events, branch_view=None: [
+            lambda events, branch_view=None, **_kwargs: [
                 {"role": "user", "content": "u1"},
                 {
                     "role": "assistant",
@@ -621,13 +689,317 @@ class TestReloadConversationUnderBranchView:
         )
         assert assistant.extra_fields["reasoning_content"] == "private thought"
 
-    async def test_events_read_failure_no_op(self, agent, monkeypatch):
+    async def test_events_read_failure_raises(self, agent, monkeypatch):
         def boom(name):
             raise RuntimeError("disk read")
 
         monkeypatch.setattr(agent.session_store, "get_events", boom)
-        # Just must not raise.
-        agent._reload_conversation_under_branch_view({1: 1})
+        with pytest.raises(RuntimeError, match="disk read"):
+            agent._reload_conversation_under_branch_view({1: 1})
+
+    async def test_duplicate_text_user_identity_and_assistant_survive_reload(
+        self, agent
+    ):
+        agent._apply_user_input("same")
+        agent._emit_assistant("a1")
+        agent._apply_user_input("same")
+        agent._emit_assistant("a2")
+        for event_type, payload in (
+            ("user_input", {"content": "same"}),
+            ("user_message", {"content": "same"}),
+            ("text_chunk", {"content": "sibling", "chunk_seq": 0}),
+            ("processing_end", {}),
+        ):
+            agent.session_store.append_event(
+                "alice", event_type, payload, turn_index=1, branch_id=2
+            )
+        agent._reload_conversation_under_branch_view({1: 1, 2: 1})
+        users = [
+            message
+            for message in agent.controller.conversation.get_messages()
+            if message.role == "user"
+        ]
+        assistants = [
+            message.content
+            for message in agent.controller.conversation.get_messages()
+            if message.role == "assistant"
+        ]
+        assert [message.content for message in users] == ["same", "same"]
+        assert users[0].metadata["event_id"] != users[1].metadata["event_id"]
+        assert (users[0].metadata["turn_index"], users[0].metadata["branch_id"]) == (
+            1,
+            1,
+        )
+        assert (users[1].metadata["turn_index"], users[1].metadata["branch_id"]) == (
+            2,
+            1,
+        )
+        assert assistants == ["a1", "a2"]
+
+
+def _shape(messages):
+    rows = []
+    for message in messages:
+        role = message.get("role")
+        if role == "system":
+            continue
+        if role == "assistant" and message.get("tool_calls"):
+            rows.append(
+                (
+                    "assistant-calls",
+                    [call.get("id") for call in message["tool_calls"]],
+                    message.get("content") or "",
+                )
+            )
+        elif role == "tool":
+            rows.append(
+                ("tool", message.get("tool_call_id"), message.get("content") or "")
+            )
+        else:
+            rows.append((role, message.get("content") or ""))
+    return rows
+
+
+def _evt(event_id, etype, turn, branch, **payload):
+    event = {
+        "event_id": event_id,
+        "type": etype,
+        "turn_index": turn,
+        "branch_id": branch,
+        "parent_branch_path": [(1, 1)] if turn > 1 else [],
+    }
+    event.update(payload)
+    return event
+
+
+class TestSettledToolReplay:
+    def test_keeps_grouped_direct_calls(self):
+        events = [
+            _evt(1, "user_message", 1, 1, content="do two"),
+            _evt(
+                2,
+                "assistant_tool_calls",
+                1,
+                1,
+                tool_calls=[
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "echo", "arguments": '{"text":"a"}'},
+                    },
+                    {
+                        "id": "c2",
+                        "type": "function",
+                        "function": {"name": "echo", "arguments": '{"text":"b"}'},
+                    },
+                ],
+            ),
+            _evt(
+                3, "tool_call", 1, 1, call_id="echo_1", tool_call_id="c1", name="echo"
+            ),
+            _evt(
+                4, "tool_result", 1, 1, call_id="echo_1", tool_call_id="c1", output="A"
+            ),
+            _evt(
+                5, "tool_call", 1, 1, call_id="echo_2", tool_call_id="c2", name="echo"
+            ),
+            _evt(
+                6, "tool_result", 1, 1, call_id="echo_2", tool_call_id="c2", output="B"
+            ),
+            _evt(7, "text_chunk", 1, 1, content="done", chunk_seq=0),
+        ]
+        original = deepcopy(events)
+        messages = Conversation.sanitize_orphan_tool_pairs(
+            replay_with_settled_tools(events, branch_view={1: 1})
+        )
+        assert _shape(messages) == [
+            ("user", "do two"),
+            ("assistant-calls", ["c1", "c2"], ""),
+            ("tool", "c1", "A"),
+            ("tool", "c2", "B"),
+            ("assistant", "done"),
+        ]
+        assert events == original
+        assert messages[1]["tool_calls"] == events[1]["tool_calls"]
+
+    @pytest.mark.parametrize("view", [{1: 1, 2: 1}, {1: 1, 2: 2}])
+    def test_late_ancestor_result_survives_both_turn2_branches(self, view):
+        events = [
+            _evt(1, "user_message", 1, 1, content="start bg"),
+            _evt(
+                2,
+                "assistant_tool_calls",
+                1,
+                1,
+                tool_calls=[
+                    {
+                        "id": "b1",
+                        "type": "function",
+                        "function": {"name": "slowbg", "arguments": "{}"},
+                    }
+                ],
+            ),
+            _evt(
+                3,
+                "tool_call",
+                1,
+                1,
+                call_id="slowbg_1",
+                tool_call_id="b1",
+                name="slowbg",
+            ),
+            _evt(4, "user_message", 2, 1, content="second"),
+            _evt(5, "text_chunk", 2, 1, content="second-turn", chunk_seq=0),
+            _evt(6, "tool_result", 2, 1, call_id="slowbg_1", output="RESULT_reviewbg"),
+            _evt(7, "user_message", 2, 2, content="second"),
+            _evt(8, "text_chunk", 2, 2, content="t2-sibling", chunk_seq=0),
+        ]
+        messages = Conversation.sanitize_orphan_tool_pairs(
+            replay_with_settled_tools(events, branch_view=view)
+        )
+        shape = _shape(messages)
+        assert ("assistant-calls", ["b1"], "") in shape
+        assert ("tool", "b1", "RESULT_reviewbg") in shape
+        assert shape.count(("tool", "b1", "RESULT_reviewbg")) == 1
+        if view[2] == 1:
+            assert ("assistant", "second-turn") in shape
+            assert ("assistant", "t2-sibling") not in shape
+        else:
+            assert ("assistant", "t2-sibling") in shape
+            assert ("assistant", "second-turn") not in shape
+
+    def test_unselected_call_does_not_enter_current_context(self):
+        events = [
+            _evt(1, "user_message", 1, 1, content="one"),
+            _evt(
+                2, "tool_call", 1, 1, call_id="keep_1", tool_call_id="k1", name="echo"
+            ),
+            _evt(
+                3,
+                "tool_result",
+                1,
+                1,
+                call_id="keep_1",
+                tool_call_id="k1",
+                output="keep",
+            ),
+            _evt(4, "user_message", 1, 2, content="two"),
+            _evt(
+                5, "tool_call", 1, 2, call_id="drop_1", tool_call_id="d1", name="echo"
+            ),
+            _evt(
+                6,
+                "tool_result",
+                1,
+                2,
+                call_id="drop_1",
+                tool_call_id="d1",
+                output="drop",
+            ),
+        ]
+        messages = Conversation.sanitize_orphan_tool_pairs(
+            replay_with_settled_tools(events, branch_view={1: 1})
+        )
+        shape = _shape(messages)
+        assert ("tool", "k1", "keep") in shape
+        assert ("tool", "d1", "drop") not in shape
+        assert all("drop_1" not in str(row) for row in shape)
+
+    @pytest.mark.parametrize("compacted", [False, True])
+    def test_reused_provider_id_does_not_cross_pair(self, compacted):
+        events = [
+            _evt(1, "user_message", 1, 1, content="first"),
+            _evt(
+                2,
+                "tool_call",
+                1,
+                1,
+                call_id="job_a",
+                tool_call_id="shared",
+                name="echo",
+            ),
+            _evt(3, "user_message", 2, 1, content="second"),
+            _evt(
+                4,
+                "tool_call",
+                2,
+                1,
+                call_id="job_b",
+                tool_call_id="shared",
+                name="echo",
+            ),
+            _evt(5, "tool_result", 2, 1, call_id="job_a", output="FROM_A"),
+            _evt(6, "tool_result", 2, 1, call_id="job_b", output="FROM_B"),
+        ]
+        if compacted:
+            for event in events[-2:]:
+                event["turn_index"] = 3
+            events += [
+                _evt(7, "user_message", 3, 1, content="retained"),
+                _evt(
+                    8,
+                    "compact_complete",
+                    3,
+                    1,
+                    summary="SUMMARY",
+                    replaced_from_event_id=1,
+                    replaced_to_event_id=4,
+                    compact_path=[[1, 1], [2, 1]],
+                ),
+            ]
+        original = deepcopy(events)
+        messages = Conversation.sanitize_orphan_tool_pairs(
+            replay_with_settled_tools(
+                events, branch_view={1: 1, 2: 1}, resumable=compacted
+            )
+        )
+        assert events == original
+        assert _shape(messages) == (
+            [
+                ("assistant-calls", ["shared"], "SUMMARY"),
+                ("tool", "shared", "FROM_A"),
+                ("assistant-calls", ["shared"], ""),
+                ("tool", "shared", "FROM_B"),
+                ("user", "retained"),
+            ]
+            if compacted
+            else [
+                ("user", "first"),
+                ("assistant-calls", ["shared"], ""),
+                ("tool", "shared", "FROM_A"),
+                ("user", "second"),
+                ("assistant-calls", ["shared"], ""),
+                ("tool", "shared", "FROM_B"),
+            ]
+        )
+        assert [
+            message["tool_calls"][0]["function"]
+            for message in messages
+            if message.get("tool_calls")
+        ] == [
+            {"name": "echo", "arguments": "{}"},
+            {"name": "echo", "arguments": "{}"},
+        ]
+
+    @pytest.mark.parametrize(
+        ("output", "expected"),
+        [("", ""), ("RESULT", "RESULT"), (None, "")],
+    )
+    def test_empty_and_real_outputs_stay_paired(self, output, expected):
+        payload = {"call_id": "job_1", "tool_call_id": "b1"}
+        if output is not None:
+            payload["output"] = output
+        events = [
+            _evt(1, "user_message", 1, 1, content="go"),
+            _evt(2, "tool_call", 1, 1, call_id="job_1", tool_call_id="b1", name="echo"),
+            _evt(3, "user_message", 2, 1, content="later"),
+            _evt(4, "tool_result", 2, 1, **payload),
+        ]
+        messages = Conversation.sanitize_orphan_tool_pairs(
+            replay_with_settled_tools(events, branch_view={1: 1, 2: 1})
+        )
+        assert ("assistant-calls", ["b1"], "") in _shape(messages)
+        assert ("tool", "b1", expected) in _shape(messages)
 
 
 class TestEdgeBranches:
@@ -1041,7 +1413,7 @@ class TestReloadConvBranchViewExtraMetadata:
         # Mock replay_conversation to return messages with extras.
         from kohakuterrarium.core import agent_messages as am
 
-        def fake_replay(events, branch_view=None):
+        def fake_replay(events, branch_view=None, **_kwargs):
             return [
                 {"role": "system", "content": "sys-from-replay"},  # 514-515
                 {"role": "user", "content": "hi"},

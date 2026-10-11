@@ -4,9 +4,13 @@ import asyncio
 import types
 from typing import Any
 
+import pytest
+
 
 from kohakuterrarium.core.compact_branch import (
     compute_replaced_range,
+    persist_compacted_async,
+    summary_source_path,
     current_path,
 )
 from kohakuterrarium.core.compact import (
@@ -25,6 +29,7 @@ from kohakuterrarium.core.compact_splice import (
 from kohakuterrarium.core.compact_text import format_messages_for_summary
 from kohakuterrarium.core.conversation import Conversation
 from kohakuterrarium.llm.message import create_message
+from kohakuterrarium.session.store import SessionStore
 
 # ── stubs ────────────────────────────────────────────────────────
 
@@ -360,7 +365,35 @@ class TestCountKeepMessages:
         for _ in range(100):
             conv.append("assistant", "x" * 350)
 
-        mgr = _build_mgr(conversation=conv, llm=_LLM(chunks=["S"]))
+        store, router = _Store(), _Router()
+        for turn, msg in enumerate(
+            (m for m in conv.get_messages() if m.role == "user"), 1
+        ):
+            msg.metadata.update(turn_index=turn, branch_id=1)
+            store.events.append(
+                {
+                    "event_id": 2 * turn - 1,
+                    "type": "user_message",
+                    "turn_index": turn,
+                    "branch_id": 1,
+                }
+            )
+            store.events.append(
+                {
+                    "event_id": 2 * turn,
+                    "type": "text_chunk",
+                    "turn_index": turn,
+                    "branch_id": 1,
+                }
+            )
+        mgr = _build_mgr(
+            conversation=conv, llm=_LLM(chunks=["S"]), store=store, router=router
+        )
+        mgr._agent = types.SimpleNamespace(
+            _turn_index=8,
+            _branch_id=1,
+            _parent_branch_path=[(t, 1) for t in range(1, 8)],
+        )
         mgr.config = CompactConfig(max_tokens=10_000, target=0.5)
         mgr._controller._last_usage = {"prompt_tokens": 9_000}
         await mgr._run_compact()
@@ -368,6 +401,100 @@ class TestCountKeepMessages:
         assert mgr._compact_count == 1
         user_text = [msg.content for msg in conv.get_messages() if msg.role == "user"]
         assert "goal-7" in user_text
+        metadata = next(
+            data for kind, _, data in router.calls if kind == "compact_complete"
+        )
+        assert metadata["compact_source_path"] == [[t, 1] for t in range(1, 9)]
+        assert metadata["replaced_to_event_id"] == 14
+        assert "goal-7" in mgr._llm.calls[0][0][-1]["content"]
+
+    async def test_growth_during_compact_cannot_expand_coverage(self):
+        conv, store, router = _build_conversation(n_user=5), _Store(), _Router()
+        for turn, msg in enumerate(
+            (m for m in conv.get_messages() if m.role == "user"), 1
+        ):
+            msg.metadata.update(turn_index=turn, branch_id=1)
+            for offset, kind in enumerate(("user_message", "text_chunk")):
+                store.events.append(
+                    {
+                        "event_id": 2 * turn - 1 + offset,
+                        "type": kind,
+                        "turn_index": turn,
+                        "branch_id": 1,
+                    }
+                )
+        mgr = _build_mgr(
+            conversation=conv,
+            llm=_LLM(),
+            store=store,
+            router=router,
+            plugins=_Plugins(),
+        )
+        mgr.config.keep_recent_turns = 2
+        mgr._agent = types.SimpleNamespace(
+            _turn_index=5,
+            _branch_id=1,
+            _parent_branch_path=[(t, 1) for t in range(1, 5)],
+        )
+
+        async def grow(hook, **kwargs):
+            conv.append("user", "later", metadata={"turn_index": 6, "branch_id": 1})
+            conv.append("assistant", "later reply")
+            store.events.append(
+                {
+                    "event_id": 11,
+                    "type": "user_message",
+                    "turn_index": 6,
+                    "branch_id": 1,
+                }
+            )
+            mgr._agent._parent_branch_path.append((5, 1))
+            mgr._agent._turn_index = 6
+            return True
+
+        mgr._plugins.should_proceed = grow
+        await mgr._run_compact()
+        metadata = next(
+            data for kind, _, data in router.calls if kind == "compact_complete"
+        )
+        assert metadata["replaced_to_event_id"] == 6
+        assert metadata["compact_source_path"] == [[1, 1], [2, 1], [3, 1]]
+        assert [m.content for m in conv.get_messages() if m.role == "user"] == [
+            "u3",
+            "u4",
+            "later",
+        ]
+        assert "later" not in mgr._llm.calls[0][0][-1]["content"]
+
+    @pytest.mark.parametrize("unknown", [False, True])
+    def test_summary_inherits_only_proven_inputs(self, unknown):
+        inherited = create_message(
+            "assistant",
+            "[Previous context summary (compact round 1)]\n\nold",
+            metadata=(
+                {}
+                if unknown
+                else {"compact_summary": True, "compact_source_path": [[1, 2]]}
+            ),
+        )
+        messages = [
+            inherited,
+            create_message(
+                "user",
+                "feedback",
+                metadata={
+                    "turn_index": 3,
+                    "branch_id": 1,
+                    "kind": "tool_results",
+                    "job_ids": ["bg"],
+                },
+            ),
+        ]
+        assert summary_source_path(messages, origins={"bg": (2, 2)}) == (
+            None if unknown else {(1, 2), (2, 2), (3, 1)}
+        )
+        messages.append(create_message("user", "legacy input"))
+        assert summary_source_path(messages, origins={"bg": (2, 2)}) is None
 
 
 # ── format_messages_for_summary ─────────────────────────────────
@@ -1253,6 +1380,70 @@ class TestCurrentPathResilience:
 
 
 class TestTagSnapshotBranch:
+    async def test_compact_checkpoint_captures_messages_path_and_watermark_before_store_wait(
+        self, tmp_path, monkeypatch
+    ):
+        store = SessionStore(tmp_path / "frozen.kohakutr")
+        entered, release = asyncio.Event(), asyncio.Event()
+        original_run = store.run
+
+        async def gated_run(fn, *args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await original_run(fn, *args, **kwargs)
+
+        monkeypatch.setattr(store, "run", gated_run)
+        conv = _build_conversation(n_user=1)
+        conv.get_messages()[1].metadata.update(turn_index=1, branch_id=1)
+        agent = types.SimpleNamespace(
+            _turn_index=1, _branch_id=1, _parent_branch_path=[]
+        )
+        store.append_event(
+            "alice", "user_message", {"content": "u0"}, turn_index=1, branch_id=1
+        )
+        watermark = store.max_event_id("alice")
+        task = asyncio.create_task(
+            persist_compacted_async(store, "alice", agent, conv, 2, 10.0)
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            agent._parent_branch_path.append((1, 1))
+            agent._turn_index = 2
+            conv.append("user", "later", metadata={"turn_index": 2, "branch_id": 1})
+            store.append_event(
+                "alice",
+                "user_message",
+                {"content": "later"},
+                turn_index=2,
+                branch_id=1,
+                parent_branch_path=[(1, 1)],
+            )
+            extra_reads = []
+
+            def unexpected_scan(*args, **kwargs):
+                extra_reads.append(args)
+                raise AssertionError(
+                    "Checkpoint counters must not rescan the event log"
+                )
+
+            monkeypatch.setattr(store, "get_events", unexpected_scan)
+            release.set()
+            await task
+            assert extra_reads == []
+            record = store.load_branch_snapshot("alice", {1: 1})
+            assert record["path"] == [[1, 1]] and record["watermark"] == watermark
+            assert [
+                m["content"] for m in record["messages"] if m["role"] == "user"
+            ] == ["u0"]
+            assert record["compact_state"] == {
+                "compact_count": 2,
+                "last_compact_time": 10.0,
+            }
+        finally:
+            release.set()
+            await task
+            store.close()
+
     def _store_and_agent(self, turn=3, branch=2, path=None):
         from types import SimpleNamespace
 

@@ -26,6 +26,7 @@ from kohakuterrarium.session.rollup import (
     list_turn_rollups,
     save_turn_rollup,
 )
+from kohakuterrarium.session.snapshot import load_branch_snapshot, save_branch_snapshot
 from kohakuterrarium.session.store_affinity import StoreAffinityMixin
 from kohakuterrarium.session.store_counters import (
     persist_event_counter,
@@ -450,7 +451,33 @@ class SessionStore(StoreAffinityMixin):
         Accepts either a list of message dicts (preferred, stored via msgpack)
         or a JSON string (legacy, stored as-is).
         """
+        self.state[f"{agent}:branch_snapshots"] = []
         self.conversation[agent] = messages
+
+    def save_branch_snapshot(
+        self,
+        agent: str,
+        messages: list[dict],
+        *,
+        branch: dict | None,
+        watermark: int,
+        compact_state: dict | None = None,
+    ) -> None:
+        """Save a branch-local checkpoint alongside the latest conversation."""
+        save_branch_snapshot(
+            self,
+            agent,
+            messages,
+            branch=branch,
+            watermark=watermark,
+            compact_state=compact_state,
+        )
+
+    def load_branch_snapshot(
+        self, agent: str, branch_view: dict[int, int]
+    ) -> dict | None:
+        """Load a detached checkpoint on a resolved historical lineage."""
+        return load_branch_snapshot(self, agent, branch_view)
 
     def load_conversation(self, agent: str) -> list[dict] | None:
         """Load the latest conversation snapshot for an agent.

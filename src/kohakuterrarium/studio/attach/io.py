@@ -11,6 +11,10 @@ from typing import Any
 
 from fastapi import WebSocket
 
+from kohakuterrarium.core.branch_continuation import (
+    encode_branch_view,
+    selected_branch_view,
+)
 from kohakuterrarium.core.pending_input import new_pending_id
 from kohakuterrarium.laboratory.ws_proxy import proxy_ws_to_lab
 from kohakuterrarium.modules.output.event import UIReply
@@ -69,6 +73,7 @@ def _session_info_frame(creature: Any) -> dict[str, Any]:
         "max_context": max_context,
         "compact_threshold": compact_at,
         "model_recovery": model_recovery_snapshot(agent),
+        "branch_view": encode_branch_view(selected_branch_view(agent)),
         "ts": time.time(),
     }
 
@@ -417,7 +422,12 @@ async def attach_io(
             # Do not block delivery of replies that the injected turn may await.
             task = asyncio.create_task(
                 _process_input(
-                    target_agent, content, queue, target_creature.name, pending_id
+                    target_agent,
+                    content,
+                    queue,
+                    target_creature.name,
+                    pending_id,
+                    branch_view=data.get("branch_view"),
                 )
             )
             input_tasks.append(task)

@@ -6,8 +6,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from kohakuterrarium.core.agent_event_loop import AgentEventLoopMixin
 from kohakuterrarium.core.agent_tools import AgentToolsMixin, _TurnResult
-from kohakuterrarium.core.backgroundify import BackgroundifyHandle, PromotionResult
+from kohakuterrarium.core.backgroundify import BackgroundifyHandle
 from kohakuterrarium.core.conversation import Conversation
 from kohakuterrarium.core.event_inbox import EventInbox
 from kohakuterrarium.core.job import JobResult
@@ -54,7 +55,7 @@ class _FakeExecutor:
         return self._results.get(jid)
 
 
-class _FakeAgent(AgentToolsMixin):
+class _FakeAgent(AgentToolsMixin, AgentEventLoopMixin):
     def __init__(self):
         self.output_router = _Router()
         self.subagent_manager = _SubAgentManager()
@@ -66,10 +67,6 @@ class _FakeAgent(AgentToolsMixin):
         self._bg_controller_notify = {}
         self._termination_checker = None
         self._running = True
-        self._processed: list = []
-
-    async def _process_event(self, evt):
-        self._processed.append(evt)
 
 
 @pytest.fixture
@@ -494,24 +491,50 @@ class TestWaitHandles:
         )
         assert "x" in results
 
-    async def test_promotion_recorded(self, agent):
+    @pytest.mark.parametrize("notify", [True, False])
+    async def test_promotion_recorded(self, agent, notify):
+        release, admitted = asyncio.Event(), asyncio.Event()
+
         async def coro():
-            return PromotionResult(job_id="x")
+            await release.wait()
+            return JobResult(job_id="x", output="finished")
+
+        async def complete(job_id, result):
+            await agent._on_backgroundify_complete(job_id, result)
+            admitted.set()
 
         task = asyncio.create_task(coro())
-        handle = BackgroundifyHandle(job_id="x", task=task)
-        await asyncio.sleep(0.01)
+        handle = BackgroundifyHandle(task, "x", on_bg_complete=complete)
+        agent._active_handles["x"] = handle
+        agent._bg_controller_notify["x"] = notify
         agent._register_direct_job("x", kind="tool", name="t")
-        results, promotions = await agent._wait_handles(
-            {"x": handle},
-            ["x"],
-            agent.controller,
-            {"x": "call_1"},
-            True,
-        )
-        assert promotions is True
-        # Result not in results dict (promoted goes to placeholder).
-        assert "x" not in results
+        assert handle.promote()
+        try:
+            results, promotions = await agent._wait_handles(
+                {"x": handle}, ["x"], agent.controller, {"x": "call_1"}, True
+            )
+            assert promotions is True
+            assert results == {}
+            assert agent._active_handles == {"x": handle}
+            assert agent._direct_job_meta == {}
+            assert agent._bg_controller_notify == {"x": notify}
+            placeholder = agent.controller.conversation.get_messages()[-1]
+            assert placeholder.tool_call_id == "call_1"
+            assert placeholder.metadata == {
+                "job_id": "x",
+                "tool_result_phase": "pending",
+            }
+            release.set()
+            await asyncio.wait_for(admitted.wait(), 2)
+            queued = agent._event_inbox.drain_all()
+            assert [(env.event.job_id, env.event.content) for env in queued] == (
+                [("x", "finished")] if notify else []
+            )
+            assert agent._active_handles == {}
+            assert agent._bg_controller_notify == {}
+        finally:
+            release.set()
+            await task
 
 
 # ── _on_backgroundify_complete ───────────────────────────────────
@@ -521,20 +544,16 @@ class TestOnBackgroundifyComplete:
     async def test_jobresult(self, agent):
         result = JobResult(job_id="x", output="ok", exit_code=0)
         await agent._on_backgroundify_complete("x", result)
-        await asyncio.sleep(0.01)
-        # Routed through _on_bg_complete → _process_event (notify is on
-        # by default) → a tool-complete event lands in the queue.
-        assert len(agent._processed) == 1
-        assert agent._processed[0].job_id == "x"
-        assert agent._processed[0].content == "ok"
+        assert len(agent._event_inbox) == 1
+        evt = agent._event_inbox.drain_all()[0].event
+        assert evt.job_id == "x"
+        assert evt.content == "ok"
 
     async def test_exception(self, agent):
         await agent._on_backgroundify_complete("x", RuntimeError("boom"))
-        await asyncio.sleep(0.01)
-        # A raw exception result still surfaces a tool-complete event
-        # carrying the error string in context.
-        assert len(agent._processed) == 1
-        assert "boom" in agent._processed[0].context.get("error", "")
+        assert len(agent._event_inbox) == 1
+        evt = agent._event_inbox.drain_all()[0].event
+        assert evt.context["error"] == "boom"
 
     async def test_cancelled_exception(self, agent):
         # Regression test for B-at-1 (fixed): asyncio.CancelledError is a
@@ -542,9 +561,8 @@ class TestOnBackgroundifyComplete:
         # checks for it explicitly before the generic exception arm, so a
         # cancelled background task is reported as an interrupt.
         await agent._on_backgroundify_complete("x", asyncio.CancelledError())
-        await asyncio.sleep(0.01)
-        assert len(agent._processed) == 1
-        evt = agent._processed[0]
+        assert len(agent._event_inbox) == 1
+        evt = agent._event_inbox.drain_all()[0].event
         assert evt.context.get("interrupted") is True
         assert evt.context.get("final_state") == "interrupted"
         assert evt.context.get("error") == "User manually interrupted this job."
@@ -554,9 +572,8 @@ class TestOnBackgroundifyComplete:
         # NOT a CancelledError) is reported as a plain error — NOT marked
         # interrupted. This pins the boundary the B-at-1 fix introduced.
         await agent._on_backgroundify_complete("y", RuntimeError("boom"))
-        await asyncio.sleep(0.01)
-        assert len(agent._processed) == 1
-        evt = agent._processed[0]
+        assert len(agent._event_inbox) == 1
+        evt = agent._event_inbox.drain_all()[0].event
         assert "boom" in evt.context.get("error", "")
         assert evt.context.get("interrupted") is not True
 
@@ -575,11 +592,8 @@ class TestOnBackgroundifyComplete:
         result.cancelled = False
         result.metadata = {"tools_used": ["bash"]}
         await agent._on_backgroundify_complete("agent_x", result)
-        await asyncio.sleep(0.01)
-        # Sub-agent completion surfaces an event with the run metadata
-        # threaded into context.
-        assert len(agent._processed) == 1
-        sa = agent._processed[0].context["subagent_metadata"]
+        assert len(agent._event_inbox) == 1
+        sa = agent._event_inbox.drain_all()[0].event.context["subagent_metadata"]
         assert sa["turns"] == 3
         assert sa["tools_used"] == ["bash"]
 
@@ -749,13 +763,6 @@ class TestFinalizeInterruptedDirectJob:
 
 class TestOnBackgroundifyCompleteEdges:
     async def test_subagent_metadata_attached_to_event(self, agent):
-        captured = []
-
-        async def proc(evt):
-            captured.append(evt)
-
-        agent._process_event = proc
-
         result = MagicMock()
         result.output = "ok"
         result.error = None
@@ -770,8 +777,8 @@ class TestOnBackgroundifyCompleteEdges:
         result.cancelled = False
         result.metadata = {"tools_used": ["read"]}
         await agent._on_backgroundify_complete("agent_x", result)
-        await asyncio.sleep(0.01)
-        assert captured
+        captured = [env.event for env in agent._event_inbox.drain_all()]
+        assert len(captured) == 1
         evt = captured[0]
         assert "subagent_metadata" in evt.context
         sa = evt.context["subagent_metadata"]
@@ -779,35 +786,20 @@ class TestOnBackgroundifyCompleteEdges:
         assert sa["tools_used"] == ["read"]
 
     async def test_jobresult_interrupted_flag(self, agent):
-        captured = []
-
-        async def proc(evt):
-            captured.append(evt)
-
-        agent._process_event = proc
-
         result = JobResult(job_id="x", output="", error="boom")
         object.__setattr__(result, "interrupted", True)
         await agent._on_backgroundify_complete("x", result)
-        await asyncio.sleep(0.01)
-        # Event built with interrupted in context.
-        assert captured
+        captured = [env.event for env in agent._event_inbox.drain_all()]
+        assert len(captured) == 1
         assert captured[0].context.get("interrupted") is True
         assert captured[0].context.get("final_state") == "interrupted"
 
     async def test_jobresult_cancelled_flag(self, agent):
-        captured = []
-
-        async def proc(evt):
-            captured.append(evt)
-
-        agent._process_event = proc
-
         result = JobResult(job_id="x", output="ok")
         object.__setattr__(result, "cancelled", True)
         await agent._on_backgroundify_complete("x", result)
-        await asyncio.sleep(0.01)
-        assert captured
+        captured = [env.event for env in agent._event_inbox.drain_all()]
+        assert len(captured) == 1
         assert captured[0].context.get("cancelled") is True
 
     async def test_truthy_non_object_result(self, agent):
@@ -1065,13 +1057,6 @@ class TestOnBackgroundifyCompleteEventContextInit:
     async def test_event_context_initialized_when_none(self, agent):
         """A result with sub-agent metadata but event.context=None triggers
         the ``event.context = {}`` initialization (line 323)."""
-        captured = []
-
-        async def proc(evt):
-            captured.append(evt)
-
-        agent._process_event = proc
-
         # Build a SubAgent-like result with turns.
         from unittest.mock import MagicMock
 
@@ -1110,8 +1095,8 @@ class TestOnBackgroundifyCompleteEventContextInit:
             await asyncio.sleep(0.01)
         finally:
             at.create_tool_complete_event = original
-        # Event was emitted with subagent metadata in context.
-        assert captured
+        captured = [env.event for env in agent._event_inbox.drain_all()]
+        assert len(captured) == 1
         assert "subagent_metadata" in captured[0].context
 
 

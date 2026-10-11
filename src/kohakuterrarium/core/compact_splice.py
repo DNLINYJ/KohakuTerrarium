@@ -1,4 +1,4 @@
-"""Conversation splice for compaction.
+"""Atomic conversation splicing and boundary selection.
 
 Split out of :mod:`compact` to keep that module under the file-size
 guard.
@@ -48,6 +48,8 @@ def splice_conversation(
     expected_last: Any = None,
     expected_fingerprint: tuple | None = None,
     retain_latest_user: bool = False,
+    source_path: set[tuple[int, int]] | None = None,
+    result_event_ids: set[int] | None = None,
 ) -> bool:
     """Atomic splice: replace compact zone with summary message.
 
@@ -95,6 +97,15 @@ def splice_conversation(
         "assistant",
         f"[Previous context summary (compact round {compact_round})]\n\n{summary}",
     )
+    # The marker tells a later compaction that this text stands for
+    # history, and the recorded inputs are the only proof of what it was
+    # written from. ``None`` stays explicit: an unproven summary is not
+    # silently reinterpreted as provenance-free legacy data.
+    summary_msg.metadata["compact_summary"] = True
+    summary_msg.metadata["compact_source_path"] = (
+        sorted([t, b] for t, b in source_path) if source_path else None
+    )
+    summary_msg.metadata["compact_result_event_ids"] = sorted(result_event_ids or ())
     conversation._messages.append(summary_msg)
     if retained_user is not None:
         conversation._messages.append(retained_user)
