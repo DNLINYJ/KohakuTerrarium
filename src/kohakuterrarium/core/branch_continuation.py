@@ -176,6 +176,13 @@ async def continue_on_branch(agent: Any, event: Any, view: dict[int, int]) -> bo
         return await agent._process_event(event)
     if getattr(agent, "_running", True) is False or _history_mutation_in_flight(agent):
         _require_history_switch_available(agent)
+    if (
+        current
+        and view == current
+        and load_persisted_branch_view(store, namespace) == current
+    ):
+        persist_branch_view(store, namespace, current)
+        return await agent._process_event(event)
     events = list(store.get_events(agent.config.name))
     try:
         resolved = resolve_branch_view_strict(events, view)

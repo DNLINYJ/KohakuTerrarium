@@ -10,6 +10,7 @@ from kohakuterrarium.core.branch_continuation import (
     continue_on_branch,
     live_branch_path,
     load_persisted_branch_view,
+    persist_branch_view,
     selected_branch_view,
 )
 from kohakuterrarium.core.config_types import AgentConfig
@@ -215,21 +216,47 @@ async def test_stopped_rejection_is_readonly(tmp_path):
         await engine.__aexit__(None, None, None)
 
 
-async def test_same_branch_paused_input_runs_after_resume(tmp_path):
+@pytest.mark.parametrize("selection", ["confirmed", "missing", "stale", "partial"])
+async def test_same_branch_paused_input_runs_after_resume(
+    tmp_path, monkeypatch, selection
+):
     engine, creature, agent, provider = await _started(tmp_path, ["A1", "A2", "queued"])
     try:
         await creature.run("U1", timeout=8)
         await creature.run("U2", timeout=8)
+        current = live_branch_path(agent)
+        persist_branch_view(agent.session_store, "alice", current)
+        if selection == "missing":
+            persist_branch_view(agent.session_store, "alice", None)
+        elif selection == "stale":
+            persist_branch_view(agent.session_store, "alice", {1: 1})
+        requested = {1: 1} if selection == "partial" else current
+        reads = []
+        original = agent.session_store.get_events
+
+        def observed_read(*args, **kwargs):
+            reads.append(args)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(agent.session_store, "get_events", observed_read)
         agent.pause()
-        queued = await agent.inject_input("queued-same", branch_view={1: 1, 2: 1})
+        queued = await agent.inject_input("queued-same", branch_view=requested)
         assert queued is False
         assert provider.call_count == 2
+        assert bool(reads) is (selection != "confirmed")
+        assert load_persisted_branch_view(agent.session_store, "alice") == current
         agent.resume()
         for _ in range(80):
             if provider.call_count > 2:
                 break
             await asyncio.sleep(0.02)
-        assert provider.last_user_message == "queued-same"
+        assert _non_system_prefix(provider.call_log[-1]) == [
+            ("user", "U1"),
+            ("assistant", "A1"),
+            ("user", "U2"),
+            ("assistant", "A2"),
+            ("user", "queued-same"),
+        ]
         assert ("assistant", "queued") in _non_system(agent)
     finally:
         await engine.__aexit__(None, None, None)
