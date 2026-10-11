@@ -11,6 +11,7 @@ from typing import Any
 from kohakuvault import KVault, TextVault
 
 from kohakuterrarium.session.artifacts import artifacts_dir_for, write_artifact_bytes
+from kohakuterrarium.session.branch_index import BranchIndex, BranchIndexMixin
 from kohakuterrarium.session.event_key_index import EventKeyIndex
 from kohakuterrarium.session.history import (
     dedupe_adjacent_duplicate_events,
@@ -80,7 +81,7 @@ def _key_text(key: Any) -> str:
     return key.decode("utf-8", errors="replace") if isinstance(key, bytes) else key
 
 
-class SessionStore(StoreAffinityMixin):
+class SessionStore(StoreAffinityMixin, BranchIndexMixin):
     """Persistent session storage backed by KohakuVault.
 
     One ``.kohakutr`` file contains metadata, per-agent state, append-only
@@ -126,6 +127,7 @@ class SessionStore(StoreAffinityMixin):
 
         # Per-namespace sequences coexist with one session-wide event identifier.
         self._event_keys = EventKeyIndex()
+        self._branch_maxima = BranchIndex()
         self._event_seq: dict[str, int] = {}
         self._channel_seq: dict[str, int] = {}
         self._subagent_runs: dict[str, int] = {}
@@ -211,6 +213,7 @@ class SessionStore(StoreAffinityMixin):
     def _restore_counters(self) -> None:
         """Restore sequence counters; persisted counters skip the value scan."""
         self._event_keys.clear()
+        self._branch_maxima.clear()
         self._global_event_id = restore_event_counters(
             self.events, self._event_seq, state=self.state
         )
@@ -283,6 +286,7 @@ class SessionStore(StoreAffinityMixin):
             data["ts"] = time.time()
         self.events[key] = data
         self._event_keys.record(key, event_id)
+        self._branch_maxima.record(agent, data)
 
         text = data.get("content") or data.get("output") or data.get("text") or ""
         if isinstance(text, str) and len(text) > 10:

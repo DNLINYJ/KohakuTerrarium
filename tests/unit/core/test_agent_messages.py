@@ -151,16 +151,68 @@ class TestMaxBranchIdForTurn:
         )
         assert agent._max_branch_id_for_turn(1) == 2
 
+    def test_legacy_store_uses_raw_events(self, agent, monkeypatch):
+        agent._apply_user_input("first")
+        agent._emit_assistant("a1")
+        monkeypatch.setattr(agent.session_store, "max_branch_id", None)
+        assert agent._max_branch_id_for_turn(1) == 1
+        assert agent._max_branch_id_for_turn(2) == 0
+
+    def test_unrelated_unreadable_row_keeps_collision_free_allocation(
+        self, agent, monkeypatch
+    ):
+        store = agent.session_store
+        for branch in (1, 7):
+            store.append_event(
+                "alice",
+                "user_message",
+                {"content": "existing"},
+                turn_index=1,
+                branch_id=branch,
+            )
+        bad_key, _ = store.append_event("alice", "text", {}, turn_index=99, branch_id=1)
+        table = store.events
+
+        class UnreadableRow:
+            def __getattr__(self, name):
+                return getattr(table, name)
+
+            def __getitem__(self, key):
+                decoded = key.decode() if isinstance(key, bytes) else key
+                if decoded == bad_key:
+                    raise OSError("unrelated row is unreadable")
+                return table[key]
+
+            def __setitem__(self, key, value):
+                table[key] = value
+
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "events", UnreadableRow())
+            assert agent._max_branch_id_for_turn(1) == 7
+            agent._apply_user_input("new continuation")
+        event = next(
+            event
+            for event in store.get_events("alice")
+            if event.get("content") == "new continuation"
+        )
+        assert event["turn_index"] == 1
+        assert event["branch_id"] == 8
+        assert agent._branch_id == 8
+
     def test_no_store_returns_zero(self, agent):
         agent.session_store = None
         assert agent._max_branch_id_for_turn(1) == 0
 
-    def test_get_events_failure_swallowed(self, agent, monkeypatch):
-        def boom(name):
+    @pytest.mark.parametrize("native", [True, False])
+    def test_get_events_failure_swallowed(self, agent, monkeypatch, native):
+        def boom(*args):
             raise RuntimeError("read failed")
 
-        monkeypatch.setattr(agent.session_store, "get_events", boom)
-        # Returns 0 on read error.
+        if native:
+            monkeypatch.setattr(agent.session_store, "max_branch_id", boom)
+        else:
+            monkeypatch.setattr(agent.session_store, "max_branch_id", None)
+            monkeypatch.setattr(agent.session_store, "get_events", boom)
         assert agent._max_branch_id_for_turn(1) == 0
 
 

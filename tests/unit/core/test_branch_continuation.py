@@ -245,6 +245,7 @@ async def test_same_branch_paused_input_runs_after_resume(
         assert provider.call_count == 2
         assert bool(reads) is (selection != "confirmed")
         assert load_persisted_branch_view(agent.session_store, "alice") == current
+        reads.clear()
         agent.resume()
         for _ in range(80):
             if provider.call_count > 2:
@@ -258,6 +259,7 @@ async def test_same_branch_paused_input_runs_after_resume(
             ("user", "queued-same"),
         ]
         assert ("assistant", "queued") in _non_system(agent)
+        assert reads == []
     finally:
         await engine.__aexit__(None, None, None)
 

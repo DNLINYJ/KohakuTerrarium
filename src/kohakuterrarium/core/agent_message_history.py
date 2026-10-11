@@ -153,6 +153,16 @@ def max_branch_id_for_turn(agent: Any, turn_index: int) -> int:
     """Return the largest persisted branch id for one turn."""
     if agent.session_store is None:
         return 0
+    maximum = getattr(agent.session_store, "max_branch_id", None)
+    if callable(maximum):
+        try:
+            return maximum(agent.config.name, turn_index)
+        except Exception as exc:
+            logger.warning(
+                "Branch index unavailable; reading raw events",
+                error=str(exc),
+                exc_info=True,
+            )
     try:
         events = agent.session_store.get_events(agent.config.name)
     except Exception as exc:

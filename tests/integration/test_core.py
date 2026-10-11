@@ -1754,7 +1754,21 @@ class TestCoreIntegration:
             # Live path is the latest subtree. inject_input must reseat
             # onto the original branch without a prior private reload.
             assert live_branch_path(agent).get(1) != 1
+            previous_branches = {
+                event["branch_id"]
+                for event in store.get_events(agent.config.name)
+                if event.get("turn_index") == 2
+            }
             await agent.inject_input("continue original", branch_view={1: 1})
+            continuation = next(
+                event
+                for event in store.get_events(agent.config.name)
+                if event["type"] == "user_message"
+                and event.get("content") == "continue original"
+            )
+            assert continuation["turn_index"] == 2
+            assert continuation["branch_id"] == max(previous_branches) + 1
+            assert continuation["parent_branch_path"] == [[1, 1]]
             continued = [
                 (message.get("role"), message.get("content"))
                 for message in agent.llm.call_log[-1]
