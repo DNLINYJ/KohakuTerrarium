@@ -101,6 +101,7 @@ def _build_service():
     engine.remove_creature = AsyncMock()
     engine.start = AsyncMock()
     engine.stop = AsyncMock()
+    engine.wake = AsyncMock(return_value=False)
     engine.shutdown = AsyncMock()
     engine.add_channel = AsyncMock()
     engine.remove_channel = AsyncMock()
@@ -201,12 +202,17 @@ class TestInteraction:
     async def test_inject_input(self):
         svc, c = _build_service()
         await svc.inject_input("cid", "hello", source="api")
+        svc._engine.wake.assert_awaited_once_with(c)
         c.inject_input.assert_awaited_with("hello", source="api")
 
-    def test_chat_delegates(self):
+    async def test_chat_delegates(self):
         svc, c = _build_service()
         stream = svc.chat("cid", "hi")
-        assert stream is c.chat.return_value
+        svc._engine.wake.assert_not_awaited()
+        chunks = [chunk async for chunk in stream]
+        svc._engine.wake.assert_awaited_once_with(c)
+        c.chat.assert_called_once_with("hi")
+        assert chunks == ["x"]
 
 
 # ── per-creature control (jobs / interrupt) ───────────────────

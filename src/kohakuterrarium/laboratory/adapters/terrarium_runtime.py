@@ -487,6 +487,7 @@ class TerrariumRuntimeAdapter:
                 # Validate routing before injection to prevent retries duplicating input.
                 cid = msg.body["creature_id"]
                 creature = self._require_hosted(cid)
+                await self._engine.wake(creature)
                 await creature.inject_input(
                     unpack_content(msg.body["message"]),
                     source=msg.body.get("source", "chat"),

@@ -108,6 +108,7 @@ class TerrariumEventsAdapter:
     ) -> None:
         try:
             creature = self._engine.get_creature(creature_id)
+            await self._engine.wake(creature)
             async for token in creature.chat(message):
                 await self._send_frame(
                     consumer, {"stream_id": stream_id, "token": token}

@@ -1628,7 +1628,14 @@ class TestTerrariumIntegration:
         await asyncio.sleep(0.1)
         assert len((await service.chat_history("writer"))["messages"]) == writer_pre
         assert await service.unwire_output("scout", stopped_wire["edge_id"]) is True
-        await service.start_creature("writer")
+        # A user message to the stopped (not removed) writer starts it again
+        # and is answered; the wired delivery above never woke it.
+        woken = [chunk async for chunk in service.chat("writer", "are you there")]
+        assert "".join(woken) == "ack"
+        assert engine.get_creature("writer").status == "idle"
+        writer_log = (await service.chat_history("writer"))["messages"]
+        assert len(writer_log) == writer_pre + 2
+        assert "are you there" in str(writer_log[-2])
         # Unknown targets fail closed at wiring time; no dead edge is stored.
         from kohakuterrarium.terrarium.graph_identity import TargetNotFoundError
 

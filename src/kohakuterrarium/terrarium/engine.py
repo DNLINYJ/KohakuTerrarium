@@ -121,6 +121,7 @@ class Terrarium:
         self._owned_sessions: set[str] = set()
         self._subscribers: list[_observability.Subscriber] = []
         self._running = True
+        self._shutting_down = False
         # Live runtime-graph prompt block — refreshed reactively when the
         # engine emits topology / wire / parent-link events. Attaches
         # lazily on the first ``async with`` / ``__aenter__`` so a sync
@@ -224,6 +225,7 @@ class Terrarium:
 
     async def __aenter__(self) -> "Terrarium":
         self._running = True
+        self._shutting_down = False
         self._runtime_prompt.attach()
         if self._drive_runtime is not None:
             await self._drive_runtime.start()
@@ -693,6 +695,19 @@ class Terrarium:
         if self._drive_runtime is not None:
             self._drive_runtime.schedule_reconcile(c)
 
+    async def wake(self, creature: CreatureRef) -> bool:
+        """Start ``creature`` unless it is running; True when it was started.
+
+        User input addressed to a stopped (not removed) creature goes through
+        this, so the message reactivates the creature instead of being refused.
+        Once the engine is shutting down nothing is started.
+        """
+        c = self._creature(creature)
+        if c.is_running or self._shutting_down:
+            return False
+        await self.start(c)
+        return True
+
     async def stop(self, creature: CreatureRef) -> None:
         """Stop a running creature without removing it from the graph."""
         c = self._creature(creature)
@@ -720,6 +735,7 @@ class Terrarium:
         """
         if not self._creatures and not self._running:
             return
+        self._shutting_down = True
         # The stop loop can be cancelled mid-await; run store closure +
         # subscriber teardown in ``finally`` so a leaked writer lock (which
         # blocks any later adopt of the same file) can't outlive shutdown.

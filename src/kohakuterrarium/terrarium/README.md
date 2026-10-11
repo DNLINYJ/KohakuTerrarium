@@ -56,6 +56,7 @@ await engine.shutdown()
 - `await engine.connect(a, b, channel=...)` / `disconnect(...)`: wire or unwire graph edges; may merge/split graphs.
 - `await engine.wire_output(creature, sink)`: deterministic turn-output routing.
 - `engine.subscribe(EventFilter(...))`: observe text chunks, channel messages, topology changes, lifecycle, errors, and session forks.
+- `await engine.wake(creature)`: start a stopped creature; user input (web chat, service `inject_input` / `chat`) calls it so a message reactivates a stopped creature.
 - `await engine.shutdown()`: stop all creatures.
 
 Use `Studio` when you also need package catalog, settings/identity, saved-session

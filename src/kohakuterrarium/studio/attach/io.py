@@ -7,6 +7,7 @@ channel history and live messages through the same websocket.
 
 import asyncio
 import time
+from functools import partial
 from typing import Any
 
 from fastapi import WebSocket
@@ -428,6 +429,7 @@ async def attach_io(
                     target_creature.name,
                     pending_id,
                     branch_view=data.get("branch_view"),
+                    wake=partial(engine.wake, target_creature),
                 )
             )
             input_tasks.append(task)

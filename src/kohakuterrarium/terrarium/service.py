@@ -31,6 +31,7 @@ DTOs vs live objects:
 
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from typing import Any, Protocol, runtime_checkable
 
 from kohakuterrarium.core.channel import ChannelMessage as _ChannelMessage
@@ -675,6 +676,7 @@ class LocalTerrariumService(
         source: str = "chat",
     ) -> None:
         creature = self._engine.get_creature(creature_id)
+        await self._engine.wake(creature)
         await creature.inject_input(message, source=source)
 
     def chat(
@@ -682,12 +684,18 @@ class LocalTerrariumService(
         creature_id: str,
         message: str | list[dict[str, Any]],
     ) -> AsyncIterator[str]:
-        # Resolving the creature is sync; the returned iterator is the
-        # creature's chat stream. We delegate the iterator object
-        # directly rather than wrapping it in another async generator
-        # so cancellation semantics match exactly.
+        # Resolving the creature is sync so an unknown id raises at call time.
         creature = self._engine.get_creature(creature_id)
-        return creature.chat(message)
+        return self._wake_and_chat(creature, message)
+
+    async def _wake_and_chat(
+        self, creature: Any, message: str | list[dict[str, Any]]
+    ) -> AsyncIterator[str]:
+        """Start a stopped creature, then stream its reply to ``message``."""
+        await self._engine.wake(creature)
+        async with aclosing(creature.chat(message)) as stream:
+            async for chunk in stream:
+                yield chunk
 
     # === Per-creature control ===
 

@@ -397,6 +397,49 @@ class TestStartStop:
         finally:
             await t.shutdown()
 
+    async def test_wake_starts_only_a_creature_that_is_not_running(self):
+        t = await TestTerrariumBuilder().with_creature("alice").build()
+        try:
+            alice = t.get_creature("alice")
+            assert await t.wake("alice") is False
+            assert alice.agent.start_calls == 1
+            await t.stop("alice")
+            assert alice.status == "stopped"
+            assert await t.wake(alice) is True
+            assert (alice.status, alice.agent.start_calls) == ("idle", 2)
+            alice._input_loop_error = RuntimeError("input loop died")
+            alice._running = False
+            await alice.agent.stop()
+            assert alice.status == "error"
+            assert await t.wake("alice") is True
+            assert alice.status == "idle"
+            await t.shutdown()
+            assert await t.wake("alice") is False
+            assert alice.status == "stopped"
+            async with t:
+                assert await t.wake("alice") is True
+            await t.remove_creature("alice")
+            with pytest.raises(KeyError):
+                await t.wake("alice")
+        finally:
+            await t.shutdown()
+
+    async def test_wake_starts_a_deferred_creature_through_engine_start(self):
+        t = Terrarium()
+        scheduled = []
+        try:
+            agent = _FakeAgent(name="late")
+            creature = Creature(creature_id="late", name="late", agent=agent)
+            await t.add_creature(creature, start=False)
+            assert creature.status == "not_started"
+            t._drive_runtime = SimpleNamespace(schedule_reconcile=scheduled.append)
+            assert await t.wake("late") is True
+            assert creature.status == "idle"
+            assert scheduled == [creature]
+        finally:
+            t._drive_runtime = None
+            await t.shutdown()
+
     async def test_stop_graph(self):
         t = (
             await TestTerrariumBuilder()

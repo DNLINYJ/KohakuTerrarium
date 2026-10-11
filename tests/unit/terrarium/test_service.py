@@ -406,6 +406,38 @@ class TestPerCreatureReads:
         finally:
             await svc.shutdown()
 
+    async def test_user_input_to_a_stopped_creature_starts_it_first(self):
+        svc = await _make_service()
+        try:
+            alice = svc.engine.get_creature("alice")
+            seen_running: list[bool] = []
+            inject = alice.agent.inject_input
+
+            async def recording_inject(message, *, source="chat"):
+                seen_running.append(alice.is_running)
+                await inject(message, source=source)
+
+            alice.agent.inject_input = recording_inject
+            await svc.stop_creature("alice")
+            reply = [chunk async for chunk in svc.chat("alice", "wake up")]
+            assert reply == ["hello!"]
+            assert alice.agent.start_calls == 2
+            await svc.stop_creature("alice")
+            await svc.inject_input("alice", "and again")
+            assert alice.agent.start_calls == 3
+            await svc.inject_input("alice", "still running")
+            assert alice.agent.start_calls == 3
+            assert seen_running == [True, True, True]
+            assert [m for m, _ in alice.agent.injected] == [
+                "wake up",
+                "and again",
+                "still running",
+            ]
+            with pytest.raises(KeyError):
+                svc.chat("nobody", "hi")
+        finally:
+            await svc.shutdown()
+
 
 # ── shutdown ─────────────────────────────────────────────────────
 

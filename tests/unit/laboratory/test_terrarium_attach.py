@@ -420,3 +420,30 @@ class TestProcessInput:
         finally:
             adapter.detach()
             await t.shutdown()
+
+    async def test_wake_starts_a_stopped_target_before_injecting(self):
+        t = await TestTerrariumBuilder().with_creature("alice").build()
+        try:
+            adapter, node = await _build_adapter(t)
+            alice = t.get_creature("alice")
+            running_at_inject: list[bool] = []
+
+            async def _inject(*args, **kwargs):
+                running_at_inject.append(alice.is_running)
+                return True
+
+            alice.agent.inject_input = AsyncMock(side_effect=_inject)
+            await t.stop("alice")
+            sink = _make_sink(node)
+            await adapter._process_input(
+                sink, alice.agent, "hi", "alice", "p1", wake=alice
+            )
+            await adapter._process_input(
+                sink, alice.agent, "again", "alice", "p2", wake=alice
+            )
+            assert running_at_inject == [True, True]
+            assert alice.agent.start_calls == 2
+            assert [f["type"] for f in _drain(sink)] == ["idle", "idle"]
+        finally:
+            adapter.detach()
+            await t.shutdown()

@@ -467,19 +467,26 @@ class TestLaboratoryMultiNodeService:
             assert status is not None
             assert status.get("creature_id") == alpha_info.creature_id
 
-            # ── 14. stop_creature → start_creature round-trip ──
+            # ── 14. stop_creature → user input on the worker starts it again ──
+            async def _bravo_running(expected: bool) -> bool:
+                for _ in range(20):
+                    s = await service.creature_status(bravo_info.creature_id)
+                    if s and s.get("running") is expected:
+                        return True
+                    await asyncio.sleep(0.05)
+                return False
+
             await service.stop_creature(bravo_info.creature_id)
-            for _ in range(20):
-                s = await service.creature_status(bravo_info.creature_id)
-                if s and s.get("running") is False:
-                    break
-                await asyncio.sleep(0.05)
+            assert await _bravo_running(False)
+            await service.inject_input(bravo_info.creature_id, "wake up", source="test")
+            assert (await service.creature_status(bravo_info.creature_id))["running"]
+            await service.stop_creature(bravo_info.creature_id)
+            assert await _bravo_running(False)
+            async for _ in service.chat(bravo_info.creature_id, "still there?"):
+                pass
+            assert (await service.creature_status(bravo_info.creature_id))["running"]
             await service.start_creature(bravo_info.creature_id)
-            for _ in range(20):
-                s = await service.creature_status(bravo_info.creature_id)
-                if s and s.get("running") is True:
-                    break
-                await asyncio.sleep(0.05)
+            assert await _bravo_running(True)
 
             # ── 15. disconnect ──
             disc = await service.disconnect(

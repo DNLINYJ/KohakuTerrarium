@@ -539,6 +539,43 @@ class TestAttachIoLocal:
         finally:
             await t.shutdown()
 
+    async def test_input_to_a_stopped_creature_starts_it_before_injecting(self):
+        t = await (
+            TestTerrariumBuilder().with_creature("alice").with_creature("bob").build()
+        )
+        svc = LocalTerrariumService(t)
+        try:
+            bob = t.get_creature("bob")
+            running_at_inject: list[bool] = []
+
+            async def _inject(*args, **kwargs):
+                running_at_inject.append(bob.is_running)
+                return True
+
+            for cid in ("alice", "bob"):
+                ag = t.get_creature(cid).agent
+                ag.inject_input = AsyncMock(side_effect=_inject)
+                ag.output_router = SimpleNamespace(
+                    add_secondary=lambda x: None,
+                    remove_secondary=lambda x: None,
+                    submit_reply_with_status=lambda r: (True, "ok"),
+                )
+                ag.config = SimpleNamespace(model="m")
+            await t.stop("bob")
+            assert bob.status == "stopped"
+            ws = _FakeWebSocket(
+                frames=[{"type": "input", "content": "wake", "target": "bob"}]
+            )
+            with pytest.raises(RuntimeError):
+                await io_mod.attach_io(ws, svc, "_", "alice")
+            await asyncio.sleep(0.05)
+            assert running_at_inject == [True]
+            assert bob.agent.start_calls == 2
+            assert t.get_creature("alice").agent.start_calls == 1
+            assert bob.agent.inject_input.await_args.args[0] == "wake"
+        finally:
+            await t.shutdown()
+
     async def test_input_unknown_target_emits_error(self):
         t = await TestTerrariumBuilder().with_creature("alice").build()
         svc = LocalTerrariumService(t)

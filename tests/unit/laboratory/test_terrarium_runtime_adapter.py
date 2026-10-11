@@ -404,6 +404,21 @@ class TestInjectInput:
         finally:
             await adapter._engine.shutdown()
 
+    async def test_inject_wakes_a_stopped_creature(self):
+        adapter = await _make_adapter()
+        try:
+            alice = adapter._engine.get_creature("alice")
+            await adapter._engine.stop("alice")
+            out = await adapter._dispatch(
+                _msg("inject_input", {"creature_id": "alice", "message": "hi"})
+            )
+            assert out == {}
+            assert alice.status == "idle"
+            assert alice.agent.injected == [("hi", "chat")]
+            assert alice.agent.start_calls == 2
+        finally:
+            await adapter._engine.shutdown()
+
     async def test_inject_unknown(self):
         adapter = await _make_adapter()
         try:

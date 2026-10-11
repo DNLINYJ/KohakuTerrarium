@@ -181,6 +181,7 @@ class TerrariumAttachAdapter(WSProxyAdapter):
                 if frame_type not in {"input", "input_edit", "input_cancel"}:
                     continue
                 target_name = (frame.get("target") or "").strip()
+                target = creature
                 target_agent = agent
                 target_name_eff = creature.name
                 if target_name and target_name != creature.name:
@@ -198,6 +199,7 @@ class TerrariumAttachAdapter(WSProxyAdapter):
                             }
                         )
                         continue
+                    target = sibling
                     target_agent = sibling.agent
                     target_name_eff = sibling.name
                 if frame_type in {"input_edit", "input_cancel"}:
@@ -230,6 +232,7 @@ class TerrariumAttachAdapter(WSProxyAdapter):
                         target_name_eff,
                         pending_id,
                         branch_view=frame.get("branch_view"),
+                        wake=target,
                     )
                 )
         except asyncio.CancelledError:
@@ -392,8 +395,12 @@ class TerrariumAttachAdapter(WSProxyAdapter):
         source_name: str,
         pending_id: str,
         branch_view: dict | None = None,
+        wake: Any = None,
     ) -> None:
+        """Run one input turn; ``wake`` is the target creature, started if stopped."""
         try:
+            if wake is not None:
+                await self._engine.wake(wake)
             options = {"branch_view": branch_view} if branch_view is not None else {}
             dispatched = await agent.inject_input(
                 content,

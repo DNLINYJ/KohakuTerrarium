@@ -143,6 +143,30 @@ class TestStartChat:
             adapter.detach()
             await t.shutdown()
 
+    async def test_start_chat_wakes_a_stopped_creature(self):
+        t = await (
+            TestTerrariumBuilder().with_creature("alice", responses=["hello"]).build()
+        )
+        node = _FakeLabNode()
+        try:
+            adapter = TerrariumEventsAdapter(t, node)
+            alice = t.get_creature("alice")
+            await t.stop("alice")
+            await adapter._dispatch(
+                _app_msg(
+                    "start_chat",
+                    {"stream_id": "s1", "creature_id": "alice", "message": "hi"},
+                )
+            )
+            await asyncio.wait_for(adapter._active["s1"], timeout=2.0)
+            bodies = [n["body"] for n in node.notifications]
+            assert [b.get("token") for b in bodies if "token" in b] == ["hello"]
+            assert not any("error" in b for b in bodies)
+            assert (alice.status, alice.agent.start_calls) == ("idle", 2)
+        finally:
+            adapter.detach()
+            await t.shutdown()
+
 
 # ── cancel_stream ────────────────────────────────────────────
 

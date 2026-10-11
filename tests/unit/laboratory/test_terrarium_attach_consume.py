@@ -343,13 +343,14 @@ class TestConsumeInputTargetRouting:
             bob = t.get_creature("bob")
             alice.agent.inject_input = AsyncMock()
             bob.agent.inject_input = AsyncMock()
+            await t.stop("bob")
             sink = _make_sink(node)
             consumer = asyncio.create_task(
                 adapter._consume_input(sink, alice, alice.agent)
             )
             try:
-                # A frame addressed to "bob" must be routed to bob's
-                # agent, not alice's.
+                # A frame addressed to the stopped "bob" starts bob and is
+                # routed to bob's agent, not alice's.
                 await sink.inject_input(
                     {"type": "input", "content": "for bob", "target": "bob"}
                 )
@@ -362,6 +363,8 @@ class TestConsumeInputTargetRouting:
                     "for bob", source="web", pending_id=pending_id
                 )
                 alice.agent.inject_input.assert_not_awaited()
+                assert bob.status == "idle"
+                assert (bob.agent.start_calls, alice.agent.start_calls) == (2, 1)
                 # The echoed user_input frame names the effective target.
                 frames = _drain(sink)
                 user_in = next(f for f in frames if f["type"] == "user_input")

@@ -318,6 +318,11 @@ Recipes and resume-into:
 Lifecycle and output wiring:
 
 - `await engine.start(creature)` / `await engine.stop(creature)` / `await engine.stop_graph(graph)`
+- `await engine.wake(creature) -> bool`: start the creature unless it is
+  running (no-op once shutdown began); True when it was started. User input
+  from the web chat (WebSocket attach, HTTP chat, lab workers) and
+  `TerrariumService.inject_input` / `chat` go through it, so a message to a
+  stopped (not removed) creature reactivates it.
 - `await engine.shutdown()`: stop everything, close every store the
   engine minted, terminate subscribers; idempotent.
 - `await engine.wire_output(creature, target) -> str` / `await engine.unwire_output(creature, edge_id) -> bool`

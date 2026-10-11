@@ -53,3 +53,28 @@ async def test_previous_input_cannot_mark_a_new_turn_idle(tmp_path):
         llm.release.set()
         llm.followup_release.set()
         await agent.stop()
+
+
+async def test_wake_starts_a_stopped_agent_before_its_input_runs(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text("name: sleeper\nsystem_prompt: offline\ninput: {type: none}\n")
+    agent = await Agent.build(
+        str(config), llm=ScriptedLLM(["awake"]), io="headless", pwd=tmp_path
+    )
+    queue = asyncio.Queue()
+    await _process_input(agent, "refused", queue, "sleeper", "p0")
+    refused = queue.get_nowait()
+    assert refused["type"] == "error" and "not running" in refused["content"]
+
+    async def failing_wake():
+        raise RuntimeError("start failed")
+
+    await _process_input(agent, "x", queue, "sleeper", "p1", wake=failing_wake)
+    assert queue.get_nowait()["content"] == "start failed"
+    assert [m["role"] for m in agent.conversation_history] == ["system"]
+    try:
+        await _process_input(agent, "hello", queue, "sleeper", "p2", wake=agent.start)
+        assert queue.get_nowait()["type"] == "idle"
+        assert agent.conversation_history[-1]["content"] == "awake"
+    finally:
+        await agent.stop()

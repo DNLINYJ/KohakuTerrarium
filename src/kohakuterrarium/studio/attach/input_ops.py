@@ -2,7 +2,7 @@
 
 import asyncio
 import time
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from kohakuterrarium.llm.message import (
     content_parts_to_dicts,
@@ -95,8 +95,11 @@ async def _process_input(
     source_name: str,
     pending_id: str,
     branch_view: dict | None = None,
+    wake: Callable[[], Awaitable[Any]] | None = None,
 ) -> None:
     """Inject input without blocking the websocket receive loop.
+
+    ``wake`` runs first and starts the target creature when it is stopped.
 
     Errors and terminal notices use the outbound queue so this task does not need
     direct access to the websocket and inbound frames such as ``ui_reply`` remain
@@ -108,6 +111,8 @@ async def _process_input(
     acknowledgement exposes ``pending_id`` for later edit or cancellation.
     """
     try:
+        if wake is not None:
+            await wake()
         options = {"branch_view": branch_view} if branch_view is not None else {}
         processed = await agent.inject_input(
             content, source="web", pending_id=pending_id, **options
