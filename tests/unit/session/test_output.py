@@ -895,6 +895,86 @@ class TestActivityHandlers:
         finally:
             store.close()
 
+    async def test_own_namespace_persists_frame_totals(self, tmp_path):
+        store, out = _make(tmp_path)
+        try:
+            out.on_activity_with_metadata(
+                "token_usage",
+                "[llm]",
+                {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 3,
+                    "totals": {"prompt": 905, "completion": 103, "cached": 9},
+                    "context_tokens": 5,
+                },
+            )
+            await out.drain()
+            assert store.state.get("alice:token_usage") == {
+                "total_input_tokens": 905,
+                "total_output_tokens": 103,
+                "total_cached_tokens": 9,
+                "last_prompt_tokens": 5,
+            }
+        finally:
+            store.close()
+
+    async def test_attached_namespace_counts_its_own_totals(self, tmp_path):
+        store, out = _make(tmp_path, prefix="host:attached:1")
+        try:
+            out.on_activity_with_metadata(
+                "token_usage",
+                "[llm]",
+                {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 3,
+                    "totals": {"prompt": 905, "completion": 103, "cached": 9},
+                },
+            )
+            assert out._total_input_tokens == 5
+            assert out._total_output_tokens == 3
+        finally:
+            store.close()
+
+    async def test_compaction_and_clear_zero_persisted_context(self, tmp_path):
+        store, out = _make(tmp_path)
+        try:
+            out.on_activity_with_metadata(
+                "token_usage", "[llm]", {"prompt_tokens": 7000, "completion_tokens": 9}
+            )
+            out.on_activity_with_metadata(
+                "compact_complete", "[compact]", {"round": 1, "context_tokens": 0}
+            )
+            await out.drain()
+            slot = store.state.get("alice:token_usage")
+            assert slot["last_prompt_tokens"] == 0
+            assert slot["total_input_tokens"] == 7000
+            out.on_activity_with_metadata(
+                "token_usage", "[llm]", {"prompt_tokens": 300, "completion_tokens": 1}
+            )
+            out.on_activity_with_metadata(
+                "context_cleared",
+                "[clear]",
+                {"messages_cleared": 4, "context_tokens": 0},
+            )
+            await out.drain()
+            slot = store.state.get("alice:token_usage")
+            assert slot["last_prompt_tokens"] == 0
+            assert slot["total_input_tokens"] == 7300
+        finally:
+            store.close()
+
+    async def test_compact_complete_without_context_keeps_slot(self, tmp_path):
+        store, out = _make(tmp_path)
+        try:
+            out.on_activity_with_metadata(
+                "token_usage", "[llm]", {"prompt_tokens": 70, "completion_tokens": 1}
+            )
+            out.on_activity_with_metadata("compact_complete", "[compact]", {"round": 1})
+            await out.drain()
+            assert store.state.get("alice:token_usage")["last_prompt_tokens"] == 70
+        finally:
+            store.close()
+
     async def test_compact_events(self, tmp_path):
         store, out = _make(tmp_path)
         try:

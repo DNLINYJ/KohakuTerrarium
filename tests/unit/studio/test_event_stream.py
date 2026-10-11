@@ -1,6 +1,7 @@
 """Unit tests for :mod:`kohakuterrarium.studio.attach._event_stream`."""
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,7 +11,9 @@ from kohakuterrarium.studio.attach._event_stream import (
     StreamOutput,
     _parse_detail,
     get_event_log,
+    session_info_frame,
 )
+from kohakuterrarium.testing.terrarium import _FakeAgent
 
 # ── _parse_detail / get_event_log ────────────────────────────
 
@@ -41,6 +44,73 @@ class TestGetEventLog:
         b = get_event_log("b")
         a.append("x")
         assert list(b) == []
+
+
+# ── session_info_frame ─────────────────────────────────────
+
+
+class TestSessionInfoFrame:
+    def _creature(self, store=None):
+        agent = _FakeAgent(name="alice")
+        agent.session_store = store
+        agent.compact_manager = SimpleNamespace(
+            config=SimpleNamespace(max_tokens=8000, threshold=0.75)
+        )
+        return SimpleNamespace(name="alice", agent=agent, config_name="cfg")
+
+    def test_carries_backend_totals_and_context(self):
+        store = SimpleNamespace(
+            state={
+                "alice:token_usage": {
+                    "total_input_tokens": 1200,
+                    "total_output_tokens": 300,
+                    "total_cached_tokens": 100,
+                    "last_prompt_tokens": 650,
+                }
+            }
+        )
+        frame = session_info_frame(self._creature(store))
+        assert frame["source"] == "alice"
+        assert frame["token_usage"] == {
+            "prompt": 1200,
+            "completion": 300,
+            "cached": 100,
+            "total": 1500,
+        }
+        assert frame["context_tokens"] == 650
+        assert frame["max_context"] == 8000
+        assert frame["compact_threshold"] == 6000
+
+    def test_fresh_creature_reports_zero(self):
+        frame = session_info_frame(self._creature())
+        assert frame["token_usage"]["total"] == 0
+        assert frame["context_tokens"] == 0
+
+
+class TestTokenFramePassthrough:
+    def test_running_totals_reach_the_client(self):
+        q: asyncio.Queue = asyncio.Queue()
+        so = StreamOutput("alice", q, [])
+        so.on_activity_with_metadata(
+            "token_usage",
+            "[llm] tokens",
+            {
+                "prompt_tokens": 10,
+                "totals": {"prompt": 510, "completion": 20, "cached": 0, "total": 530},
+                "context_tokens": 10,
+            },
+        )
+        frame = q.get_nowait()
+        assert frame["totals"]["total"] == 530
+        assert frame["context_tokens"] == 10
+
+    def test_compaction_context_reset_reaches_the_client(self):
+        q: asyncio.Queue = asyncio.Queue()
+        so = StreamOutput("alice", q, [])
+        so.on_activity_with_metadata(
+            "compact_complete", "[compact] done", {"round": 1, "context_tokens": 0}
+        )
+        assert q.get_nowait()["context_tokens"] == 0
 
 
 # ── StreamOutput sync hooks ────────────────────────────────

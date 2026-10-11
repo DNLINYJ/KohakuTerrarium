@@ -2303,6 +2303,7 @@ const _chatStoreOptions = {
         if (initialTab && initialTab !== this.activeTab) {
           this.openTab(initialTab)
         }
+        this._adoptCreatureUsage(instance)
         // Same instance, WS already up. Nothing to do — the live WS
         // is already streaming any new events into ``messagesByTab``,
         // so re-fetching ``/history`` here would be wasted work and
@@ -2391,6 +2392,7 @@ const _chatStoreOptions = {
           this.modelByTab["root"] = { ...info }
         }
       }
+      this._adoptCreatureUsage(instance)
 
       // Reset status store too. Actions run detached from any Vue
       // setup context, so ``injectScope()`` would return null —
@@ -3018,19 +3020,23 @@ const _chatStoreOptions = {
       }
     },
 
-    /** Restore token usage from event log (for page refresh) */
+    /** Restore token usage from event log (for page refresh). Totals of a
+     *  source that already holds backend-reported usage are left alone —
+     *  a history window is only a fallback for viewers without a backend
+     *  baseline (saved sessions, older servers); sub-agent snapshots are
+     *  always folded in. */
     _restoreTokenUsage(source, events, alreadyDeduped = false) {
-      // Canonical history is authoritative — rebuild this source's total
-      // from scratch so a reconnect (which re-runs _loadHistory on the
-      // same generation) does not add the persisted token_usage rows a
-      // second time and double the count.
-      this.tokenUsage[source] = { prompt: 0, completion: 0, total: 0, cached: 0, lastPrompt: 0 }
+      const backendOwned = !!this.tokenUsage[source]?.backend
+      // Rebuilt from zero so a reconnect replay does not count rows twice.
+      if (!backendOwned) {
+        this.tokenUsage[source] = { prompt: 0, completion: 0, total: 0, cached: 0, lastPrompt: 0 }
+      }
       const normalizedEvents = alreadyDeduped ? events : _dedupeAdjacentDuplicateEvents(events)
       for (const evt of normalizedEvents) {
         const isTokenEvt =
           (evt.type === "activity" && evt.activity_type === "token_usage") ||
           evt.type === "token_usage"
-        if (isTokenEvt) {
+        if (isTokenEvt && !backendOwned) {
           const prev = this.tokenUsage[source]
           this.tokenUsage[source] = {
             prompt: prev.prompt + (evt.prompt_tokens || 0),
@@ -3046,6 +3052,36 @@ const _chatStoreOptions = {
         if (evt.type === "subagent_token_usage" || evt.type === "subagent_result") {
           this._recordSubagentUsage(source, evt.job_id, evt)
         }
+      }
+    },
+
+    /** Replace ``tab``'s usage with backend-reported running totals
+     *  (``{prompt, completion, cached, total}``) and context fill. */
+    _applyCreatureUsage(tab, usage, contextTokens) {
+      if (!tab || !usage || typeof usage !== "object") return
+      const prompt = Number(usage.prompt) || 0
+      const completion = Number(usage.completion) || 0
+      this.tokenUsage[tab] = {
+        prompt,
+        completion,
+        cached: Number(usage.cached) || 0,
+        total: Number(usage.total) || prompt + completion,
+        lastPrompt: Number(contextTokens) || 0,
+        backend: true,
+      }
+    },
+
+    /** Adopt each creature's ``token_usage`` / ``context_tokens`` from an
+     *  instance snapshot. Totals only grow, so a snapshot older than the
+     *  live frames already applied (smaller total) is skipped. */
+    _adoptCreatureUsage(instance) {
+      for (const c of instance?.creatures || []) {
+        if (!c?.name || !c.token_usage || typeof c.token_usage !== "object") continue
+        const key = this._rootSourceName && c.name === this._rootSourceName ? "root" : c.name
+        const current = this.tokenUsage[key]
+        const incoming = Number(c.token_usage.total) || 0
+        if (current?.backend && incoming < (current.total || 0)) continue
+        this._applyCreatureUsage(key, c.token_usage, c.context_tokens)
       }
     },
 
@@ -3405,6 +3441,14 @@ const _chatStoreOptions = {
       const statusStore = useStatusStore(scopeOfStoreId(this.$id))
       statusStore.handleActivity(data)
 
+      if (
+        (at === "compact_complete" || at === "context_cleared") &&
+        typeof data.context_tokens === "number" &&
+        this.tokenUsage[source]
+      ) {
+        this.tokenUsage[source] = { ...this.tokenUsage[source], lastPrompt: data.context_tokens }
+      }
+
       if (at === "assistant_reasoning") {
         const tab = source || data.agent_name || this.activeTab
         if (!this._frameMatchesViewedBranch(tab, data)) return
@@ -3447,6 +3491,8 @@ const _chatStoreOptions = {
         if (data.compact_threshold != null) info.compactThreshold = data.compact_threshold
         const tab = source || data.agent_name || ""
         if (tab && data.branch_view) this._adoptAuthoritativeBranchView(tab, data.branch_view)
+        if (tab && data.token_usage)
+          this._applyCreatureUsage(tab, data.token_usage, data.context_tokens)
         if (tab && Object.keys(info).length) {
           this.modelByTab[tab] = { ...(this.modelByTab[tab] || {}), ...info }
           if (tab === this._rootSourceName && this.tabs.includes("root")) {
@@ -3471,20 +3517,27 @@ const _chatStoreOptions = {
       }
 
       if (at === "token_usage") {
-        const prev = this.tokenUsage[source] || {
-          prompt: 0,
-          completion: 0,
-          total: 0,
-          cached: 0,
-          lastPrompt: 0,
-        }
-        this.tokenUsage[source] = {
-          ...(prev.partial ? { partial: true } : {}),
-          prompt: prev.prompt + (data.prompt_tokens || 0),
-          completion: prev.completion + (data.completion_tokens || 0),
-          total: prev.total + (data.total_tokens || 0),
-          cached: prev.cached + (data.cached_tokens || 0),
-          lastPrompt: data.prompt_tokens || prev.lastPrompt,
+        if (data.totals) {
+          this._applyCreatureUsage(source, data.totals, data.context_tokens ?? data.prompt_tokens)
+        } else {
+          // Servers without running totals: add deltas; a source with no
+          // history baseline yet stays partial so its history load rebuilds it.
+          const prev = this.tokenUsage[source] || {
+            prompt: 0,
+            completion: 0,
+            total: 0,
+            cached: 0,
+            lastPrompt: 0,
+            partial: true,
+          }
+          this.tokenUsage[source] = {
+            ...(prev.partial ? { partial: true } : {}),
+            prompt: prev.prompt + (data.prompt_tokens || 0),
+            completion: prev.completion + (data.completion_tokens || 0),
+            total: prev.total + (data.total_tokens || 0),
+            cached: prev.cached + (data.cached_tokens || 0),
+            lastPrompt: data.prompt_tokens || prev.lastPrompt,
+          }
         }
         const list = this.messagesByTab[source] || []
         const target = [...list].reverse().find((message) => message?.role === "assistant")
@@ -6302,7 +6355,7 @@ const _chatStoreOptions = {
       ) {
         this._restoreTokenUsage(tab, prepared.events, true)
       }
-      if (this.tokenUsage[tab]) {
+      if (this.tokenUsage[tab] && !this.tokenUsage[tab].backend) {
         this.tokenUsage[tab].partial = !!(
           this.historyPageByTab[tab]?.hasOlder || this.historyPageByTab[tab]?.hasNewer
         )

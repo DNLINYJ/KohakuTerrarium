@@ -22,6 +22,7 @@ from kohakuterrarium.core.compact_text import (
 )
 from kohakuterrarium.core.conversation_elide import elide_after_compact
 from kohakuterrarium.core.single_flight import SingleFlightDispatch, SingleFlightLease
+from kohakuterrarium.core.token_ledger import reset_context_tokens
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -417,6 +418,7 @@ class CompactManager:
             # prompt — drop it so it can't re-trigger a compact.
             if self._controller is not None:
                 self._controller._last_usage = {}
+            reset_context_tokens(self._agent)
 
             # Compact summarizes the compact zone but leaves the live zone
             # (recent turns) untouched; elide stale tool results there so
@@ -430,6 +432,7 @@ class CompactManager:
             if self._output_router:
                 run = getattr(self._session_store, "run", None)
                 metadata["summary"] = summary
+                metadata["context_tokens"] = 0
                 self._output_router.notify_activity(
                     "compact_complete",
                     f"Context auto-compact done (round {self._compact_count})",

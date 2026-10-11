@@ -23,6 +23,7 @@
 <script setup>
 import { computed } from "vue"
 
+import { percentOf } from "@/components/session-v2/model/status/statusModel"
 import { useChatStore } from "@/stores/chat"
 import { useSessionDetailStore } from "@/stores/sessionDetail"
 import { useStatusStore } from "@/stores/status"
@@ -66,13 +67,17 @@ const statusColor = computed(
     })[props.instance?.status] ?? "bg-warm-400",
 )
 
-const model = computed(() => {
-  const target = props.target || chat.activeTab
-  const perTab = (target && chat.modelByTab[target]) || {}
-  return perTab.llmName || perTab.model || chat.sessionInfo.llmName || chat.sessionInfo.model || status.sessionInfo.llmName || status.sessionInfo.model || props.instance?.model || ""
-})
+// The creature tab the header describes: the target when it is a creature
+// tab, else the chat's active tab.
+const creatureTab = computed(() => (props.target && (chat.modelByTab[props.target] || chat.tokenUsage[props.target]) ? props.target : chat.activeTab))
+const creatureInfo = computed(() => (creatureTab.value && chat.modelByTab[creatureTab.value]) || {})
 
-const contextPercent = computed(() => Math.round(status.tokenUsage.contextPercent || 0))
+const model = computed(() => creatureInfo.value.llmName || creatureInfo.value.model || chat.sessionInfo.llmName || chat.sessionInfo.model || props.instance?.llm_name || props.instance?.model || "")
+
+const contextPercent = computed(() => {
+  const maxContext = creatureInfo.value.maxContext || chat.sessionInfo.maxContext || props.instance?.max_context || 0
+  return percentOf(chat.tokenUsage[creatureTab.value]?.lastPrompt || 0, maxContext)
+})
 
 const costLine = computed(() => {
   const cost = props.instance?.cost ?? 0
@@ -82,7 +87,7 @@ const costLine = computed(() => {
 const jobCount = computed(() => status.runningJobs.length)
 
 const age = computed(() => {
-  const start = props.instance?.created_at ? new Date(props.instance.created_at).getTime() : status.sessionInfo.startTime
+  const start = props.instance?.created_at ? new Date(props.instance.created_at).getTime() : null
   if (!start) return ""
   const sec = Math.floor((Date.now() - start) / 1000)
   if (sec < 60) return `${sec}s ago`

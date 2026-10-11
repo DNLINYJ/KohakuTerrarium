@@ -1903,6 +1903,8 @@ export default {
   "graph.field.config": "Config",
   "graph.field.session": "Session",
   "graph.field.tools": "Tools",
+  "graph.field.tokens": "Tokens",
+  "graph.field.context": "Context",
   "graph.field.subagents": "Sub-agents",
   "graph.section.channels": "Channels",
   "graph.section.wires": "Output wiring",

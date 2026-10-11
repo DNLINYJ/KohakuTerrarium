@@ -100,6 +100,8 @@ def pack_creature_info(c: CreatureInfo) -> dict[str, Any]:
         "model": c.model,
         "llm_name": c.llm_name,
         "config_name": c.config_name,
+        "token_usage": dict(c.token_usage),
+        "context_tokens": c.context_tokens,
     }
 
 
@@ -121,6 +123,11 @@ def unpack_creature_info(d: dict[str, Any]) -> CreatureInfo:
         llm_name=str(d.get("llm_name", "") or ""),
         # Graph-local name resolution accepts the original config alias too.
         config_name=str(d.get("config_name", "") or ""),
+        # Older workers omit running usage; they decode as zero.
+        token_usage={
+            str(k): int(v or 0) for k, v in (d.get("token_usage") or {}).items()
+        },
+        context_tokens=int(d.get("context_tokens", 0) or 0),
     )
 
 

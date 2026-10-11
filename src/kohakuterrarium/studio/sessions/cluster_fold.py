@@ -128,6 +128,8 @@ def fold_session_creatures(
                     "is_privileged": bool(entry.get("is_privileged", False)),
                     "model": str(entry.get("model", "") or ""),
                     "llm_name": str(entry.get("llm_name", "") or ""),
+                    "token_usage": dict(entry.get("token_usage") or {}),
+                    "context_tokens": int(entry.get("context_tokens", 0) or 0),
                 }
             )
     for sid in sorted(members):
@@ -151,6 +153,8 @@ def fold_session_creatures(
                 # status fetch on every cluster-member entry.
                 "model": str(meta.get("model", "") or ""),
                 "llm_name": str(meta.get("llm_name", "") or ""),
+                "token_usage": dict(meta.get("token_usage") or {}),
+                "context_tokens": int(meta.get("context_tokens", 0) or 0),
             }
         )
     return creatures or None
@@ -204,6 +208,8 @@ async def refresh_cluster_creatures_live(
                 "is_privileged": bool(getattr(info, "is_privileged", False)),
                 "model": str(getattr(info, "model", "") or ""),
                 "llm_name": str(getattr(info, "llm_name", "") or ""),
+                "token_usage": dict(getattr(info, "token_usage", None) or {}),
+                "context_tokens": int(getattr(info, "context_tokens", 0) or 0),
             }
         )
     return live_for_cluster or None

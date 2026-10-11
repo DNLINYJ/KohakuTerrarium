@@ -79,6 +79,40 @@ class TestCreatureInfoRoundTrip:
         packed = pack_creature_info(c)
         assert isinstance(packed["listen_channels"], list)
 
+    def test_running_usage_crosses_the_wire(self):
+        usage = {"prompt": 900, "completion": 100, "cached": 40, "total": 1000}
+        c = CreatureInfo(
+            creature_id="cid",
+            name="n",
+            graph_id="g",
+            is_running=True,
+            is_privileged=False,
+            parent_creature_id=None,
+            listen_channels=(),
+            send_channels=(),
+            token_usage=usage,
+            context_tokens=350,
+        )
+        packed = pack_creature_info(c)
+        assert packed["token_usage"] == usage
+        assert packed["context_tokens"] == 350
+        out = unpack_creature_info(packed)
+        assert out.token_usage == usage
+        assert out.context_tokens == 350
+
+    def test_older_worker_without_usage_decodes_as_zero(self):
+        out = unpack_creature_info(
+            {
+                "creature_id": "cid",
+                "name": "n",
+                "graph_id": "g",
+                "is_running": True,
+                "is_privileged": False,
+            }
+        )
+        assert out.token_usage == {}
+        assert out.context_tokens == 0
+
 
 # ── ChannelInfo round-trip ──────────────────────────────────────
 

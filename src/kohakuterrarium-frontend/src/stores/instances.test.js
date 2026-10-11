@@ -186,12 +186,23 @@ describe("instances store", () => {
           running: true,
           listen_channels: [],
           send_channels: [],
+          token_usage: { prompt: 700, completion: 70, cached: 7, total: 770 },
+          context_tokens: 650,
         },
       ],
       channels: [],
     })
 
     const result = await store.fetchOne("graph_team")
+    // Backend running usage survives the mapping for every creature.
+    expect(result.creatures[1].token_usage).toEqual({
+      prompt: 700,
+      completion: 70,
+      cached: 7,
+      total: 770,
+    })
+    expect(result.creatures[1].context_tokens).toBe(650)
+    expect(result.creatures[0].token_usage).toBe(null)
 
     expect(result.id).toBe("graph_team")
     expect(result.graph_id).toBe("graph_team")

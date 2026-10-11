@@ -12,10 +12,6 @@ from typing import Any
 
 from fastapi import WebSocket
 
-from kohakuterrarium.core.branch_continuation import (
-    encode_branch_view,
-    selected_branch_view,
-)
 from kohakuterrarium.core.pending_input import new_pending_id
 from kohakuterrarium.laboratory.ws_proxy import proxy_ws_to_lab
 from kohakuterrarium.modules.output.event import UIReply
@@ -23,7 +19,7 @@ from kohakuterrarium.studio._runtime import host_engine_or_none
 from kohakuterrarium.studio.attach._event_stream import (
     StreamOutput,
     get_event_log,
-    model_recovery_snapshot,
+    session_info_frame as _session_info_frame,
 )
 from kohakuterrarium.studio.attach.input_ops import (
     _handle_pending_op,
@@ -38,45 +34,6 @@ from kohakuterrarium.terrarium import TerrariumService
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
-
-
-def _session_info_frame(creature: Any) -> dict[str, Any]:
-    """Build the per-creature ``session_info`` frame sent at attachment.
-
-    The shape matches model-switch events so initial and updated tab state use the
-    same canonical LLM name, raw model ID, and context limits. ``source`` must be the
-    creature display name because the client keys model metadata by tab name.
-    """
-    agent = creature.agent
-    try:
-        llm_name = agent.llm_identifier()
-    except Exception:
-        llm_name = ""
-    llm = getattr(agent, "llm", None)
-    model = getattr(llm, "model", "") or getattr(agent.config, "model", "") or ""
-    max_context = getattr(llm, "_profile_max_context", 0) or 0
-    compact_manager = getattr(agent, "compact_manager", None)
-    compact_at = 0
-    if compact_manager is not None and max_context:
-        try:
-            compact_at = int(max_context * compact_manager.config.threshold)
-        except Exception:
-            compact_at = 0
-    return {
-        "type": "activity",
-        "activity_type": "session_info",
-        "source": creature.name,
-        "model": model,
-        "llm_name": llm_name,
-        "agent_name": creature.name,
-        "config_name": getattr(creature, "config_name", ""),
-        "config_ref": getattr(creature, "config_ref", None),
-        "max_context": max_context,
-        "compact_threshold": compact_at,
-        "model_recovery": model_recovery_snapshot(agent),
-        "branch_view": encode_branch_view(selected_branch_view(agent)),
-        "ts": time.time(),
-    }
 
 
 def _handle_ui_reply(

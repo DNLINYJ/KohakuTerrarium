@@ -1,7 +1,7 @@
 """Maintain cached status for remote creatures in session metadata.
 
-Model, LLM, running, and privilege fields let Studio render remote sessions during
-brief worker outages. Callers provide their runtime-scoped metadata registry;
+Model, LLM, running, privilege, and running token-usage fields let Studio render
+remote sessions during brief worker outages. Callers provide their runtime-scoped metadata registry;
 reads refresh lazily, while model switches can update the cache eagerly.
 """
 
@@ -73,6 +73,15 @@ async def refresh_remote_creature_meta(
         meta["is_privileged"] = bool(
             getattr(info, "is_privileged", meta.get("is_privileged", False))
         )
+        copy_usage_meta(meta, info)
+
+
+def copy_usage_meta(meta: dict[str, Any], info: Any) -> None:
+    """Cache a remote creature's running ``token_usage`` / ``context_tokens``."""
+    usage = getattr(info, "token_usage", None)
+    if isinstance(usage, dict) and usage:
+        meta["token_usage"] = dict(usage)
+        meta["context_tokens"] = int(getattr(info, "context_tokens", 0) or 0)
 
 
 async def refresh_all_remote_creature_meta(
@@ -121,3 +130,4 @@ async def refresh_all_remote_creature_meta(
         meta["is_privileged"] = bool(
             getattr(info, "is_privileged", meta.get("is_privileged", False))
         )
+        copy_usage_meta(meta, info)

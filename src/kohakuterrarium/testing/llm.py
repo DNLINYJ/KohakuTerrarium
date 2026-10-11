@@ -10,12 +10,14 @@ from kohakuterrarium.llm.message import Message
 
 @dataclass
 class ScriptEntry:
-    """Configure one response, optional user-text match, and stream timing."""
+    """Configure one response, optional user-text match, stream timing, and the
+    provider usage (``prompt_tokens`` / ``completion_tokens`` / …) the call reports."""
 
     response: str
     match: str | None = None
     delay_per_chunk: float = 0
     chunk_size: int = 10
+    usage: dict[str, int] | None = None
 
 
 class ScriptedLLM:
@@ -35,6 +37,8 @@ class ScriptedLLM:
 
         self.call_count: int = 0
         self.call_log: list[list[dict[str, Any]]] = []
+        # Provider-style usage of the most recent call; empty when unscripted.
+        self.last_usage: dict[str, int] = {}
         # Match-gated retries must advance through duplicate match entries.
         self._used_indices: set[int] = set()
 
@@ -97,6 +101,7 @@ class ScriptedLLM:
         self.call_log.append(normalized)
         entry = self._find_entry(normalized)
         self.call_count += 1
+        self.last_usage = dict(entry.usage) if entry.usage else {}
 
         response = entry.response
         chunk_size = entry.chunk_size

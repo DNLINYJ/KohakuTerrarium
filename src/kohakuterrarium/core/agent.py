@@ -45,6 +45,7 @@ from kohakuterrarium.core.events import TriggerEvent, create_user_input_event
 from kohakuterrarium.core.job import JobState
 from kohakuterrarium.core.loader import ModuleLoader
 from kohakuterrarium.core.session import Session
+from kohakuterrarium.core.token_ledger import context_window
 from kohakuterrarium.core.trigger_manager import TriggerManager
 from kohakuterrarium.llm.message import ContentPart
 from kohakuterrarium.modules.input.base import InputModule
@@ -551,9 +552,7 @@ class Agent(
             or getattr(getattr(self.llm, "config", None), "model", "")
             or "(no model - backend)"
         )
-        compact_cfg = self.compact_manager.config
-        max_context = compact_cfg.max_tokens
-        compact_at = int(max_context * compact_cfg.threshold) if max_context else 0
+        max_context, compact_at = context_window(self)
         # ``llm_name`` carries the canonical ``provider/name[@variations]``
         # identifier so CLI banners, the web ModelSwitcher pill, and
         # future ``/model`` invocations all show the same selector form.

@@ -1305,10 +1305,55 @@ class TestStudioIntegration:
                 "        listen: [ops-net]\n",
                 encoding="utf-8",
             )
+            scripted_llm["script"] = [
+                ScriptEntry(
+                    "w1",
+                    usage={
+                        "prompt_tokens": 500,
+                        "completion_tokens": 30,
+                        "total_tokens": 530,
+                    },
+                ),
+                ScriptEntry(
+                    "w2",
+                    usage={
+                        "prompt_tokens": 800,
+                        "completion_tokens": 40,
+                        "total_tokens": 840,
+                    },
+                ),
+            ]
             team = await studio.sessions.start_terrarium(str(recipe))
             assert team.name == "rt-team"
             team_sid = team.session_id
             assert {c["name"] for c in team.creatures} == {"lead", "worker"}
+            # --- per-creature usage: a creature no viewer ever attached to
+            # reports backend running totals and context fill after turns.
+            worker_id = next(
+                c["creature_id"] for c in team.creatures if c["name"] == "worker"
+            )
+            assert await _drain_chat(studio, team_sid, worker_id, "first") == "w1"
+            assert await _drain_chat(studio, team_sid, worker_id, "second") == "w2"
+            by_name = {c["name"]: c for c in studio.sessions.list_creatures(team_sid)}
+            assert by_name["worker"]["token_usage"] == {
+                "prompt": 1300,
+                "completion": 70,
+                "cached": 0,
+                "total": 1370,
+            }
+            assert by_name["worker"]["context_tokens"] == 800
+            assert by_name["lead"]["token_usage"]["total"] == 0
+            # The graph view reads the same backend figures.
+            graph_snap = await studio.service.runtime_graph_snapshot()
+            snap_worker = next(
+                c
+                for g in graph_snap["graphs"]
+                if g["graph_id"] == team_sid
+                for c in g["creatures"]
+                if c["name"] == "worker"
+            )
+            assert snap_worker["token_usage"]["total"] == 1370
+            assert snap_worker["context_tokens"] == 800
             # The graph carries the declared channel + per-creature
             # implicit direct channels.
             assert {c["name"] for c in team.channels} == {

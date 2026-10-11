@@ -1413,6 +1413,8 @@ export default {
   "graph.field.config": "設定檔",
   "graph.field.session": "工作階段",
   "graph.field.tools": "工具",
+  "graph.field.tokens": "Token",
+  "graph.field.context": "上下文",
   "graph.field.subagents": "子代理",
   "graph.section.channels": "頻道",
   "graph.section.wires": "輸出接線",

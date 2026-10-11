@@ -4,10 +4,6 @@ import asyncio
 import time
 from typing import Any
 
-from kohakuterrarium.core.branch_continuation import (
-    encode_branch_view,
-    selected_branch_view,
-)
 from kohakuterrarium.core.pending_input import new_pending_id
 from kohakuterrarium.laboratory.protocols import LabRegistrar
 from kohakuterrarium.laboratory.ws_proxy import WSFrameSink, WSProxyAdapter
@@ -19,7 +15,7 @@ from kohakuterrarium.modules.output.event import UIReply
 from kohakuterrarium.studio.attach._event_stream import (
     StreamOutput,
     get_event_log,
-    model_recovery_snapshot,
+    session_info_frame,
 )
 from kohakuterrarium.terrarium.engine import Terrarium
 from kohakuterrarium.utils.logging import get_logger
@@ -122,15 +118,7 @@ class TerrariumAttachAdapter(WSProxyAdapter):
                 )  # type: ignore[arg-type]
                 sibling.agent.output_router.add_secondary(sib_module)
                 sibling_modules.append((sibling.agent, sib_module))
-                sink.send_json_nowait(
-                    {
-                        "type": "activity",
-                        "activity_type": "session_info",
-                        "source": sibling.name,
-                        "ts": time.time(),
-                        "model_recovery": model_recovery_snapshot(sibling.agent),
-                    }
-                )
+                sink.send_json_nowait(session_info_frame(sibling))
 
         # Replay precedes live delivery so an attach starts with a coherent channel view.
         channel_cbs = self._register_channel_callbacks(creature.graph_id, sink)
@@ -146,17 +134,7 @@ class TerrariumAttachAdapter(WSProxyAdapter):
             consumer_task=consumer_task,
         )
 
-        session_info = {
-            "type": "activity",
-            "activity_type": "session_info",
-            "source": creature.name,
-            "model": agent.config.model,
-            "agent_name": creature.name,
-            "model_recovery": model_recovery_snapshot(agent),
-            "branch_view": encode_branch_view(selected_branch_view(agent)),
-            "ts": time.time(),
-        }
-        return {"setup": session_info}
+        return {"setup": session_info_frame(creature)}
 
     async def on_close(self, stream_id: str) -> None:
         session = self._sessions.get(stream_id)

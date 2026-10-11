@@ -256,6 +256,8 @@ import { computed, h, onMounted, onUnmounted, ref } from "vue"
 
 import Metric from "@/components/common/Metric.vue"
 import Sparkline from "@/components/common/Sparkline.vue"
+import { percentOf } from "@/components/session-v2/model/status/statusModel"
+import { useChatStore } from "@/stores/chat"
 import { useInstancesStore } from "@/stores/instances"
 import { useStatusStore } from "@/stores/status"
 import { configAPI, settingsAPI, statsAPI } from "@/utils/api"
@@ -284,6 +286,7 @@ defineProps({ tab: { type: Object, required: true } })
 
 const instances = useInstancesStore()
 const status = useStatusStore()
+const chat = useChatStore()
 
 // ── Storage ─────────────────────────────────────────────────────
 const disk = ref({})
@@ -415,12 +418,8 @@ const running = computed(() => instances.list.filter((i) => i.status === "runnin
 const creatureCount = computed(() => instances.list.filter((i) => i.type === "creature").length)
 const terrariumCount = computed(() => instances.list.filter((i) => i.type === "terrarium").length)
 const jobsInFlight = computed(() => status.runningJobs.length)
-const tokens = computed(() => ({
-  prompt: status.tokenUsage.promptTokens || 0,
-  completion: status.tokenUsage.completionTokens || 0,
-  cached: status.tokenUsage.cachedTokens || 0,
-}))
-const contextPercent = computed(() => Math.round(status.tokenUsage.contextPercent || 0))
+const tokens = computed(() => chat.sessionTokenTotals)
+const contextPercent = computed(() => percentOf(chat.tokenUsage[chat.activeTab]?.lastPrompt || 0, chat.activeCreatureInfo.maxContext))
 
 // ── Process metrics ─────────────────────────────────────────────
 const metrics = ref({})

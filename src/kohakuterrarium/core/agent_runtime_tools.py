@@ -4,6 +4,7 @@ from kohakuterrarium.core.event_inbox import EventEnvelope
 from kohakuterrarium.core.events import TriggerEvent
 from kohakuterrarium.core.pending_input import stamp_pending_id
 from kohakuterrarium.core.job_label import make_job_label
+from kohakuterrarium.core.token_ledger import ledger_for
 from kohakuterrarium.core.tool_output import render_content_text
 from kohakuterrarium.llm.message import content_parts_to_dicts
 from kohakuterrarium.parsing import CommandResultEvent, SubAgentCallEvent, ToolCallEvent
@@ -68,17 +69,24 @@ class AgentRuntimeToolsMixin:
     def _emit_token_usage(self, controller: Controller) -> None:
         """Emit and accumulate usage from the last LLM turn.
 
-        The accumulated usage supports one turn-level event, while provider
-        cache counts are emitted separately when available.
+        The frame carries the per-call usage plus the agent's running
+        ``totals`` and ``context_tokens``. The accumulated usage supports one
+        turn-level event; provider cache counts are emitted separately.
         """
         usage = getattr(controller, "_last_usage", {})
         if not usage:
             return
+        ledger = ledger_for(self)
+        ledger.add(usage)
         self.output_router.notify_activity(
             "token_usage",
             f"tokens: {usage.get('prompt_tokens', 0)} in, "
             f"{usage.get('completion_tokens', 0)} out",
-            metadata=usage,
+            metadata={
+                **usage,
+                "totals": ledger.totals(),
+                "context_tokens": ledger.context_tokens,
+            },
         )
         accum = getattr(self, "_turn_usage_accum", None)
         if isinstance(accum, dict):

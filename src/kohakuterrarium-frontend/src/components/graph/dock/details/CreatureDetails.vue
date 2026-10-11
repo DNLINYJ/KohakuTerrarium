@@ -29,6 +29,10 @@
       <dd class="text-warm-700 dark:text-warm-300 truncate">{{ sessionName }}</dd>
       <dt class="text-warm-500">{{ t("graph.field.tools") }}</dt>
       <dd class="font-mono text-warm-700 dark:text-warm-300">{{ creature.tools }}</dd>
+      <dt class="text-warm-500">{{ t("graph.field.tokens") }}</dt>
+      <dd class="font-mono text-warm-700 dark:text-warm-300" data-test="creature-tokens">{{ formatTokens(creature.tokens) }}</dd>
+      <dt class="text-warm-500">{{ t("graph.field.context") }}</dt>
+      <dd class="font-mono text-warm-700 dark:text-warm-300" data-test="creature-context">{{ contextLabel }}</dd>
       <template v-if="creature.subagents.length">
         <dt class="text-warm-500">{{ t("graph.field.subagents") }}</dt>
         <dd class="flex flex-wrap gap-1">
@@ -81,6 +85,7 @@ import { computed } from "vue"
 import SiteChip from "@/components/cluster/SiteChip.vue"
 import { statusStyle } from "@/components/graph/graphTheme"
 import { creatureDeleteRequest } from "@/components/graph/dock/details/deleteRequests"
+import { formatTokens, percentOf } from "@/components/session-v2/model/status/statusModel"
 import { channelNodeId } from "@/utils/graph/data/model"
 import { useI18n } from "@/utils/i18n"
 
@@ -96,6 +101,11 @@ const { t } = useI18n()
 const status = computed(() => statusStyle(props.creature.status))
 const sessionName = computed(() => props.view.model.sessions.find((s) => s.id === props.creature.sessionId)?.name || props.creature.sessionId)
 const tabKey = computed(() => (props.creature.root ? "root" : props.creature.name))
+const contextLabel = computed(() => {
+  const { contextTokens, maxContext } = props.creature
+  if (!maxContext) return formatTokens(contextTokens)
+  return `${formatTokens(contextTokens)} / ${formatTokens(maxContext)} · ${percentOf(contextTokens, maxContext)}%`
+})
 
 const channelRows = computed(() => {
   const names = new Set([...props.creature.send, ...props.creature.listen])

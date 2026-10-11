@@ -7,8 +7,10 @@ boundary. The live
 (it holds the Agent, channels, …), so the service Protocol returns these DTOs.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, TypedDict
+
+from kohakuterrarium.core.token_ledger import token_snapshot
 
 
 class BranchMutationResult(TypedDict):
@@ -65,6 +67,9 @@ class CreatureInfo:
     model: str = ""
     llm_name: str = ""
     config_name: str = ""
+    # Running usage counters are telemetry, not identity: excluded from eq/hash.
+    token_usage: dict[str, int] = field(default_factory=dict, compare=False)
+    context_tokens: int = field(default=0, compare=False)
 
 
 def _channel_message_to_dict(m: Any) -> dict[str, Any]:
@@ -108,6 +113,7 @@ def creature_to_info(creature: CreatureLike) -> CreatureInfo:
     llm_name = llm_name or str(model or "")
     config = getattr(creature, "config", None) or getattr(agent, "config", None)
     config_name = getattr(config, "name", "") if config is not None else ""
+    tokens = token_snapshot(agent)
     return CreatureInfo(
         creature_id=creature.creature_id,
         name=creature.name,
@@ -120,6 +126,8 @@ def creature_to_info(creature: CreatureLike) -> CreatureInfo:
         model=str(model or ""),
         llm_name=str(llm_name or ""),
         config_name=str(config_name or ""),
+        token_usage=tokens["token_usage"],
+        context_tokens=tokens["context_tokens"],
     )
 
 

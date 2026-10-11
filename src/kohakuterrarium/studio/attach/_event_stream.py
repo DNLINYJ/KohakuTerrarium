@@ -6,6 +6,11 @@ import time
 from collections import deque
 from typing import Any
 
+from kohakuterrarium.core.branch_continuation import (
+    encode_branch_view,
+    selected_branch_view,
+)
+from kohakuterrarium.core.token_ledger import context_window, token_snapshot
 from kohakuterrarium.modules.output.base import OutputModule
 from kohakuterrarium.modules.output.event import OutputEvent
 
@@ -38,6 +43,43 @@ def model_recovery_snapshot(agent: Any) -> dict | None:
         **state,
         "turn_index": getattr(agent, "_turn_index", None),
         "branch_id": getattr(agent, "_branch_id", None),
+    }
+
+
+def session_info_frame(creature: Any) -> dict[str, Any]:
+    """Build the per-creature ``session_info`` frame sent at attachment.
+
+    The shape matches model-switch events so initial and updated tab state use the
+    same canonical LLM name, raw model ID, and context limits, and carries the
+    creature's running ``token_usage`` / ``context_tokens`` so a viewer starts
+    from backend totals. ``source`` is the creature display name because the
+    client keys per-creature state by tab name.
+    """
+    agent = creature.agent
+    try:
+        llm_name = agent.llm_identifier()
+    except Exception:
+        llm_name = ""
+    llm = getattr(agent, "llm", None)
+    model = getattr(llm, "model", "") or getattr(agent.config, "model", "") or ""
+    max_context, compact_at = context_window(agent)
+    tokens = token_snapshot(agent)
+    return {
+        "type": "activity",
+        "activity_type": "session_info",
+        "source": creature.name,
+        "model": model,
+        "llm_name": llm_name,
+        "agent_name": creature.name,
+        "config_name": getattr(creature, "config_name", ""),
+        "config_ref": getattr(creature, "config_ref", None),
+        "max_context": max_context,
+        "compact_threshold": compact_at,
+        "token_usage": tokens["token_usage"],
+        "context_tokens": tokens["context_tokens"],
+        "model_recovery": model_recovery_snapshot(agent),
+        "branch_view": encode_branch_view(selected_branch_view(agent)),
+        "ts": time.time(),
     }
 
 
@@ -333,6 +375,9 @@ _STREAM_METADATA_KEYS = (
     "completion_tokens",
     "total_tokens",
     "cached_tokens",
+    # Running per-creature totals and context fill (token_usage, compaction, clear).
+    "totals",
+    "context_tokens",
     "round",
     "summary",
     "messages_compacted",

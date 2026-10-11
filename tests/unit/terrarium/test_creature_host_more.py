@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from kohakuterrarium.core.token_ledger import ledger_for, reset_context_tokens
 from kohakuterrarium.terrarium import creature_host as ch_mod
 from kohakuterrarium.terrarium.creature_host import (
     Creature,
@@ -209,10 +210,50 @@ class TestGetStatusBranches:
 
     def test_status_with_compact_manager(self):
         agent = _FakeAgent()
-        agent.compact_manager = SimpleNamespace(config=SimpleNamespace(threshold=0.5))
+        agent.compact_manager = SimpleNamespace(
+            config=SimpleNamespace(max_tokens=6000, threshold=0.5)
+        )
         c = Creature(creature_id="c", name="alice", agent=agent)
         out = c.get_status()
-        assert out["compact_threshold"] == 4000  # 8000 * 0.5
+        # The window is the chat model's; the threshold is where compaction
+        # fires, i.e. the compaction window x threshold.
+        assert out["max_context"] == 8000
+        assert out["compact_threshold"] == 3000
+
+    def test_status_reports_persisted_token_totals(self):
+        agent = _FakeAgent(name="alice")
+        agent.session_store = SimpleNamespace(
+            meta={},
+            state={
+                "alice:token_usage": {
+                    "total_input_tokens": 900,
+                    "total_output_tokens": 100,
+                    "total_cached_tokens": 50,
+                    "last_prompt_tokens": 400,
+                }
+            },
+        )
+        c = Creature(creature_id="c", name="alice", agent=agent)
+        out = c.get_status()
+        assert out["token_usage"] == {
+            "prompt": 900,
+            "completion": 100,
+            "cached": 50,
+            "total": 1000,
+        }
+        assert out["context_tokens"] == 400
+
+    def test_status_reports_live_usage_without_store(self):
+        agent = _FakeAgent(name="alice")
+        ledger_for(agent).add({"prompt_tokens": 70, "completion_tokens": 5})
+        ledger_for(agent).add({"prompt_tokens": 90, "completion_tokens": 7})
+        out = Creature(creature_id="c", name="alice", agent=agent).get_status()
+        assert out["token_usage"]["total"] == 172
+        assert out["context_tokens"] == 90
+        reset_context_tokens(agent)
+        out = Creature(creature_id="c", name="alice", agent=agent).get_status()
+        assert out["token_usage"]["total"] == 172
+        assert out["context_tokens"] == 0
 
 
 # ── log helpers ───────────────────────────────────────────────

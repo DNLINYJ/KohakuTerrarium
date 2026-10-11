@@ -73,13 +73,13 @@ describe("per-scope chat store", () => {
 })
 
 describe("per-scope status store", () => {
-  it("token usage doesn't bleed between scopes", () => {
+  it("scratchpad doesn't bleed between scopes", () => {
     const a = useStatusStore("c1")
     const b = useStatusStore("c2")
-    a.tokenUsage.promptTokens = 100
-    b.tokenUsage.promptTokens = 999
-    expect(a.tokenUsage.promptTokens).toBe(100)
-    expect(b.tokenUsage.promptTokens).toBe(999)
+    a.scratchpad.k = "100"
+    b.scratchpad.k = "999"
+    expect(a.scratchpad.k).toBe("100")
+    expect(b.scratchpad.k).toBe("999")
   })
 
   it("running jobs don't bleed between scopes", () => {
@@ -98,27 +98,26 @@ describe("scope propagation across cross-store actions", () => {
   // callsites would break the per-attach isolation silently — this
   // test catches the regression by checking that token writes via a
   // chat action land on the scoped status store, not the default.
-  it("chat._handleActivity routes token usage to the SCOPED status store, not the default", () => {
+  it("chat._handleActivity routes activity to the SCOPED status store, not the default", () => {
     const chatA = useChatStore("creature_aaaa")
     chatA._handleActivity("creature_aaaa", {
-      activity_type: "token_usage",
-      prompt_tokens: 42,
-      completion_tokens: 13,
+      activity_type: "tool_start",
+      name: "bash",
+      job_id: "j1",
     })
 
-    // Scoped status store sees the increment.
+    // Scoped status store sees the job.
     const statusA = useStatusStore("creature_aaaa")
-    expect(statusA.tokenUsage.promptTokens).toBe(42)
-    expect(statusA.tokenUsage.completionTokens).toBe(13)
+    expect(statusA.runningJobs.map((j) => j.jobId)).toEqual(["j1"])
+    statusA._clearElapsedTimer()
 
     // Default (v1 singleton) status store stays untouched.
     const statusDefault = useStatusStore()
-    expect(statusDefault.tokenUsage.promptTokens).toBe(0)
-    expect(statusDefault.tokenUsage.completionTokens).toBe(0)
+    expect(statusDefault.runningJobs).toEqual([])
 
     // A second scope is also unaffected.
     const statusB = useStatusStore("creature_bbbb")
-    expect(statusB.tokenUsage.promptTokens).toBe(0)
+    expect(statusB.runningJobs).toEqual([])
   })
 
   it("chat._handleActivity in DEFAULT scope routes to default status (v1 back-compat)", () => {
@@ -128,12 +127,12 @@ describe("scope propagation across cross-store actions", () => {
       prompt_tokens: 7,
     })
     const statusDefault = useStatusStore()
-    expect(statusDefault.tokenUsage.promptTokens).toBe(7)
+    expect(statusDefault.recentEvents.map((e) => e.type)).toEqual(["token_usage"])
 
     // Per-scope status store stays untouched — singleton activity
     // doesn't bleed sideways into a scoped namespace.
     const statusOther = useStatusStore("creature_other")
-    expect(statusOther.tokenUsage.promptTokens).toBe(0)
+    expect(statusOther.recentEvents).toEqual([])
   })
 })
 

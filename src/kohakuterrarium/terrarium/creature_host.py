@@ -27,6 +27,7 @@ from kohakuterrarium.core.config import (
 from kohakuterrarium.core.config_serde import pack_agent_config
 from kohakuterrarium.core.environment import Environment
 from kohakuterrarium.core.events import TriggerEvent
+from kohakuterrarium.core.token_ledger import context_window, token_snapshot
 from kohakuterrarium.core.turn import AgentEventStream, TurnResult
 from kohakuterrarium.llm.profiles import _login_provider_for
 from kohakuterrarium.packages.walk import package_snapshot
@@ -560,9 +561,10 @@ class Creature:
         """Return a status dict for HTTP / WS / TUI consumers.
 
         Every field the frontend reads is included — model,
-        max_context, compact_threshold, provider, session_id, tools,
-        subagents, pwd, plus ``is_privileged`` /
-        ``parent_creature_id`` for the group-tools view.
+        max_context, compact_threshold, running ``token_usage`` and
+        ``context_tokens``, provider, session_id, tools, subagents, pwd,
+        plus ``is_privileged`` / ``parent_creature_id`` for the
+        group-tools view.
         """
         agent = self.agent
         model = (
@@ -579,12 +581,8 @@ class Creature:
                 logger.warning(
                     "llm_identifier resolve failed", error=str(e), exc_info=True
                 )
-        max_context = getattr(agent.llm, "_profile_max_context", 0)
-        compact_threshold = 0
-        if agent.compact_manager and max_context:
-            compact_threshold = int(
-                max_context * agent.compact_manager.config.threshold
-            )
+        max_context, compact_threshold = context_window(agent)
+        tokens = token_snapshot(agent)
 
         profile_data: dict[str, str] = {"provider": getattr(agent.llm, "provider", "")}
         api_key_env = getattr(agent.llm, "api_key_env", "")
@@ -625,6 +623,8 @@ class Creature:
             "session_id": session_id,
             "max_context": max_context,
             "compact_threshold": compact_threshold,
+            "token_usage": tokens["token_usage"],
+            "context_tokens": tokens["context_tokens"],
             "running": self.is_running,
             "paused": self.paused,
             "killed": self._killed,

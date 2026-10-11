@@ -119,6 +119,35 @@ describe("graph model", () => {
     ).toEqual([["lead", "coder"]])
   })
 
+  it("prefers the canonical llm_name and carries backend token usage", () => {
+    const model = buildGraphModel({
+      version: 1,
+      graphs: [
+        {
+          graph_id: "g",
+          creatures: [
+            creature("worker", {
+              model: "gpt-5",
+              llm_name: "openai/gpt-5",
+              max_context: 200000,
+              token_usage: { prompt: 9000, completion: 1000, cached: 0, total: 10000 },
+              context_tokens: 4500,
+            }),
+            creature("fresh", { model: "raw-only" }),
+          ],
+          channels: [],
+          output_edges: [],
+        },
+      ],
+    })
+    const byName = Object.fromEntries(model.creatures.map((c) => [c.name, c]))
+    expect(byName.worker.model).toBe("openai/gpt-5")
+    expect(byName.worker.tokens).toBe(10000)
+    expect(byName.worker.contextTokens).toBe(4500)
+    expect(byName.fresh.model).toBe("raw-only")
+    expect(byName.fresh.tokens).toBe(0)
+  })
+
   it("maps cluster member graph ids back to the session and orders hosts host-first", () => {
     const model = buildGraphModel(snapshot)
     expect(model.memberToSession.g2_member).toBe("g2")

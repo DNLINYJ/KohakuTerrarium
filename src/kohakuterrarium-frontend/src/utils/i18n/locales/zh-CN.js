@@ -1492,6 +1492,8 @@ export default {
   "graph.field.config": "配置",
   "graph.field.session": "会话",
   "graph.field.tools": "工具",
+  "graph.field.tokens": "Token",
+  "graph.field.context": "上下文",
   "graph.field.subagents": "子代理",
   "graph.section.channels": "频道",
   "graph.section.wires": "输出接线",

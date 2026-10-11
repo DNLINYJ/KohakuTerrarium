@@ -230,6 +230,9 @@ function _mapSession(data) {
     llm_name: c.llm_name || "",
     max_context: c.max_context || 0,
     compact_threshold: c.compact_threshold || 0,
+    // Backend running usage; absent from older servers.
+    token_usage: c.token_usage || null,
+    context_tokens: c.context_tokens || 0,
     listen_channels: c.listen_channels || [],
     send_channels: c.send_channels || [],
     is_root: !!c.is_root,

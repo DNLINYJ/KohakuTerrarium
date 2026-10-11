@@ -1,9 +1,10 @@
 /**
  * Status dashboard store.
  *
- * Tracks session metadata, token usage, running jobs, and scratchpad
- * state. Populated from WebSocket activity events forwarded by the
- * chat store.
+ * Tracks running jobs, scratchpad state and a recent-activity ring.
+ * Populated from WebSocket activity events forwarded by the chat store.
+ * Per-creature model, context and token usage live in the chat store
+ * (``modelByTab`` / ``tokenUsage``), which is keyed by creature.
  *
  * Per-attach scope: each running creature has its own running-jobs
  * list, token usage, scratchpad, etc. Two attach tabs for two
@@ -20,23 +21,6 @@ import { injectScope, registerScopeDisposer } from "@/composables/useScope"
 
 const _options = {
   state: () => ({
-    sessionInfo: {
-      agentName: "",
-      sessionId: "",
-      model: "",
-      // Canonical ``provider/name[@variations]`` identifier — mirrors
-      // the chat store so Dashboard/Status surfaces can display the
-      // full form without reaching into the chat namespace.
-      llmName: "",
-      startTime: null,
-    },
-    tokenUsage: {
-      promptTokens: 0,
-      completionTokens: 0,
-      cachedTokens: 0,
-      contextPercent: 0,
-      compactThreshold: 0,
-    },
     /** @type {{ jobId: string, name: string, type: string, startTime: number, elapsed: number }[]} */
     runningJobs: [],
     /** @type {Object<string, string>} */
@@ -73,28 +57,7 @@ const _options = {
         this.recentEvents = this.recentEvents.slice(-100)
       }
 
-      if (at === "session_info") {
-        this.sessionInfo = {
-          agentName: data.agent_name || this.sessionInfo.agentName,
-          sessionId: data.session_id || this.sessionInfo.sessionId,
-          model: data.model || this.sessionInfo.model,
-          llmName: data.llm_name || this.sessionInfo.llmName,
-          startTime: data.start_time
-            ? new Date(data.start_time).getTime()
-            : this.sessionInfo.startTime || Date.now(),
-        }
-        if (data.compact_threshold) {
-          this.tokenUsage.compactThreshold = data.compact_threshold
-        }
-      } else if (at === "token_usage") {
-        this.tokenUsage = {
-          promptTokens: this.tokenUsage.promptTokens + (data.prompt_tokens || 0),
-          completionTokens: this.tokenUsage.completionTokens + (data.completion_tokens || 0),
-          cachedTokens: this.tokenUsage.cachedTokens + (data.cached_tokens || 0),
-          contextPercent: data.context_percent ?? this.tokenUsage.contextPercent,
-          compactThreshold: data.compact_threshold ?? this.tokenUsage.compactThreshold,
-        }
-      } else if (at === "tool_start") {
+      if (at === "tool_start") {
         const jobId = data.job_id || `job_${Date.now()}`
         this.runningJobs.push({
           jobId,
@@ -166,20 +129,6 @@ const _options = {
     /** Reset all status state (e.g. when switching instances) */
     reset() {
       this._clearElapsedTimer()
-      this.sessionInfo = {
-        agentName: "",
-        sessionId: "",
-        model: "",
-        llmName: "",
-        startTime: null,
-      }
-      this.tokenUsage = {
-        promptTokens: 0,
-        completionTokens: 0,
-        cachedTokens: 0,
-        contextPercent: 0,
-        compactThreshold: 0,
-      }
       this.runningJobs = []
       this.scratchpad = {}
       this.recentEvents = []

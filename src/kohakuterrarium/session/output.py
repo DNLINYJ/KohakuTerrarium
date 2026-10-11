@@ -69,6 +69,9 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         self._total_input_tokens: int = 0
         self._total_output_tokens: int = 0
         self._total_cached_tokens: int = 0
+        # The agent's own namespace persists the agent's running totals carried
+        # on ``token_usage`` frames; attached namespaces count their own.
+        self._derive_totals: bool = event_key_prefix is None
         # Event writes queued on the store's affinity thread, drained at
         # turn boundaries. Populated before recovery so the constructor can
         # queue without an event loop.

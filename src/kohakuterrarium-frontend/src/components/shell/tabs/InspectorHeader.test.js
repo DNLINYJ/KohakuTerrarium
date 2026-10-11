@@ -5,7 +5,6 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import InspectorHeader from "./InspectorHeader.vue"
 import { useChatStore } from "@/stores/chat"
 import { useSessionDetailStore } from "@/stores/sessionDetail"
-import { useStatusStore } from "@/stores/status"
 
 beforeEach(() => {
   const storage = new Map()
@@ -63,15 +62,65 @@ describe("InspectorHeader — token total source (Bug 1)", () => {
       llmName: "openai/gpt-5",
       model: "gpt-5",
     }
-    const status = useStatusStore("g1")
-    status.sessionInfo.model = "default-model"
 
     const wrapper = mountHeader({ id: "g1", model: "default-model" })
     expect(wrapper.text()).toContain("openai/gpt-5")
     expect(wrapper.text()).not.toContain("default-model")
     wrapper.unmount()
   })
+})
 
+describe("InspectorHeader — per-creature info (Bug 2)", () => {
+  it("keeps the described creature's model when a sibling's session_info arrives last", () => {
+    const chat = useChatStore("g1")
+    chat.tabs = ["root", "alice"]
+    chat.activeTab = "alice"
+    chat._handleActivity("alice", {
+      activity_type: "session_info",
+      agent_name: "alice",
+      llm_name: "anthropic/claude-a",
+      max_context: 1000,
+    })
+    chat._handleActivity("bob", {
+      activity_type: "session_info",
+      agent_name: "bob",
+      llm_name: "openai/gpt-b",
+      max_context: 1000,
+    })
+
+    const wrapper = mountHeader({ id: "g1", status: "running" })
+    expect(wrapper.text()).toContain("anthropic/claude-a")
+    expect(wrapper.text()).not.toContain("openai/gpt-b")
+    wrapper.unmount()
+  })
+
+  it("derives context % from the creature's context fill over its own window", () => {
+    const chat = useChatStore("g1")
+    chat.activeTab = "alice"
+    chat.modelByTab.alice = { llmName: "p/m", maxContext: 200000 }
+    chat._applyCreatureUsage(
+      "alice",
+      { prompt: 500000, completion: 1000, cached: 0, total: 501000 },
+      50000,
+    )
+
+    const wrapper = mountHeader({ id: "g1", status: "running" })
+    expect(wrapper.text()).toContain("25% ctx")
+    wrapper.unmount()
+  })
+
+  it("hides context % when the creature's window is unknown", () => {
+    const chat = useChatStore("g1")
+    chat.activeTab = "alice"
+    chat._applyCreatureUsage("alice", { prompt: 10, completion: 1, cached: 0, total: 11 }, 10)
+
+    const wrapper = mountHeader({ id: "g1", status: "running" })
+    expect(wrapper.text()).not.toContain("ctx")
+    wrapper.unmount()
+  })
+})
+
+describe("InspectorHeader — live total fallback", () => {
   it("falls back to the live chat total until the summary poll lands", () => {
     // Before the first session-detail summary poll returns, the header
     // shows the live chat total so it isn't blank on first paint.

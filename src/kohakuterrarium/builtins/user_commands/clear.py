@@ -1,6 +1,7 @@
 """Clear live conversation context while preserving recorded session history."""
 
 from kohakuterrarium.builtins.user_commands.registry import register_user_command
+from kohakuterrarium.core.token_ledger import reset_context_tokens
 from kohakuterrarium.session.snapshot import save_agent_snapshot
 from kohakuterrarium.modules.user_command.base import (
     BaseUserCommand,
@@ -17,12 +18,13 @@ async def _do_clear(context: UserCommandContext) -> str:
     agent = context.agent
     msgs = len(agent.controller.conversation.get_messages())
     agent.controller.flush()
+    reset_context_tokens(agent)
 
     # Activity notification keeps frontends and the session event log synchronized.
     agent.output_router.notify_activity(
         "context_cleared",
         f"Cleared {msgs} messages",
-        metadata={"messages_cleared": msgs},
+        metadata={"messages_cleared": msgs, "context_tokens": 0},
     )
 
     # Persisting after mutation ensures resume restores the cleared state.

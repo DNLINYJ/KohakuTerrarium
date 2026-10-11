@@ -197,6 +197,41 @@ class TestEmitTokenUsage:
         # No crash; activity still emitted.
         assert a.output_router.activity_calls
 
+    def test_frame_carries_running_totals_and_context(self):
+        a = _make_mixin()
+        first = {"prompt_tokens": 10, "completion_tokens": 5, "cached_tokens": 2}
+        second = {"prompt_tokens": 40, "completion_tokens": 3, "total_tokens": 43}
+        a._emit_token_usage(types.SimpleNamespace(_last_usage=first))
+        a._emit_token_usage(types.SimpleNamespace(_last_usage=second))
+        frames = [c[2] for c in a.output_router.activity_calls if c[0] == "token_usage"]
+        assert frames[1]["prompt_tokens"] == 40
+        assert frames[1]["totals"] == {
+            "prompt": 50,
+            "completion": 8,
+            "cached": 2,
+            "total": 58,
+        }
+        assert frames[1]["context_tokens"] == 40
+        # The controller's usage dict is not mutated by the frame build.
+        assert "totals" not in second
+
+    def test_totals_extend_the_persisted_slot(self):
+        a = _make_mixin()
+        a.session_store = types.SimpleNamespace(
+            state={
+                "alice:token_usage": {
+                    "total_input_tokens": 900,
+                    "total_output_tokens": 100,
+                    "total_cached_tokens": 0,
+                }
+            }
+        )
+        usage = {"prompt_tokens": 10, "completion_tokens": 1}
+        a._emit_token_usage(types.SimpleNamespace(_last_usage=usage))
+        frame = a.output_router.activity_calls[0][2]
+        assert frame["totals"]["prompt"] == 910
+        assert frame["totals"]["total"] == 1011
+
 
 # ── _cancel_handles ──────────────────────────────────────────────
 

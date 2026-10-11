@@ -521,6 +521,8 @@ def get_session(service: "TerrariumService", session_id: str) -> Session:
                     "llm_name": str(meta.get("llm_name", "") or ""),
                     "running": bool(meta.get("running", True)),
                     "is_privileged": bool(meta.get("is_privileged", False)),
+                    "token_usage": dict(meta.get("token_usage") or {}),
+                    "context_tokens": int(meta.get("context_tokens", 0) or 0),
                 }
             ],
             channels=[],
@@ -818,6 +820,8 @@ def list_creatures(service: "TerrariumService", session_id: str) -> list[dict]:
                 # Cached model metadata keeps remote creature listings informative.
                 "model": str(meta.get("model", "") or ""),
                 "llm_name": str(meta.get("llm_name", "") or ""),
+                "token_usage": dict(meta.get("token_usage") or {}),
+                "context_tokens": int(meta.get("context_tokens", 0) or 0),
             }
         ]
     raise KeyError(f"session {session_id!r} not found")

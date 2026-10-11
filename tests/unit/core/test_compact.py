@@ -28,6 +28,7 @@ from kohakuterrarium.core.compact_splice import (
 )
 from kohakuterrarium.core.compact_text import format_messages_for_summary
 from kohakuterrarium.core.conversation import Conversation
+from kohakuterrarium.core.token_ledger import ledger_for
 from kohakuterrarium.llm.message import create_message
 from kohakuterrarium.session.store import SessionStore
 
@@ -679,6 +680,20 @@ class TestRunCompact:
         await mgr._run_compact()
         assert mgr._compact_count == 1
         assert mgr._controller._last_usage == {}
+
+    async def test_full_flow_zeroes_reported_context_fill(self):
+        conv = _build_conversation(n_user=12)
+        router = _Router()
+        mgr = _build_mgr(conversation=conv, llm=_LLM(chunks=["S"]), router=router)
+        agent = types.SimpleNamespace(config=types.SimpleNamespace(name="alice"))
+        ledger_for(agent).add({"prompt_tokens": 90_000, "completion_tokens": 10})
+        mgr._agent = agent
+        await mgr._run_compact()
+        assert mgr._compact_count == 1
+        assert ledger_for(agent).context_tokens == 0
+        assert ledger_for(agent).totals()["prompt"] == 90_000
+        complete = next(c for c in router.calls if c[0] == "compact_complete")
+        assert complete[2]["context_tokens"] == 0
 
 
 # ── stale-usage guard (compact double-fire) ──────────────────────

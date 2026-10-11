@@ -306,9 +306,15 @@ class SessionActivityMixin:
         prompt = metadata.get("prompt_tokens", 0)
         completion = metadata.get("completion_tokens", 0)
         cached = metadata.get("cached_tokens", 0)
-        self._total_input_tokens += prompt
-        self._total_output_tokens += completion
-        self._total_cached_tokens += cached
+        totals = metadata.get("totals")
+        if getattr(self, "_derive_totals", False) and isinstance(totals, dict):
+            self._total_input_tokens = int(totals.get("prompt", 0) or 0)
+            self._total_output_tokens = int(totals.get("completion", 0) or 0)
+            self._total_cached_tokens = int(totals.get("cached", 0) or 0)
+        else:
+            self._total_input_tokens += prompt
+            self._total_output_tokens += completion
+            self._total_cached_tokens += cached
         self._record(
             "token_usage",
             {
@@ -318,7 +324,13 @@ class SessionActivityMixin:
                 "cached_tokens": cached,
             },
         )
-        # Namespace cumulative totals so attached agents cannot collide with hosts.
+        self._persist_token_totals(metadata.get("context_tokens", prompt))
+
+    def _persist_token_totals(self, last_prompt: int) -> None:
+        """Write this namespace's cumulative token slot.
+
+        Namespacing keeps attached agents from colliding with hosts.
+        """
         self._submit_store_write(
             self._store.save_state,
             self._event_key_prefix,
@@ -326,9 +338,16 @@ class SessionActivityMixin:
                 "total_input_tokens": self._total_input_tokens,
                 "total_output_tokens": self._total_output_tokens,
                 "total_cached_tokens": self._total_cached_tokens,
-                "last_prompt_tokens": prompt,
+                "last_prompt_tokens": last_prompt,
             },
         )
+
+    def _persist_context_fill(self, metadata: dict) -> None:
+        """Persist the context fill an event reports (compaction / clear zero it)."""
+        if "context_tokens" not in metadata:
+            return
+        self._ensure_token_totals_restored()
+        self._persist_token_totals(int(metadata.get("context_tokens") or 0))
 
     def _handle_compact_start(self, name: str, detail: str, metadata: dict) -> None:
         self._record(
@@ -355,6 +374,7 @@ class SessionActivityMixin:
                 "parent_branch_path": metadata.get("parent_branch_path"),
             },
         )
+        self._persist_context_fill(metadata)
 
     def _handle_compact_skipped(self, name: str, detail: str, metadata: dict) -> None:
         self._record(
@@ -394,6 +414,7 @@ class SessionActivityMixin:
             "context_cleared",
             {"messages_cleared": metadata.get("messages_cleared", 0)},
         )
+        self._persist_context_fill(metadata)
 
     def _handle_processing_error(self, name: str, detail: str, metadata: dict) -> None:
         self._record(
