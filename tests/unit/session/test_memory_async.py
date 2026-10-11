@@ -18,6 +18,11 @@ from kohakuterrarium.session.memory_async import (
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.studio.sessions import memory_search
 
+# Budget for work that must finish; never a bound on how fast it finishes.
+SETTLE = 30
+# A blocked model call outlives every SETTLE wait unless the test releases it.
+HOLD = 120
+
 
 class Embedder(BaseEmbedder):
     dimensions = 2
@@ -73,7 +78,7 @@ async def test_timeout_falls_back_without_spawning_more_model_calls(store, monke
 
     def blocked(config):
         calls.append(config)
-        assert release.wait(5)
+        assert release.wait(HOLD)
         return Embedder()
 
     try:
@@ -86,10 +91,14 @@ async def test_timeout_falls_back_without_spawning_more_model_calls(store, monke
         assert len(hits) == 2 and warning is None
         with pytest.raises(TimeoutError, match="still running"):
             await search(memory, blocked, mode="semantic")
-        await asyncio.wait_for(asyncio.to_thread(store.close, update_status=False), 1)
+        await asyncio.wait_for(
+            asyncio.to_thread(store.close, update_status=False), SETTLE
+        )
+        # Close returned while the model call is still blocked.
+        assert not memory._worker._pending.done()
     finally:
         release.set()
-        await asyncio.to_thread(memory._worker._pending.result, 2)
+        await asyncio.to_thread(memory._worker._pending.result, SETTLE)
 
 
 async def test_cancelled_search_never_installs_late_model(store):
@@ -98,18 +107,21 @@ async def test_cancelled_search_never_installs_late_model(store):
 
     def blocked(_):
         entered.set()
-        assert release.wait(5)
+        assert release.wait(HOLD)
         return Embedder()
 
     task = asyncio.create_task(search(memory, blocked))
     try:
-        assert await asyncio.to_thread(entered.wait, 2)
+        assert await asyncio.to_thread(entered.wait, SETTLE)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        await asyncio.wait_for(asyncio.to_thread(store.close, update_status=False), 1)
+        await asyncio.wait_for(
+            asyncio.to_thread(store.close, update_status=False), SETTLE
+        )
+        assert not memory._worker._pending.done()
         release.set()
-        await asyncio.to_thread(memory._worker._pending.result, 2)
+        await asyncio.to_thread(memory._worker._pending.result, SETTLE)
         assert memory._embedder is None
         assert memory._memory._vec is None
         with pytest.raises(RuntimeError, match="closed"):
@@ -148,7 +160,7 @@ async def test_studio_live_search_uses_same_isolation_and_cache(store, monkeypat
 
     def blocked(_):
         entered.set()
-        assert release.wait(5)
+        assert release.wait(HOLD)
         return Embedder()
 
     monkeypatch.setattr(memory_search, "create_embedder", blocked)
@@ -156,13 +168,15 @@ async def test_studio_live_search_uses_same_isolation_and_cache(store, monkeypat
         memory_search.search_session_memory(store.path, q="needle", engine=engine)
     )
     try:
-        assert await asyncio.to_thread(entered.wait, 2)
+        assert await asyncio.to_thread(entered.wait, SETTLE)
         result = await asyncio.wait_for(
             memory_search.search_session_memory(
                 store.path, q="needle", mode="fts", engine=engine
             ),
-            1,
+            SETTLE,
         )
+        # The keyword search answered while the model load is still blocked.
+        assert not store._live_memory._worker._pending.done()
         assert {hit["content"] for hit in result["results"]} == {
             "alice needle",
             "bob needle",
