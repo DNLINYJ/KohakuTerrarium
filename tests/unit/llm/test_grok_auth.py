@@ -388,6 +388,59 @@ class TestGrokTokens:
         assert calls == ["models"]
 
     @pytest.mark.asyncio
+    async def test_a_stale_read_finishing_after_the_refresh_does_not_rerun_it(
+        self, tmp_path, monkeypatch
+    ):
+        now = 2_000_000_000.0
+        grok_home = tmp_path / "grok"
+        grok_home.mkdir()
+        self._write_cli_auth(grok_home, "old", now + 60)
+        monkeypatch.setenv("GROK_HOME", str(grok_home))
+        monkeypatch.setattr("kohakuterrarium.llm.grok_auth.time.time", lambda: now)
+        refreshed = threading.Event()
+        real_load = grok_auth._load_grok_cli_token
+        loads = []
+
+        def load_second_read_late():
+            token = real_load()
+            loads.append(token.access_token if token else None)
+            # A second read that saw the old token returns only once the first
+            # refresh has fully finished and left the in-flight registry.
+            if len(loads) == 2 and loads[1] == "old":
+                assert refreshed.wait(10)
+                deadline = time.monotonic() + 10
+                while grok_auth._refresh_tasks and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            return token
+
+        calls = []
+
+        async def fake_models():
+            calls.append("models")
+            self._write_cli_auth(grok_home, "new", now + 6 * 3600)
+            refreshed.set()
+            return True
+
+        monkeypatch.setattr(
+            "kohakuterrarium.llm.grok_auth._load_grok_cli_token", load_second_read_late
+        )
+        monkeypatch.setattr(
+            "kohakuterrarium.llm.grok_auth._run_grok_models", fake_models
+        )
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(
+                    GrokTokens.ensure_fresh_cli(), GrokTokens.ensure_fresh_cli()
+                ),
+                30,
+            )
+        finally:
+            refreshed.set()
+
+        assert [item.access_token for item in results] == ["new", "new"]
+        assert calls == ["models"]
+
+    @pytest.mark.asyncio
     async def test_forced_refresh_rejects_an_unchanged_access_token(
         self, tmp_path, monkeypatch
     ):

@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import time
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +30,9 @@ _EXPIRY_SKEW_SECONDS = 30
 _GROK_CLI_REFRESH_WINDOW_SECONDS = 30 * 60
 _GROK_CLI_REFRESH_TIMEOUT_SECONDS = 20.0
 _refresh_tasks: dict[asyncio.AbstractEventLoop, asyncio.Task["GrokToken | None"]] = {}
+_refresh_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+    weakref.WeakKeyDictionary()
+)
 _grok_version_cache: dict[tuple[str, int], str] = {}
 _GROK_VERSION_PATTERN = re.compile(
     r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)*(?: \([0-9A-Fa-f]+\))?$"
@@ -100,23 +104,28 @@ class GrokTokens:
         Auth-file and version lookups run off the event loop. Unexpected refresh
         failures are redacted rather than returned with raw exception text.
         """
-        current = await asyncio.to_thread(_load_grok_cli_token)
-        if current is None:
-            return None
-        if not force and not _needs_cli_refresh(current):
-            return current
-
         loop = asyncio.get_running_loop()
-        task = _refresh_tasks.get(loop)
-        if task is None or task.done():
-            task = loop.create_task(_refresh_grok_cli(current, force=force))
-            _refresh_tasks[loop] = task
+        lock = _refresh_locks.get(loop)
+        if lock is None:
+            lock = _refresh_locks[loop] = asyncio.Lock()
+        # Joining a running refresh and reading-then-starting one are a single
+        # step, so no read can predate a refresh that has already finished.
+        async with lock:
+            task = _refresh_tasks.get(loop)
+            if task is None or task.done():
+                current = await asyncio.to_thread(_load_grok_cli_token)
+                if current is None:
+                    return None
+                if not force and not _needs_cli_refresh(current):
+                    return current
+                task = loop.create_task(_refresh_grok_cli(current, force=force))
+                _refresh_tasks[loop] = task
 
-            def clear(done: asyncio.Task[GrokToken | None]) -> None:
-                if _refresh_tasks.get(loop) is done:
-                    _refresh_tasks.pop(loop, None)
+                def clear(done: asyncio.Task[GrokToken | None]) -> None:
+                    if _refresh_tasks.get(loop) is done:
+                        _refresh_tasks.pop(loop, None)
 
-            task.add_done_callback(clear)
+                task.add_done_callback(clear)
         return await asyncio.shield(task)
 
 
