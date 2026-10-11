@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+import kohakuterrarium.core.agent_message_history as branch_history
 from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
 from kohakuterrarium.builtins.tools.canvas_image import CanvasImageTool
@@ -39,6 +40,7 @@ from kohakuterrarium.core.agent import Agent
 from kohakuterrarium.core.branch_continuation import (
     live_branch_path,
     load_persisted_branch_view,
+    persist_branch_view,
     selected_branch_view,
 )
 from kohakuterrarium.core.config_types import (
@@ -46,6 +48,7 @@ from kohakuterrarium.core.config_types import (
     InputConfig,
     OutputConfig,
 )
+from kohakuterrarium.builtins.user_commands.clear import ClearCommand
 from kohakuterrarium.core.conversation import Conversation
 from kohakuterrarium.core.events import (
     EventType,
@@ -63,6 +66,7 @@ from kohakuterrarium.llm.base import NativeToolCall
 from kohakuterrarium.llm.codex_format import to_responses_input
 from kohakuterrarium.llm.recovery import drop_last_tool_round
 from kohakuterrarium.session.raw_history import UserMessageSelector
+from kohakuterrarium.modules.user_command.base import UserCommandContext
 from kohakuterrarium.session.resume import resume_agent
 from kohakuterrarium.session.resume_build import build_conversation
 from kohakuterrarium.session.store import SessionStore
@@ -1526,7 +1530,7 @@ class TestCoreIntegration:
                     owner.cancel()
                 await asyncio.gather(owner, return_exceptions=True)
 
-    async def test_history_ops(self, make_creature, tmp_path):
+    async def test_history_ops(self, make_creature, tmp_path, monkeypatch):
         """One workflow over the three history operations: run a turn,
         ``regenerate_last_response`` opens a new branch, ``edit_and_rerun``
         replaces the user message and re-runs, ``rewind_to`` drops the
@@ -2092,6 +2096,68 @@ class TestCoreIntegration:
                 finally:
                     await restored.stop()
                     store.close()
+
+            sibling_view = dict(live_branch_path(restored))
+            switch_llm = ScriptedLLM(["before empty"])
+            switch_agent, store = resume_agent(path, io_mode="plain", llm=switch_llm)
+            try:
+                switch_agent.controller.config.include_job_status = False
+                await switch_agent.start()
+                await switch_agent.inject_input("before clear", branch_view=original)
+                assert "background-finished" in str(switch_llm.last_messages)
+                assert "summary SIBLING" not in str(switch_llm.last_messages)
+                raw_before = list(store.get_events("settled"))
+                sibling_checkpoint = store.load_branch_snapshot("settled", sibling_view)
+                if notify:
+                    await ClearCommand()._execute(
+                        "--force", UserCommandContext(agent=switch_agent)
+                    )
+                else:
+                    await switch_agent.rewind_to(0)
+                assert prefix(switch_agent.controller.conversation.to_messages()) == []
+                path = store.path
+            finally:
+                await switch_agent.stop()
+                store.close()
+
+            for cold_step, (cold_input, expected_provider) in enumerate(
+                [
+                    ("new input 1", [("user", "new input 1")]),
+                    (
+                        "new input 2",
+                        [
+                            ("user", "new input 1"),
+                            ("assistant", "fresh answer 1"),
+                            ("user", "new input 2"),
+                        ],
+                    ),
+                ],
+                start=1,
+            ):
+                fresh_llm = ScriptedLLM([f"fresh answer {cold_step}"])
+                fresh_agent, fresh_store = resume_agent(
+                    path, io_mode="plain", llm=fresh_llm
+                )
+                try:
+                    fresh_agent.controller.config.include_job_status = False
+                    await fresh_agent.start()
+                    await fresh_agent.inject_input(cold_input)
+                    assert prefix(fresh_llm.last_messages) == expected_provider
+                    assert fresh_agent.compact_manager._compact_count == 0
+                    assert (
+                        fresh_store.load_branch_snapshot("settled", sibling_view)[
+                            "messages"
+                        ]
+                        == sibling_checkpoint["messages"]
+                    )
+                    assert (
+                        fresh_store.get_events("settled")[: len(raw_before)]
+                        == raw_before
+                    )
+                    path = fresh_store.path
+                finally:
+                    await fresh_agent.stop()
+                    fresh_store.close()
             assert echo.calls == 2
             assert bg.calls == 1
 
@@ -2196,7 +2262,13 @@ class TestCoreIntegration:
                 compact_bg.release.set()
 
         resumed_llm = ScriptedLLM(
-            ["after compact", "edited tail", "rerun tail", "edited launch"]
+            [
+                "after compact",
+                "edited tail",
+                "rerun tail",
+                "edited launch",
+                "switch A reply",
+            ]
         )
         restored, restored_store = resume_agent(
             compact_path, io_mode="plain", llm=resumed_llm
@@ -2256,15 +2328,88 @@ class TestCoreIntegration:
             )
             assert prefix(resumed_llm.last_messages) == [("user", "launch edited")]
             assert "OLD_LAUNCH" not in str(resumed_llm.last_messages)
+            assert restored.compact_manager._compact_count == 0
+            await restored.stop()
+            await restored.start()
+            assert restored.compact_manager._compact_count == 0
+            original_view = {turn: 1 for turn in range(1, 6)}
+            checkpoint = restored_store.load_branch_snapshot(
+                "compactcold", original_view
+            )
+            replayed_ids = []
+            original_replay = branch_history.replay_with_settled_tools
+
+            def observe_replay(events, **kwargs):
+                replayed_ids.extend(
+                    evt["event_id"] for evt in events if "event_id" in evt
+                )
+                return original_replay(events, **kwargs)
+
+            with monkeypatch.context() as observation:
+                observation.setattr(
+                    branch_history, "replay_with_settled_tools", observe_replay
+                )
+                await restored.inject_input("switch A", branch_view=original_view)
+            assert all(event_id > checkpoint["watermark"] for event_id in replayed_ids)
+            assert prefix(resumed_llm.last_messages) == compacted + [
+                ("user", "after reopen"),
+                ("assistant", "after compact"),
+                ("user", "switch A"),
+            ]
+            assert restored.compact_manager._compact_count == 1
+            counter_reads = []
+            original_events = restored_store.get_events
+
+            def observe_counter_reads(*args, **kwargs):
+                counter_reads.append(args)
+                return original_events(*args, **kwargs)
+
+            with monkeypatch.context() as observation:
+                observation.setattr(restored_store, "get_events", observe_counter_reads)
+                restored.attach_session_store(restored_store)
+            assert counter_reads == []
+            assert restored.compact_manager._compact_count == 1
             assert (
                 restored_store.get_events("compactcold")[: len(raw_before_resume)]
                 == raw_before_resume
             )
             assert summary_llm.call_count == 1
             assert compact_bg.calls == 1
+            persist_branch_view(
+                restored_store, "compactcold", {turn: 1 for turn in range(1, 7)}
+            )
         finally:
             await restored.stop()
             restored_store.close()
+        retained_llm = ScriptedLLM(["retained A"])
+        retained, retained_store = resume_agent(
+            compact_path, io_mode="plain", llm=retained_llm
+        )
+        try:
+            await retained.start()
+            assert retained.compact_manager._compact_count == 1
+            await retained.inject_input("from retained A")
+            assert prefix(retained_llm.last_messages) == compacted + [
+                ("user", "after reopen"),
+                ("assistant", "after compact"),
+                ("user", "switch A"),
+                ("assistant", "switch A reply"),
+                ("user", "from retained A"),
+            ]
+            await retained.rewind_to(
+                retained.controller.conversation.find_last_user_index() + 1
+            )
+            assert [
+                m["content"]
+                for m in retained_store.load_branch_snapshot("compactcold", {1: 2})[
+                    "messages"
+                ]
+                if m["role"] == "user"
+            ] == ["launch edited"]
+
+        finally:
+            await retained.stop()
+            retained_store.close()
 
     async def test_inject_event_and_unified_trigger_model(self, make_creature):
         """The unified ``TriggerEvent`` model: a non-user-input event

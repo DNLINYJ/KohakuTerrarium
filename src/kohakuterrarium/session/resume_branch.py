@@ -5,20 +5,35 @@ decide whether a saved conversation snapshot still matches the branch the
 agent resumes onto, or must be rebuilt from the event log.
 """
 
-import re
 from typing import Any
 
 from kohakuterrarium.core.agent_message_history import (
-    include_settled_tool_results,
     replay_with_settled_tools,
+    snapshot_needs_settled_tool_replay as snapshot_needs_settled_tool_replay,
 )
 from kohakuterrarium.core.branch_continuation import load_persisted_branch_view
-from kohakuterrarium.core.conversation_elide import ELISION_MARKER, TOOL_FEEDBACK_KIND
-from kohakuterrarium.core.tool_output import render_content_text
+from kohakuterrarium.core.conversation_elide import TOOL_FEEDBACK_KIND
+from kohakuterrarium.core.snapshot_history import prepare_snapshot
 from kohakuterrarium.session.history import (
-    compact_covered_event_ids,
+    index_parent_paths,
+    resolve_selected_branches,
     select_live_event_ids,
 )
+
+
+def prepare_saved_snapshot(store, namespace: str, events: list[dict]) -> dict | None:
+    """Select a branch checkpoint under the persisted resume view."""
+    selected = resolve_selected_branches(
+        events, index_parent_paths(events), load_persisted_branch_view(store, namespace)
+    )
+    return prepare_snapshot(
+        store,
+        namespace,
+        events,
+        selected,
+        replay=replay_with_settled_tools,
+        needs_replay=snapshot_needs_settled_tool_replay,
+    )
 
 
 def snapshot_has_turn_metadata(snapshot: list[dict]) -> bool:
@@ -209,121 +224,6 @@ def snapshot_mismatches_branch(store: Any, agent: Any, agent_name: str) -> bool:
     snapshot_path = _safe_branch_path(branch.get("parent_branch_path")) + [(ti, bi)]
     agent_path = _safe_branch_path(a_ppath) + [(a_ti, a_bi)]
     return not is_path_prefix(snapshot_path, agent_path)
-
-
-def snapshot_needs_settled_tool_replay(
-    events: list[dict],
-    branch_view: dict[int, int] | None,
-    snapshot: list[dict] | None = None,
-) -> bool:
-    """Whether the snapshot still lacks a completed result for a live call."""
-    if not events:
-        return False
-    live_ids = select_live_event_ids(events, branch_view=branch_view)
-    projected = include_settled_tool_results(
-        events,
-        live_ids,
-        covered_event_ids=compact_covered_event_ids(events, branch_view),
-    )
-    needed: dict[str, set[str]] = {}
-    provider_ids: dict[str, str] = {}
-    alias_owners: dict[str, set[str]] = {}
-    for event in projected:
-        if event.get("type") != "tool_call":
-            continue
-        job_id = str(event.get("call_id") or event.get("job_id") or "")
-        provider_id = str(event.get("tool_call_id") or "")
-        if job_id:
-            alias_owners.setdefault(job_id, set()).add(job_id)
-            if provider_id:
-                provider_ids[job_id] = provider_id
-                alias_owners.setdefault(provider_id, set()).add(job_id)
-    for event in projected:
-        if not event.get("_settled_from_call"):
-            continue
-        job_id = str(event.get("call_id") or event.get("job_id") or "")
-        if not job_id:
-            continue
-        names = {
-            job_id,
-            provider_ids.get(job_id, ""),
-            str(event.get("tool_call_id") or ""),
-        }
-        names.discard("")
-        needed[job_id] = names
-        for name in names:
-            alias_owners.setdefault(name, set()).add(job_id)
-    if not needed:
-        return False
-    if not snapshot:
-        return True
-    present: set[str] = set()
-    for message in snapshot:
-        identities = _snapshot_result_identities(message)
-        if not identities:
-            continue
-        if not _snapshot_result_is_final(message):
-            continue
-        for identity in identities:
-            owners = alias_owners.get(identity, set())
-            if len(owners) == 1:
-                present.update(owners & needed.keys())
-    return any(job_id not in present for job_id in needed)
-
-
-def _snapshot_result_identities(message: dict) -> set[str]:
-    role = message.get("role")
-    metadata = (
-        message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
-    )
-    names: set[str] = set()
-    if role != "tool" and not (
-        role == "user" and metadata.get("kind") == TOOL_FEEDBACK_KIND
-    ):
-        return names
-    for key in ("job_id", "call_id"):
-        if metadata.get(key):
-            names.add(str(metadata[key]))
-    job_ids = metadata.get("job_ids")
-    if isinstance(job_ids, list):
-        names.update(str(value) for value in job_ids if value)
-    if names:
-        return names
-    if role == "tool":
-        identity = str(message.get("tool_call_id") or "")
-        return {identity} if identity else set()
-    content = render_content_text(message.get("content") or "")
-    names.update(
-        re.findall(
-            r"(?:\A|\n\n)\[Tool ([^\]\n]+?) "
-            r"(?:completed|failed(?:, exit [^\]\n]+)?|cancelled)\](?=\n|\Z)",
-            content,
-        )
-    )
-    return names
-
-
-def _snapshot_result_is_final(message: dict) -> bool:
-    metadata = (
-        message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
-    )
-    phase = metadata.get("tool_result_phase")
-    if phase == "pending":
-        return False
-    if phase == "final":
-        return True
-    content = render_content_text(message.get("content") or "")
-    if re.match(
-        r"^(?:\[[^\]\n]+\] )?(?:Running in background — task delegated\.|"
-        r"Promoted to background\. Result arrives in a later turn\.)",
-        content,
-    ):
-        return False
-    if metadata.get("tool_results_elided") or ELISION_MARKER in content:
-        return True
-    if message.get("role") == "user" and metadata.get("kind") == TOOL_FEEDBACK_KIND:
-        return bool(_snapshot_result_identities(message))
-    return True
 
 
 def replayed_messages_for(

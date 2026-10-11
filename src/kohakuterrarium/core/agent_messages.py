@@ -33,6 +33,7 @@ from kohakuterrarium.core.events import EventType, TriggerEvent
 from kohakuterrarium.errors import ConflictError
 from kohakuterrarium.llm.message import normalize_content_parts
 from kohakuterrarium.session.history import replay_conversation
+from kohakuterrarium.session.snapshot import save_agent_snapshot
 from kohakuterrarium.session.raw_history import (
     UserMessageSelector,
     append_user_event_pair,
@@ -387,8 +388,11 @@ class AgentMessagesMixin:
             logger.info("Rewound", index=message_idx, dropped=len(removed))
             if self.session_store:
                 try:
-                    self.session_store.save_conversation(
-                        self.config.name, conv.snapshot_messages()
+                    save_agent_snapshot(
+                        self.session_store,
+                        self.config.name,
+                        self,
+                        conv.snapshot_messages(),
                     )
                 except Exception as e:
                     logger.warning(

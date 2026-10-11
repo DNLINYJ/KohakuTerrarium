@@ -2,8 +2,16 @@
 
 from typing import Any, Protocol
 
+from kohakuterrarium.core.agent_message_history import (
+    replay_with_settled_tools,
+    snapshot_needs_settled_tool_replay,
+)
 from kohakuterrarium.core.compact_branch import compact_rule_from_event
 from kohakuterrarium.core.conversation import Conversation
+from kohakuterrarium.core.snapshot_history import (
+    prepare_snapshot,
+    replayed_compact_state,
+)
 from kohakuterrarium.llm.message import dicts_to_messages
 from kohakuterrarium.session.history import (
     compact_covered_event_ids,
@@ -86,13 +94,29 @@ def reload_raw_prefix_for_target(
     # restore stream order so replay sees a monotonic event stream (its
     # pending-summary flush/drop logic assumes one).
     raw_events.sort(key=lambda evt: evt.get("event_id", 0))
-    messages = replay_conversation(
-        normalize_tool_call_events(
-            raw_events,
-            covered_event_ids=compact_covered_event_ids(raw_events, prefix.branch_view),
-        ),
-        branch_view=prefix.branch_view,
-        include_metadata=True,
+    prepared = prepare_snapshot(
+        agent.session_store,
+        agent.config.name,
+        all_events,
+        prefix.branch_view,
+        replay=replay_with_settled_tools,
+        needs_replay=snapshot_needs_settled_tool_replay,
+        before_turn=target.turn_index,
+    )
+    messages = (
+        prepared["messages"]
+        + replay_conversation([prefix.target], include_metadata=True)
+        if prepared
+        else replay_conversation(
+            normalize_tool_call_events(
+                raw_events,
+                covered_event_ids=compact_covered_event_ids(
+                    raw_events, prefix.branch_view
+                ),
+            ),
+            branch_view=prefix.branch_view,
+            include_metadata=True,
+        )
     )
     persisted_messages = dicts_to_messages(messages)
     for raw_message, message in zip(messages, persisted_messages):
@@ -112,6 +136,16 @@ def reload_raw_prefix_for_target(
     for message in persisted_messages:
         conversation.append_message(message)
     agent.controller.conversation = conversation
+    agent._context_cutoff_event_id = (
+        prepared.get("context_cutoff_event_id", 0) if prepared is not None else 0
+    )
+    manager = getattr(agent, "compact_manager", None)
+    if manager is not None:
+        state = (
+            prepared["compact_state"] if prepared else replayed_compact_state(messages)
+        )
+        manager._compact_count = state["compact_count"]
+        manager._last_compact_time = state["last_compact_time"]
     agent._turn_index = target.turn_index
     agent._branch_id = target.branch_id
     agent._parent_branch_path = [

@@ -285,6 +285,7 @@ class TestSessionIntegration:
             # turn-end; seed a value and run one more turn so it persists
             # and the snapshot covers every activity event above.
             agent.session.scratchpad.set("project", "terrarium")
+            agent.compact_manager._compact_count = 3
             await agent._process_event(create_user_input_event("remember the project"))
         finally:
             await agent.stop()
@@ -336,10 +337,6 @@ class TestSessionIntegration:
         assert any(
             "channel" in str(h.get("meta", {}).get("type", "")) for h in search_hits
         )
-
-        # Persist compact state the way the runtime does (compact_manager
-        # writes this; attach_session_store reads it back on resume).
-        store.save_state("scribe", compact_count=3)
 
         # The append-only event log is the source of truth on resume.
         # The ``user_input`` events ARE exactly the real user turns
@@ -652,7 +649,6 @@ class TestSessionIntegration:
             )
             # Scratchpad restored exactly.
             assert resumed_agent.session.scratchpad.get("project") == "terrarium"
-            # Compact state restored from store.state.
             assert resumed_agent.compact_manager._compact_count == 3
             # The store was re-attached and marked running for continued
             # recording.

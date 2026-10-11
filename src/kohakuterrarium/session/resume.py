@@ -33,6 +33,7 @@ from kohakuterrarium.session.resume_open import (
 )
 from kohakuterrarium.session.resume_branch import (
     backfill_turn_metadata,
+    prepare_saved_snapshot,
     replayed_messages_for,
     snapshot_has_turn_metadata,
     snapshot_mismatches_branch,
@@ -77,10 +78,14 @@ def _create_io_modules(
             )
 
 
+_UNPREPARED = object()
+
+
 def _load_conversation_with_replay_fallback(
     store: SessionStore,
     agent_name: str,
     events: list[dict] | None = None,
+    prepared: dict | None | object = _UNPREPARED,
 ) -> list[dict] | None:
     """Load the conversation snapshot and replay events when it is stale.
 
@@ -90,17 +95,19 @@ def _load_conversation_with_replay_fallback(
     log, shared across the resume helpers so one scan serves them all;
     without it the store is read here.
 
-    Deliberately NO counter-based freshness shortcut: the persisted event
-    counter is NOT an upper bound of the event table. ``append_event``
-    flushes the events cache BEFORE ``persist_event_counter`` runs, and
-    that persist swallows failures (session/store.py), so the stored
-    counter can lag the table by any amount. A snapshot watermarked at a
-    lagging counter would then pass a ``cached_up_to >= counter`` check
-    while newer events exist, silently dropping the tail replay.
     """
     snapshot = store.load_conversation(agent_name)
     if events is None:
         events = store.get_events(agent_name)
+    if prepared is _UNPREPARED:
+        prepared = prepare_saved_snapshot(store, agent_name, events)
+    if prepared:
+        return prepared["messages"]
+    try:
+        if store.state.get(f"{agent_name}:branch_snapshots"):
+            return replayed_messages_for(store, agent_name, events)
+    except (KeyError, TypeError, AttributeError):
+        pass
     if not events:
         return snapshot
     last_event_id = 0
@@ -315,8 +322,14 @@ def inject_saved_state(agent, store: SessionStore, agent_name: str) -> None:
     # ONE raw read of the event log feeds every consumer below (conversation
     # replay, branch restore, mismatch replay) — not the old 3-4 scans.
     events = store.get_events(agent_name)
-    saved_messages = _load_conversation_with_replay_fallback(store, agent_name, events)
-    if saved_messages:
+    prepared = prepare_saved_snapshot(store, agent_name, events)
+    agent._context_cutoff_event_id = (
+        prepared.get("context_cutoff_event_id", 0) if prepared is not None else 0
+    )
+    saved_messages = _load_conversation_with_replay_fallback(
+        store, agent_name, events, prepared
+    )
+    if saved_messages is not None:
         agent.controller.conversation = _build_conversation(saved_messages)
         _apply_restore_elision(agent)
         logger.info(
@@ -328,8 +341,11 @@ def inject_saved_state(agent, store: SessionStore, agent_name: str) -> None:
     # Rebuild from the event log only when the snapshot is on another branch
     # or omits a completed ancestor tool result that the selected view needs.
     persisted = load_persisted_branch_view(store, agent_name)
-    if snapshot_mismatches_branch(store, agent, agent_name) or (
-        snapshot_needs_settled_tool_replay(events, persisted, snapshot=saved_messages)
+    if prepared is None and (
+        snapshot_mismatches_branch(store, agent, agent_name)
+        or snapshot_needs_settled_tool_replay(
+            events, persisted, snapshot=saved_messages
+        )
     ):
         logger.info(
             "Replaying target branch for resume",
@@ -470,16 +486,9 @@ def _rebuild_resumed_agent(
     input_module: InputModule | None,
     output_module: OutputModule | None,
 ) -> tuple[Agent, str]:
-    """Rebuild an agent from an open store, up to state injection.
-
-    Returns ``(agent, saved_agent_name)``. Everything after this point —
-    injection, status marking, store attachment — is kept separate so the
-    async resume flow can dispatch the injection onto the store's affinity
-    thread without duplicating the rebuild checks.
-    """
+    """Rebuild an agent and return its persisted namespace before state injection."""
     meta = store.load_meta()
 
-    # Missing type metadata follows detection's agent default for partial mirrors.
     config_type = meta.get("config_type")
     if config_type not in (None, "", "agent"):
         raise ValueError(
@@ -496,7 +505,6 @@ def _rebuild_resumed_agent(
     if not config_path and not config_snapshot:
         raise ValueError("Session has no config_path or config_snapshot in metadata")
 
-    # Pass workspace explicitly; process-wide directory changes race other sessions.
     saved_pwd = meta.get("pwd")
     pwd = pwd_override or saved_pwd
     if not (pwd and os.path.isdir(pwd)):
@@ -506,7 +514,6 @@ def _rebuild_resumed_agent(
             "Choose a replacement directory or open the session history."
         )
 
-    # Explicit module instances take precedence over the mode shortcut.
     io_kwargs: dict[str, Any] = {}
     if input_module is not None or output_module is not None:
         if input_module is not None:
@@ -518,7 +525,6 @@ def _rebuild_resumed_agent(
         io_kwargs["input_module"] = inp
         io_kwargs["output_module"] = out
 
-    # Resolution order is caller override, saved profile, then provider default.
     effective_llm = llm
     if not effective_llm:
         try:
@@ -528,7 +534,6 @@ def _rebuild_resumed_agent(
         except (KeyError, Exception):
             pass
 
-    # Embedded snapshots support inline-spawn and cross-node resume.
     agent = _rebuild_agent(
         config_path=config_path,
         config_snapshot=config_snapshot,
@@ -549,7 +554,6 @@ def _attach_resumed_agent(
     mark_conversation_open: bool,
 ) -> tuple[Agent, SessionStore]:
     """Mark the conversation open and attach the store for continued turns."""
-    # Continued turns append to the same session file.
     if mark_conversation_open:
         _mark_conversation_open(store)
         store.update_status("running")

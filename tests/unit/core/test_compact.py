@@ -9,6 +9,7 @@ import pytest
 
 from kohakuterrarium.core.compact_branch import (
     compute_replaced_range,
+    persist_compacted_async,
     summary_source_path,
     current_path,
 )
@@ -28,6 +29,7 @@ from kohakuterrarium.core.compact_splice import (
 from kohakuterrarium.core.compact_text import format_messages_for_summary
 from kohakuterrarium.core.conversation import Conversation
 from kohakuterrarium.llm.message import create_message
+from kohakuterrarium.session.store import SessionStore
 
 # ── stubs ────────────────────────────────────────────────────────
 
@@ -1378,6 +1380,70 @@ class TestCurrentPathResilience:
 
 
 class TestTagSnapshotBranch:
+    async def test_compact_checkpoint_captures_messages_path_and_watermark_before_store_wait(
+        self, tmp_path, monkeypatch
+    ):
+        store = SessionStore(tmp_path / "frozen.kohakutr")
+        entered, release = asyncio.Event(), asyncio.Event()
+        original_run = store.run
+
+        async def gated_run(fn, *args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await original_run(fn, *args, **kwargs)
+
+        monkeypatch.setattr(store, "run", gated_run)
+        conv = _build_conversation(n_user=1)
+        conv.get_messages()[1].metadata.update(turn_index=1, branch_id=1)
+        agent = types.SimpleNamespace(
+            _turn_index=1, _branch_id=1, _parent_branch_path=[]
+        )
+        store.append_event(
+            "alice", "user_message", {"content": "u0"}, turn_index=1, branch_id=1
+        )
+        watermark = store.max_event_id("alice")
+        task = asyncio.create_task(
+            persist_compacted_async(store, "alice", agent, conv, 2, 10.0)
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            agent._parent_branch_path.append((1, 1))
+            agent._turn_index = 2
+            conv.append("user", "later", metadata={"turn_index": 2, "branch_id": 1})
+            store.append_event(
+                "alice",
+                "user_message",
+                {"content": "later"},
+                turn_index=2,
+                branch_id=1,
+                parent_branch_path=[(1, 1)],
+            )
+            extra_reads = []
+
+            def unexpected_scan(*args, **kwargs):
+                extra_reads.append(args)
+                raise AssertionError(
+                    "Checkpoint counters must not rescan the event log"
+                )
+
+            monkeypatch.setattr(store, "get_events", unexpected_scan)
+            release.set()
+            await task
+            assert extra_reads == []
+            record = store.load_branch_snapshot("alice", {1: 1})
+            assert record["path"] == [[1, 1]] and record["watermark"] == watermark
+            assert [
+                m["content"] for m in record["messages"] if m["role"] == "user"
+            ] == ["u0"]
+            assert record["compact_state"] == {
+                "compact_count": 2,
+                "last_compact_time": 10.0,
+            }
+        finally:
+            release.set()
+            await task
+            store.close()
+
     def _store_and_agent(self, turn=3, branch=2, path=None):
         from types import SimpleNamespace
 

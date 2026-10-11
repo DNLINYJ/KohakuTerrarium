@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from kohakuterrarium.core.compact_splice import is_real_user_message
+from kohakuterrarium.session.snapshot import snapshot_tag
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -352,27 +353,45 @@ def persist_compacted(
     conversation: Any,
     compact_count: int,
     last_compact_time: float,
+    *,
+    captured: tuple[list[dict], dict, int] | None = None,
 ) -> None:
-    """Persist the compacted conversation snapshot + compact state.
-
-    The splice runs mid-turn: the in-flight tail announcement is preserved so
-    resume can reconstruct the active round. The snapshot is tagged with the
-    branch it was created on, and compact_count / watermark / cooldown are
-    stored for resume continuity.
-    """
+    """Persist a compacted conversation and its matching branch checkpoint."""
     try:
-        store.save_conversation(
-            agent_name,
+        messages, branch, watermark = captured or (
             conversation.snapshot_messages(preserve_pending_tail=True),
+            snapshot_tag(agent),
+            max(
+                (
+                    evt.get("event_id", 0)
+                    for evt in read_agent_events(store, agent_name)
+                ),
+                default=0,
+            ),
         )
+        saver = getattr(store, "save_branch_snapshot", None)
+        if callable(saver):
+            saver(
+                agent_name,
+                messages,
+                branch=branch,
+                watermark=watermark,
+                compact_state={
+                    "compact_count": compact_count,
+                    "last_compact_time": last_compact_time,
+                },
+            )
+        else:
+            store.save_conversation(agent_name, messages)
     except Exception as e:
         logger.warning(
             "Failed to save compacted conversation",
             error=str(e),
             exc_info=True,
         )
-    tag_snapshot_branch(store, agent, agent_name)
-    persist_compact_state(store, agent_name, compact_count, last_compact_time)
+    if not callable(getattr(store, "save_branch_snapshot", None)):
+        tag_snapshot_branch(store, agent, agent_name)
+        persist_compact_state(store, agent_name, compact_count, last_compact_time)
 
 
 async def persist_compacted_async(
@@ -383,12 +402,15 @@ async def persist_compacted_async(
     compact_count: int,
     last_compact_time: float,
 ) -> None:
-    """Off-loop twin of :func:`persist_compacted`.
-
-    Runs on the store's affinity thread when it has one (FIFO after any
-    queued writes), else on a plain worker thread; compaction dispatches
-    this only after a drain barrier, so no queued write can interleave.
-    """
+    """Persist one captured checkpoint on the store's affinity thread."""
+    captured = (
+        deepcopy(conversation.snapshot_messages(preserve_pending_tail=True)),
+        snapshot_tag(agent),
+        max(
+            (evt.get("event_id", 0) for evt in read_agent_events(store, agent_name)),
+            default=0,
+        ),
+    )
     run = getattr(store, "run", None)
     if callable(run):
         await run(
@@ -399,6 +421,7 @@ async def persist_compacted_async(
             conversation,
             compact_count,
             last_compact_time,
+            captured=captured,
         )
     else:
         await asyncio.to_thread(
@@ -409,25 +432,26 @@ async def persist_compacted_async(
             conversation,
             compact_count,
             last_compact_time,
+            captured=captured,
         )
 
 
 def persist_compact_state(
     store: Any, agent_name: str, compact_count: int, last_compact_time: float
 ) -> None:
-    """Persist compact_count + snapshot watermark + cooldown timestamp.
-
-    Restoring ``last_compact_time`` on resume keeps the cooldown window so a
-    quick resume does not permit an immediate re-compact (audit finding 3j).
-    """
+    """Persist compact counters and the watermark for legacy snapshot stores."""
     try:
-        last_event_id = 0
-        for evt in store.get_events(agent_name):
-            eid = evt.get("event_id")
-            if isinstance(eid, int) and eid > last_event_id:
-                last_event_id = eid
         store.save_state(agent_name, compact_count=compact_count)
-        store.state[f"{agent_name}:snapshot_event_id"] = last_event_id
+        if not callable(getattr(store, "save_branch_snapshot", None)):
+            last_event_id = max(
+                (
+                    evt["event_id"]
+                    for evt in store.get_events(agent_name)
+                    if isinstance(evt.get("event_id"), int)
+                ),
+                default=0,
+            )
+            store.state[f"{agent_name}:snapshot_event_id"] = last_event_id
         store.state[f"{agent_name}:last_compact_time"] = last_compact_time
     except Exception as e:
         logger.warning(

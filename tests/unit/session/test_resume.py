@@ -11,8 +11,11 @@ import time
 
 import pytest
 
+import kohakuterrarium.session.resume as resume_mod
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
+from kohakuterrarium.core.agent_compact import restore_compact_state_from_session
+from kohakuterrarium.core.compact import CompactConfig, CompactManager
 from kohakuterrarium.core.agent_handlers import _BG_PLACEHOLDER
 from kohakuterrarium.core.agent_message_history import replay_with_settled_tools
 from kohakuterrarium.core.controller_context import format_events_for_context
@@ -508,6 +511,88 @@ class TestAlignAgentName:
 
 
 class TestLoadConversationFallback:
+    @pytest.mark.parametrize(
+        "rejection", ["compact_after_snapshot", "future_watermark"]
+    )
+    def test_rejected_branch_record_cannot_reuse_its_latest_mirror(
+        self, tmp_path, rejection, monkeypatch
+    ):
+        store = SessionStore(tmp_path / "rejected.kohakutr")
+        try:
+            store.append_event(
+                "alice",
+                "user_message",
+                {"content": "raw user"},
+                turn_index=1,
+                branch_id=1,
+            )
+            store.append_event(
+                "alice",
+                "text_chunk",
+                {"content": "raw answer", "chunk_seq": 0},
+                turn_index=1,
+                branch_id=1,
+            )
+            store.save_branch_snapshot(
+                "alice",
+                [
+                    {
+                        "role": "user",
+                        "content": "snapshot user",
+                        "metadata": {"turn_index": 1, "branch_id": 1},
+                    },
+                    {"role": "assistant", "content": "snapshot answer"},
+                ],
+                branch={"turn_index": 1, "branch_id": 1},
+                watermark=(
+                    999
+                    if rejection == "future_watermark"
+                    else store.max_event_id("alice")
+                ),
+            )
+            if rejection == "compact_after_snapshot":
+                store.append_event(
+                    "alice",
+                    "compact_complete",
+                    {
+                        "summary": "new summary",
+                        "round": 1,
+                        "replaced_from_event_id": 1,
+                        "replaced_to_event_id": 2,
+                        "compact_path": [[1, 1]],
+                        "compact_source_path": [[1, 1]],
+                    },
+                    turn_index=1,
+                    branch_id=1,
+                )
+                expected = [
+                    "[Previous context summary (compact round 1)]\n\nnew summary"
+                ]
+            else:
+                expected = ["raw user", "raw answer"]
+            preparations = []
+            prepare = resume_mod.prepare_saved_snapshot
+
+            def observe_prepare(*args):
+                preparations.append(True)
+                return prepare(*args)
+
+            monkeypatch.setattr(resume_mod, "prepare_saved_snapshot", observe_prepare)
+            assert [
+                m["content"]
+                for m in _load_conversation_with_replay_fallback(store, "alice")
+            ] == expected
+            assert preparations == [True]
+            assert [
+                m["content"]
+                for m in _load_conversation_with_replay_fallback(
+                    store, "alice", prepared=None
+                )
+            ] == expected
+            assert preparations == [True]
+        finally:
+            store.close()
+
     def test_no_events_returns_snapshot(self, tmp_path):
         store = SessionStore(str(tmp_path / "x.kohakutr"))
         try:
@@ -2830,7 +2915,8 @@ class TestResumeAgent:
         finally:
             store.close()
 
-    def test_crowded_resume_elides_stale_tool_results(self, tmp_path):
+    @pytest.mark.parametrize("snapshot_kind", ["legacy", "branch"])
+    def test_crowded_resume_elides_stale_tool_results(self, tmp_path, snapshot_kind):
         store = SessionStore(str(tmp_path / "x.kohakutr"))
         try:
             big = "y" * 1_000_000
@@ -2871,10 +2957,48 @@ class TestResumeAgent:
                     {"role": "assistant", "content": "latest"},
                 ],
             )
+            cooldown = time.time()
+            if snapshot_kind == "branch":
+                messages = store.load_conversation("alice")
+                for turn, message in enumerate(
+                    (msg for msg in messages if msg["role"] == "user"), 1
+                ):
+                    message["metadata"] = {"turn_index": turn, "branch_id": 1}
+                    store.append_event(
+                        "alice",
+                        "user_message",
+                        {"content": message["content"]},
+                        turn_index=turn,
+                        branch_id=1,
+                        parent_branch_path=[(t, 1) for t in range(1, turn)],
+                    )
+                store.save_branch_snapshot(
+                    "alice",
+                    messages,
+                    branch={
+                        "turn_index": 2,
+                        "branch_id": 1,
+                        "parent_branch_path": [[1, 1]],
+                    },
+                    watermark=store.max_event_id("alice"),
+                    compact_state={"compact_count": 2, "last_compact_time": cooldown},
+                )
             agent = _FakeAgentForInject()
             agent.config = _ElideConfig()
             agent.controller.config = _ElideConfig()
+            agent.compact_manager = CompactManager(
+                CompactConfig(max_tokens=2000, cooldown_seconds=30)
+            )
+            agent.compact_manager._agent = agent
             inject_saved_state(agent, store, "alice")
+            if snapshot_kind == "branch":
+                for _ in range(2):
+                    restore_compact_state_from_session(
+                        agent.compact_manager, store, "alice"
+                    )
+                    assert agent.compact_manager._compact_count == 2
+                    assert agent.compact_manager._last_compact_time == cooldown
+                    assert not agent.compact_manager.should_compact(2000)
             from kohakuterrarium.core.conversation_elide import ELISION_MARKER
 
             contents = [

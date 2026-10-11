@@ -4,6 +4,7 @@
 
 import asyncio
 import types
+from contextlib import closing
 from unittest.mock import AsyncMock
 
 
@@ -18,6 +19,7 @@ from kohakuterrarium.core.agent_compact import (
 )
 from kohakuterrarium.core.agent_lifecycle import AgentLifecycleMixin
 from kohakuterrarium.core.conversation import Conversation, ConversationConfig
+from kohakuterrarium.session.store import SessionStore
 
 # ── agent_lifecycle.AgentLifecycleMixin ──────────────────────────
 
@@ -290,7 +292,7 @@ class TestRestoreCompactState:
         restore_compact_state_from_session(mgr, store, "alice")
         assert mgr._compact_count == 5
 
-    def test_loads_last_compact_time(self):
+    def test_loads_last_compact_time(self, tmp_path):
         mgr = types.SimpleNamespace()
         store = types.SimpleNamespace(
             state={
@@ -300,6 +302,35 @@ class TestRestoreCompactState:
         )
         restore_compact_state_from_session(mgr, store, "alice")
         assert mgr._last_compact_time == 1234.5
+        with closing(SessionStore(tmp_path / "state.kohakutr")) as store:
+            store.append_event(
+                "alice",
+                "user_message",
+                {"content": "original"},
+                turn_index=1,
+                branch_id=1,
+            )
+            conv = Conversation()
+            conv.append("user", "original", metadata={"turn_index": 1, "branch_id": 1})
+            store.save_branch_snapshot(
+                "alice",
+                conv.snapshot_messages(),
+                branch={"turn_index": 1, "branch_id": 1},
+                watermark=store.max_event_id("alice"),
+                compact_state={"compact_count": 2, "last_compact_time": 1234.5},
+            )
+            store.state["alice:compact_count"] = 9
+            store.state["alice:last_compact_time"] = 9999.0
+            conv.append("user", "new tail", metadata={"turn_index": 2, "branch_id": 1})
+            agent = types.SimpleNamespace(
+                _turn_index=2,
+                _branch_id=1,
+                _parent_branch_path=[(1, 1)],
+                controller=types.SimpleNamespace(conversation=conv),
+            )
+            mgr = types.SimpleNamespace(_agent=agent)
+            restore_compact_state_from_session(mgr, store, "alice")
+            assert (mgr._compact_count, mgr._last_compact_time) == (2, 1234.5)
 
     def test_bad_value_silently_ignored(self):
         mgr = types.SimpleNamespace()

@@ -1,9 +1,12 @@
 """Branch-aware history lookup helpers for agent message mutations."""
 
+import re
 from collections.abc import Callable
 from typing import Any
 
 from kohakuterrarium.core.conversation_elide import (
+    ELISION_MARKER,
+    TOOL_FEEDBACK_KIND,
     elide_stale_tool_results,
     estimate_tokens,
 )
@@ -11,6 +14,11 @@ from kohakuterrarium.core.message_locator import (
     user_message_indices_for_content,
     user_message_indices_for_turn,
 )
+from kohakuterrarium.core.snapshot_history import (
+    prepare_snapshot,
+    replayed_compact_state,
+)
+from kohakuterrarium.core.tool_output import render_content_text
 from kohakuterrarium.session.history import (
     compact_covered_event_ids,
     normalize_resumable_events,
@@ -312,6 +320,121 @@ def replay_with_settled_tools(
     )
 
 
+def snapshot_needs_settled_tool_replay(
+    events: list[dict],
+    branch_view: dict[int, int] | None,
+    snapshot: list[dict] | None = None,
+) -> bool:
+    """Whether the snapshot still lacks a completed result for a live call."""
+    if not events:
+        return False
+    live_ids = select_live_event_ids(events, branch_view=branch_view)
+    projected = include_settled_tool_results(
+        events,
+        live_ids,
+        covered_event_ids=compact_covered_event_ids(events, branch_view),
+    )
+    needed: dict[str, set[str]] = {}
+    provider_ids: dict[str, str] = {}
+    alias_owners: dict[str, set[str]] = {}
+    for event in projected:
+        if event.get("type") != "tool_call":
+            continue
+        job_id = str(event.get("call_id") or event.get("job_id") or "")
+        provider_id = str(event.get("tool_call_id") or "")
+        if job_id:
+            alias_owners.setdefault(job_id, set()).add(job_id)
+            if provider_id:
+                provider_ids[job_id] = provider_id
+                alias_owners.setdefault(provider_id, set()).add(job_id)
+    for event in projected:
+        if not event.get("_settled_from_call"):
+            continue
+        job_id = str(event.get("call_id") or event.get("job_id") or "")
+        if not job_id:
+            continue
+        names = {
+            job_id,
+            provider_ids.get(job_id, ""),
+            str(event.get("tool_call_id") or ""),
+        }
+        names.discard("")
+        needed[job_id] = names
+        for name in names:
+            alias_owners.setdefault(name, set()).add(job_id)
+    if not needed:
+        return False
+    if not snapshot:
+        return True
+    present: set[str] = set()
+    for message in snapshot:
+        identities = _snapshot_result_identities(message)
+        if not identities:
+            continue
+        if not _snapshot_result_is_final(message):
+            continue
+        for identity in identities:
+            owners = alias_owners.get(identity, set())
+            if len(owners) == 1:
+                present.update(owners & needed.keys())
+    return any(job_id not in present for job_id in needed)
+
+
+def _snapshot_result_identities(message: dict) -> set[str]:
+    role = message.get("role")
+    metadata = (
+        message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+    )
+    names: set[str] = set()
+    if role != "tool" and not (
+        role == "user" and metadata.get("kind") == TOOL_FEEDBACK_KIND
+    ):
+        return names
+    for key in ("job_id", "call_id"):
+        if metadata.get(key):
+            names.add(str(metadata[key]))
+    job_ids = metadata.get("job_ids")
+    if isinstance(job_ids, list):
+        names.update(str(value) for value in job_ids if value)
+    if names:
+        return names
+    if role == "tool":
+        identity = str(message.get("tool_call_id") or "")
+        return {identity} if identity else set()
+    content = render_content_text(message.get("content") or "")
+    names.update(
+        re.findall(
+            r"(?:\A|\n\n)\[Tool ([^\]\n]+?) "
+            r"(?:completed|failed(?:, exit [^\]\n]+)?|cancelled)\](?=\n|\Z)",
+            content,
+        )
+    )
+    return names
+
+
+def _snapshot_result_is_final(message: dict) -> bool:
+    metadata = (
+        message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+    )
+    phase = metadata.get("tool_result_phase")
+    if phase == "pending":
+        return False
+    if phase == "final":
+        return True
+    content = render_content_text(message.get("content") or "")
+    if re.match(
+        r"^(?:\[[^\]\n]+\] )?(?:Running in background — task delegated\.|"
+        r"Promoted to background\. Result arrives in a later turn\.)",
+        content,
+    ):
+        return False
+    if metadata.get("tool_results_elided") or ELISION_MARKER in content:
+        return True
+    if message.get("role") == "user" and metadata.get("kind") == TOOL_FEEDBACK_KIND:
+        return bool(_snapshot_result_identities(message))
+    return True
+
+
 def reload_conversation_under_branch_view(
     agent: Any,
     branch_view: dict[int, int],
@@ -329,6 +452,19 @@ def reload_conversation_under_branch_view(
         events = agent.session_store.get_events(agent.config.name)
 
     selected = resolve_branch_view_strict(events, branch_view)
+    prepared = prepare_snapshot(
+        agent.session_store,
+        agent.config.name,
+        events,
+        selected,
+        replay=replay_with_settled_tools,
+        needs_replay=snapshot_needs_settled_tool_replay,
+    )
+    if prepared is not None:
+        if apply:
+            apply_prepared_branch_view(agent, prepared)
+            return None
+        return prepared
     if replay is replay_conversation:
         messages = replay_with_settled_tools(
             events, branch_view=branch_view, include_metadata=True
@@ -355,6 +491,12 @@ def apply_prepared_branch_view(agent: Any, prepared: dict[str, Any]) -> None:
     """Install a prepared subtree onto the live agent."""
     messages = prepared["messages"]
     selected = prepared["selected"]
+    agent._context_cutoff_event_id = prepared.get("context_cutoff_event_id", 0)
+    manager = getattr(agent, "compact_manager", None)
+    if manager is not None:
+        state = prepared.get("compact_state") or replayed_compact_state(messages)
+        manager._compact_count = state["compact_count"]
+        manager._last_compact_time = state["last_compact_time"]
     conversation = agent.controller.conversation
     existing_system = [
         message for message in conversation.get_messages() if message.role == "system"

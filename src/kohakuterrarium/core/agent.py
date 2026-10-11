@@ -878,21 +878,11 @@ class Agent(
             self.subagent_manager._parent_name = self.config.name
         self.trigger_manager._session_store = store
         self.trigger_manager._agent_name = self.config.name
-        # Terrariums attach the store AFTER agent.start() (creatures),
-        # so re-read the saved compact_count or it resets to 0.
         if self.compact_manager:
             self.compact_manager._session_store = store
-            try:
-                saved = store.state.get(f"{self.config.name}:compact_count")
-                if saved is not None:
-                    self.compact_manager._compact_count = int(saved)
-            except (KeyError, TypeError, ValueError) as e:
-                logger.warning(
-                    "compact_count restore skipped",
-                    agent=self.config.name,
-                    error=str(e),
-                    exc_info=True,
-                )
+            restore_compact_state_from_session(
+                self.compact_manager, store, self.config.name
+            )
         native_tool_options = getattr(self, "native_tool_options", None)
         if native_tool_options is not None:
             try:
