@@ -324,8 +324,12 @@ class TestProgTerrariumJourney:
         assert analyst.graph_id == gid
         assert analyst.is_privileged is False
         assert analyst.parent_creature_id == "root"
-        # wire — group_channel(action="wire") gives the analyst a listen
-        # edge on a fresh auto-created channel.
+        # wire — the channel is declared first, then group_channel(action=
+        # "wire") gives the analyst a listen edge on it.
+        create_res = await GroupChannelTool()._execute(
+            {"action": "create", "channel": "analysis"}, context=ctx
+        )
+        assert create_res.error is None, create_res.error
         wire_res = await GroupChannelTool()._execute(
             {
                 "action": "wire",

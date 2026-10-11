@@ -10,6 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
+
 from kohakuterrarium.modules.tool.base import ToolContext
 from kohakuterrarium.terrarium import tools_group as tg
 from kohakuterrarium.terrarium import tools_group_channel as channel_mod
@@ -153,7 +155,7 @@ class TestGroupChannelErrorArms:
         gctx = SimpleNamespace(
             engine=engine,
             caller=caller,
-            graph=SimpleNamespace(graph_id="g1", channels={}),
+            graph=SimpleNamespace(graph_id="g1", channels={"bridge": object()}),
         )
         monkeypatch.setattr(
             channel_mod, "resolve_or_error", lambda c, **_: (gctx, None)
@@ -169,22 +171,22 @@ class TestGroupChannelErrorArms:
         )
         assert "cross-graph wire failed" in result.error
 
-    async def test_intra_graph_wire_autocreate_failure(self, monkeypatch):
-        """A failure auto-creating the channel during an intra-graph
-        wire surfaces as a 'channel auto-create failed' error."""
+    @pytest.mark.parametrize("target_graph", ["g1", "g2"])
+    async def test_wire_on_missing_channel_never_creates_it(
+        self, monkeypatch, target_graph
+    ):
+        """Neither an intra- nor a cross-graph wire declares an unknown channel."""
         caller = SimpleNamespace(
             creature_id="root", name="root", graph_id="g1", is_privileged=True
         )
         target = SimpleNamespace(
-            creature_id="bob", name="bob", graph_id="g1", is_privileged=False
+            creature_id="bob", name="bob", graph_id=target_graph, is_privileged=False
         )
-        engine = SimpleNamespace(
-            add_channel=AsyncMock(side_effect=RuntimeError("disk full")),
-        )
+        engine = SimpleNamespace(add_channel=AsyncMock(), connect=AsyncMock())
         gctx = SimpleNamespace(
             engine=engine,
             caller=caller,
-            graph=SimpleNamespace(graph_id="g1", channels={}),
+            graph=SimpleNamespace(graph_id="g1", channels={"tasks": object()}),
         )
         monkeypatch.setattr(
             channel_mod, "resolve_or_error", lambda c, **_: (gctx, None)
@@ -195,10 +197,13 @@ class TestGroupChannelErrorArms:
                 "action": "wire",
                 "channel": "fresh",
                 "creature_id": "bob",
-                "direction": "listen",
+                "direction": "send",
             }
         )
-        assert "channel auto-create failed" in result.error
+        assert "channel 'fresh' does not exist" in result.error
+        assert "available: ['tasks']" in result.error
+        engine.add_channel.assert_not_awaited()
+        engine.connect.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

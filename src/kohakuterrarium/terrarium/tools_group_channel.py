@@ -29,7 +29,12 @@ from kohakuterrarium.terrarium.group_tool_context import (
     cross_cluster_target_error,
     resolve_group_target,
 )
-from kohakuterrarium.terrarium.tools_group_common import err, ok, resolve_or_error
+from kohakuterrarium.terrarium.tools_group_common import (
+    err,
+    missing_channel_error,
+    ok,
+    resolve_or_error,
+)
 
 
 def _emit_intra_graph_wire_event(gctx: GroupContext, target_id: str) -> None:
@@ -154,9 +159,12 @@ async def _wire(
     channel: str,
     direction: str,
 ) -> ToolResult:
+    graph = gctx.graph
+    if channel not in graph.channels:
+        return missing_channel_error(graph, channel, target_name=target.name)
     # Cross-graph wiring merges the graphs; the caller takes the role opposite
     # the requested target direction.
-    if target.graph_id != gctx.graph.graph_id:
+    if target.graph_id != graph.graph_id:
         sender = gctx.caller if direction == "listen" else target
         receiver = target if direction == "listen" else gctx.caller
         try:
@@ -176,14 +184,6 @@ async def _wire(
                 "merged": True,
             }
         )
-
-    # A missing intra-graph channel is declared before its edge is enabled.
-    graph = gctx.graph
-    if channel not in graph.channels:
-        try:
-            await gctx.engine.add_channel(graph.graph_id, channel)
-        except Exception as exc:
-            return err(f"channel auto-create failed: {exc}")
 
     env = gctx.engine._environments.get(graph.graph_id)
     registry = getattr(env, "shared_channels", None) if env is not None else None

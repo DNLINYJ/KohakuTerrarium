@@ -372,23 +372,47 @@ class TestGroupChannelWire:
         finally:
             await t.shutdown()
 
-    async def test_wire_auto_creates_missing_channel(self):
-        """Wiring a not-yet-declared channel auto-creates it."""
+    async def test_wire_refuses_missing_channel_with_hint(self):
+        """Wiring an undeclared channel creates none and names both ways out."""
         t = await _privileged_pair()
         try:
             root = t.get_creature("root")
-            tool = channel_mod.GroupChannelTool()
-            result = await tool._execute(
+            bob = t.get_creature("bob")
+            graph = t.get_graph(root.graph_id)
+            channels_before = set(graph.channels)
+            result = await channel_mod.GroupChannelTool()._execute(
                 {
                     "action": "wire",
-                    "channel": "fresh",
+                    "channel": "to-bob",
                     "creature_id": "bob",
                     "direction": "listen",
                 },
                 context=_ctx_for(t, root),
             )
-            assert _parse(result)["wired"] == "fresh"
-            assert "fresh" in t.get_graph(root.graph_id).channels
+            assert "channel 'to-bob' does not exist" in result.error
+            assert "group_channel(action='create', channel='to-bob')" in (result.error)
+            assert "group_send(to='bob'" in result.error
+            assert set(graph.channels) == channels_before
+            assert "to-bob" not in bob.listen_channels
+            assert "to-bob" not in graph.listen_edges.get("bob", set())
+
+            # The suggested path works: create, then the same wire succeeds.
+            created = await channel_mod.GroupChannelTool()._execute(
+                {"action": "create", "channel": "to-bob"},
+                context=_ctx_for(t, root),
+            )
+            assert created.error is None, created.error
+            wired = await channel_mod.GroupChannelTool()._execute(
+                {
+                    "action": "wire",
+                    "channel": "to-bob",
+                    "creature_id": "bob",
+                    "direction": "listen",
+                },
+                context=_ctx_for(t, root),
+            )
+            assert _parse(wired)["wired"] == "to-bob"
+            assert "to-bob" in bob.listen_channels
         finally:
             await t.shutdown()
 

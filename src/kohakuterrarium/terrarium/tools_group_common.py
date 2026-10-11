@@ -24,6 +24,20 @@ def ok(payload: dict[str, Any]) -> ToolResult:
     return ToolResult(output=json.dumps(payload, default=str), exit_code=0)
 
 
+def missing_channel_error(
+    graph: Any, channel: str, *, target_name: str | None = None
+) -> ToolResult:
+    """Refuse an undeclared channel and name the two ways to reach a member."""
+    to = repr(target_name) if target_name else "'<creature name>'"
+    then_wire = f" then wire {target_name!r} to it" if target_name else ""
+    return err(
+        f"channel {channel!r} does not exist in your graph; no channel was created. "
+        f"available: {sorted(graph.channels)}. Either create it first with "
+        f"group_channel(action='create', channel={channel!r}){then_wire}, or "
+        f"message the creature directly by name with group_send(to={to}, message=...)."
+    )
+
+
 def resolve_or_error(
     ctx: ToolContext | None,
     *,

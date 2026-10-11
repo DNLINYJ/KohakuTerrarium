@@ -29,6 +29,7 @@ from kohakuterrarium.modules.tool.base import (
 from kohakuterrarium.terrarium.output_wiring import notify_inbound_delivery
 from kohakuterrarium.terrarium.tools_group_common import (
     err,
+    missing_channel_error,
     ok,
     resolve_or_error,
     resolve_target_or_error,
@@ -196,10 +197,7 @@ class SendChannelTool(BaseTool):
             return err("'channel' and 'message' are required")
         graph = gctx.graph
         if channel_name not in graph.channels:
-            return err(
-                f"channel {channel_name!r} does not exist in your graph; "
-                f"available: {sorted(graph.channels)}"
-            )
+            return missing_channel_error(graph, channel_name)
         try:
             sends = graph.send_edges[gctx.caller.creature_id]
         except (AttributeError, KeyError, TypeError):

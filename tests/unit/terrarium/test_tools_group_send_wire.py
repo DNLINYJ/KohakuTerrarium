@@ -248,7 +248,9 @@ class TestSendChannel:
         r = await send_mod.SendChannelTool()._execute(
             {"channel": "ghost", "message": "m"}
         )
-        assert "does not exist" in r.error
+        assert "channel 'ghost' does not exist" in r.error
+        assert "group_channel(action='create', channel='ghost')" in r.error
+        assert "group_send(to=" in r.error
 
     async def test_not_wired_privileged_self_wire_hint(self, monkeypatch):
         gctx = _gctx(

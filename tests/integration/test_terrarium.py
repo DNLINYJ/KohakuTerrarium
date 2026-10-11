@@ -511,8 +511,26 @@ class TestTerrariumIntegration:
         assert worker.parent_creature_id == "lead"
         assert "group_add_node" not in worker.agent.registry.list_tools()
 
-        # 2. wire — group_channel(action="wire") gives the worker a
-        # listen edge on a fresh auto-created channel.
+        # 2. wire — an undeclared channel is refused and changes nothing;
+        # once created, the same wire gives the worker a listen edge.
+        channels_before = set(engine.get_graph(gid).channels)
+        refused = await GroupChannelTool()._execute(
+            {
+                "action": "wire",
+                "channel": "tasks",
+                "creature_id": worker_id,
+                "direction": "listen",
+            },
+            context=ctx,
+        )
+        assert "channel 'tasks' does not exist" in refused.error
+        assert "group_send(to='worker'" in refused.error
+        assert set(engine.get_graph(gid).channels) == channels_before
+        assert "tasks" not in engine.get_creature(worker_id).listen_channels
+        create_res = await GroupChannelTool()._execute(
+            {"action": "create", "channel": "tasks"}, context=ctx
+        )
+        assert create_res.error is None, create_res.error
         wire_res = await GroupChannelTool()._execute(
             {
                 "action": "wire",
