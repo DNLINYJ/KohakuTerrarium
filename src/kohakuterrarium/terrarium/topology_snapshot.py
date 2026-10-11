@@ -14,7 +14,7 @@ Snapshot shape (under ``meta["runtime_topology"]``):
 ::
 
     {
-        "channels": [{"name": str, "description": str}, ...],
+        "channels": [{"name": str, "description": str, "direct"?: true}, ...],
         "listen_edges": {creature_id: [channel_name, ...]},
         "send_edges":   {creature_id: [channel_name, ...]},
     }
@@ -75,6 +75,7 @@ def snapshot(engine: "Terrarium", graph_id: str) -> None:
     payload: dict[str, Any] = {
         "channels": [
             {"name": ch.name, "description": ch.description}
+            | ({"direct": True} if ch.direct else {})
             for ch in g.channels.values()
         ],
         "listen_edges": {
@@ -184,7 +185,10 @@ async def _replay_into(
             continue
         try:
             await engine.add_channel(
-                graph_id, name, description=str(ch.get("description") or "")
+                graph_id,
+                name,
+                description=str(ch.get("description") or ""),
+                direct=ch.get("direct") is True,
             )
         except Exception:  # pragma: no cover - defensive
             leftovers["channels"].append(dict(ch))

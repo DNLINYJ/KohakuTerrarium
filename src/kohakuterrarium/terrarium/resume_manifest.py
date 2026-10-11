@@ -152,6 +152,7 @@ async def _resume_reserved_manifest(
                 manifest.graph_id,
                 channel.name,
                 description=channel.description,
+                direct=channel.direct,
             )
             _channels.register_channel_in_environment(
                 environment.shared_channels,

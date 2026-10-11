@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from kohakuterrarium.terrarium import creature_ops as co
-from kohakuterrarium.terrarium.topology import GraphTopology
+from kohakuterrarium.terrarium.topology import ChannelInfo, GraphTopology
 
 # ---------------------------------------------------------------------------
 # native tool inventory — schema_fn raising
@@ -484,3 +484,24 @@ class TestGetModuleOptionsNativeTool:
         agent = SimpleNamespace(registry=_Registry(), native_tool_options=None)
         with pytest.raises(KeyError):
             co.agent_get_module_options(agent, "native_tool", "ghost")
+
+
+# ---------------------------------------------------------------------------
+# _channels_for_graph — direct channel flag
+# ---------------------------------------------------------------------------
+
+
+class TestChannelsForGraphDirectFlag:
+    def test_flags_only_direct_channels(self):
+        graph = GraphTopology(
+            graph_id="g1",
+            channels={
+                "alice": ChannelInfo("alice", "Direct channel to alice", direct=True),
+                "deploy": ChannelInfo("deploy", "Deployment planning"),
+            },
+        )
+        eng = _Engine(graphs={"g1": graph})
+        out = {c["name"]: c for c in co._channels_for_graph(eng, graph)}
+        assert out["alice"]["direct"] is True
+        assert out["deploy"]["direct"] is False
+        assert out["deploy"]["description"] == "Deployment planning"

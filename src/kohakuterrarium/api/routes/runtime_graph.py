@@ -156,6 +156,7 @@ def _channels_for_graph(
                 "name": name,
                 "type": channel_type or "broadcast",
                 "description": description,
+                "direct": bool(getattr(topo_info, "direct", False)),
                 "qsize": int(getattr(runtime_channel, "qsize", 0) or 0),
                 "message_count": len(history),
                 "last_message": _message_to_dict(history[-1]) if history else None,

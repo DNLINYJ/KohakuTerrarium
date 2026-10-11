@@ -61,6 +61,7 @@ from kohakuterrarium.terrarium.drive.registration import (
 )
 from kohakuterrarium.terrarium.drive.requests import CreateDriveRequest, DriveQuery
 from kohakuterrarium.testing.llm import ScriptEntry
+from kohakuterrarium.terrarium.creature_ops import build_runtime_graph_snapshot_for
 from kohakuterrarium.terrarium.engine import Terrarium
 from kohakuterrarium.terrarium.events import EventFilter, EventKind
 from kohakuterrarium.terrarium.output_log import OutputLogCapture
@@ -742,6 +743,28 @@ class TestTerrariumIntegration:
         assert del_res.error is None, del_res.error
         assert "orders" not in engine.get_graph(gid).channels
 
+        # A designed channel that happens to share the worker's name is a
+        # real channel, not the worker's direct alias: the snapshot the
+        # Studio sidebar and graph read must not flag it as direct.
+        same_name = await GroupChannelTool()._execute(
+            {"action": "create", "channel": "worker", "description": "ops talk"},
+            context=ctx,
+        )
+        assert same_name.error is None, same_name.error
+        lead_gid = engine.get_creature("lead").graph_id
+        snap_graph = next(
+            g
+            for g in build_runtime_graph_snapshot_for(engine)["graphs"]
+            if g["graph_id"] == lead_gid
+        )
+        snap_channels = {c["name"]: c for c in snap_graph["channels"]}
+        assert snap_channels["worker"]["direct"] is False
+        assert snap_channels["worker"]["description"] == "ops talk"
+        assert not any(c["direct"] for c in snap_graph["channels"])
+        await GroupChannelTool()._execute(
+            {"action": "delete", "channel": "worker"}, context=ctx
+        )
+
         # 9. remove — group_remove_node destroys the worker. It was the
         # only other node so the graph just shrinks back to the lead.
         rm_res = await GroupRemoveNodeTool()._execute(
@@ -1278,6 +1301,21 @@ class TestTerrariumIntegration:
         assert "findings" in graph.channels
         assert "scout" in graph.channels and "writer" in graph.channels
         assert "report_to_root" in graph.channels
+        # Only the per-creature channels are flagged direct, in the engine
+        # and in the runtime-graph snapshot the frontend renders from.
+        assert {n for n, c in graph.channels.items() if c.direct} == {
+            "scout",
+            "writer",
+        }
+        snap_graph = next(
+            g
+            for g in build_runtime_graph_snapshot_for(engine)["graphs"]
+            if g["graph_id"] == gid
+        )
+        assert {c["name"] for c in snap_graph["channels"] if c["direct"]} == {
+            "scout",
+            "writer",
+        }
 
         # The ``root:`` keyword promoted its creature to a privileged
         # node — it has the privilege flag AND the group_* surface.

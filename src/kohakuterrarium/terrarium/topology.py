@@ -23,6 +23,20 @@ class ChannelInfo:
 
     name: str
     description: str = ""
+    # The per-creature channel a recipe creates, named after its creature.
+    direct: bool = False
+
+
+def direct_channel_description(creature_name: str) -> str:
+    """Description a recipe gives the direct channel it creates for a creature."""
+    return f"Direct channel to {creature_name}"
+
+
+def is_legacy_direct_channel(
+    name: str, description: str, creature_names: set[str] | frozenset[str]
+) -> bool:
+    """Recognise a recipe direct channel saved before ``direct`` was recorded."""
+    return name in creature_names and description == direct_channel_description(name)
 
 
 @dataclass
@@ -192,6 +206,7 @@ def add_channel(
     name: str,
     *,
     description: str = "",
+    direct: bool = False,
 ) -> ChannelInfo:
     """Declare a channel inside a graph.  Channel names are
     graph-unique; declaring a channel that already exists is an error.
@@ -201,7 +216,7 @@ def add_channel(
         raise KeyError(f"graph {graph_id!r} does not exist")
     if name in g.channels:
         raise ValueError(f"channel {name!r} already declared in graph {graph_id!r}")
-    info = ChannelInfo(name=name, description=description)
+    info = ChannelInfo(name=name, description=description, direct=direct)
     g.channels[name] = info
     return info
 

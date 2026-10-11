@@ -15,14 +15,24 @@
  * Channel edges of a privileged creature carry `control`: it listens on every
  * channel, and its send memberships are the ones assigned to it.
  *
- * A channel named after a creature of the same session is that creature's
- * direct channel, an alias for messaging it. It is not a channel node: it is
- * dropped from channels, channel edges and creature listen/send lists, drawn
- * as `direct` edges, and kept in `aliases` because the engine still counts
- * it as a link when predicting splits.
+ * A creature's direct channel (the one a recipe creates under its name, an
+ * alias for messaging it) is not a channel node: it is dropped from channels,
+ * channel edges and creature listen/send lists, drawn as `direct` edges, and
+ * kept in `aliases` because the engine still counts it as a link when
+ * predicting splits. See `isDirectChannel` for how one is recognised.
  */
 
 export const HOST_SITE = "_host"
+
+/**
+ * Whether `channel` is a creature's direct channel. The server's `direct`
+ * flag decides; without one (an older server), a name shared with a creature
+ * in `creatureNames` does.
+ */
+export function isDirectChannel(channel, creatureNames) {
+  if (typeof channel?.direct === "boolean") return channel.direct
+  return creatureNames.has(channel?.name)
+}
 
 export function channelNodeId(sessionId, name) {
   return `ch:${sessionId}:${name}`
@@ -194,9 +204,13 @@ export function buildGraphModel(snapshot) {
       session.channelIds.push(channel.id)
       return channel
     }
+    const rawChannels = new Map()
     for (const raw of graph.channels || []) {
-      if (raw?.name && !creatureNames.has(raw.name) && !channelsByName.has(raw.name))
-        ensureChannel(raw.name, raw)
+      if (raw?.name && !rawChannels.has(raw.name)) rawChannels.set(raw.name, raw)
+    }
+    const isDirect = (name) => isDirectChannel(rawChannels.get(name) || { name }, creatureNames)
+    for (const raw of rawChannels.values()) {
+      if (!isDirect(raw.name)) ensureChannel(raw.name, raw)
     }
 
     const creatureIdByName = new Map()
@@ -206,15 +220,15 @@ export function buildGraphModel(snapshot) {
     for (const raw of rawCreatures) {
       const creature = normalizeCreature(raw, sessionId, sessionHost)
       for (const name of new Set([...creature.listen, ...creature.send])) {
-        if (!creatureNames.has(name)) continue
+        if (!isDirect(name)) continue
         if (!aliasMembers.has(name)) aliasMembers.set(name, [])
         aliasMembers.get(name).push(creature.id)
         if (!creature.send.includes(name)) continue
         if (!aliasSenders.has(name)) aliasSenders.set(name, [])
         aliasSenders.get(name).push(creature.id)
       }
-      creature.listen = creature.listen.filter((name) => !creatureNames.has(name))
-      creature.send = creature.send.filter((name) => !creatureNames.has(name))
+      creature.listen = creature.listen.filter((name) => !isDirect(name))
+      creature.send = creature.send.filter((name) => !isDirect(name))
       creatures.push(creature)
       members.push(creature)
       creatureIds.add(creature.id)

@@ -6,6 +6,7 @@ import {
   channelNodeId,
   creatureStatus,
   indexModel,
+  isDirectChannel,
   predictChannelRemoval,
   predictRemoval,
 } from "./model"
@@ -182,6 +183,36 @@ describe("graph model", () => {
         implicit: false,
       },
     ])
+  })
+
+  it("keeps a designed channel that shares a creature's name when the server says it is not direct", () => {
+    const named = buildGraphModel({
+      graphs: [
+        {
+          graph_id: "g",
+          channels: [
+            { name: "deploy", description: "deployment planning", direct: false },
+            { name: "opus", description: "Direct channel to opus", direct: true },
+          ],
+          creatures: [
+            creature("opus", { listen_channels: ["deploy", "opus"], send_channels: ["deploy"] }),
+            creature("deploy", { listen_channels: ["deploy"], send_channels: ["deploy", "opus"] }),
+          ],
+        },
+      ],
+    })
+    expect(named.channels.map((ch) => ch.name)).toEqual(["deploy"])
+    const deploy = named.channels[0]
+    expect(deploy.description).toBe("deployment planning")
+    expect(deploy.senders.sort()).toEqual(["deploy", "opus"])
+    expect(deploy.listeners.sort()).toEqual(["deploy", "opus"])
+    expect(named.creatures.find((c) => c.id === "opus").listen).toEqual(["deploy"])
+    expect(named.aliases).toEqual([{ sessionId: "g", name: "opus", memberIds: ["opus", "deploy"] }])
+    expect(named.edges.filter((e) => e.kind === "direct").map((e) => e.id)).toEqual([
+      "direct:deploy:opus",
+    ])
+    expect(isDirectChannel({ name: "deploy" }, new Set(["deploy"]))).toBe(true)
+    expect(isDirectChannel({ name: "deploy", direct: false }, new Set(["deploy"]))).toBe(false)
   })
 
   it("draws a privileged creature's direct reach to every other member, and nothing it does not have", () => {

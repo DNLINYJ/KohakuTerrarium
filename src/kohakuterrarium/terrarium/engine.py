@@ -403,6 +403,8 @@ class Terrarium:
         graph: GraphRef,
         name: str,
         description: str = "",
+        *,
+        direct: bool = False,
     ) -> ChannelInfo:
         """Declare a channel inside a graph.
 
@@ -419,6 +421,7 @@ class Terrarium:
             gid,
             name,
             description=description,
+            direct=direct,
         )
         env = self._environments[gid]
         _channels.register_channel_in_environment(

@@ -130,11 +130,15 @@ def unpack_creature_info(d: dict[str, Any]) -> CreatureInfo:
 
 
 def pack_channel_info(c: ChannelInfo) -> dict[str, Any]:
-    return {"name": c.name, "description": c.description}
+    return {"name": c.name, "description": c.description, "direct": c.direct}
 
 
 def unpack_channel_info(d: dict[str, Any]) -> ChannelInfo:
-    return ChannelInfo(name=d["name"], description=d.get("description", ""))
+    return ChannelInfo(
+        name=d["name"],
+        description=d.get("description", ""),
+        direct=bool(d.get("direct", False)),
+    )
 
 
 # ---------------------------------------------------------------------------
