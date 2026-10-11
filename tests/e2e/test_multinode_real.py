@@ -1422,11 +1422,15 @@ async def test_subprocess_worker_spawn_and_chat_round_trip(tmp_path, monkeypatch
                 active = (await host.http.get("/api/sessions/active")).json()
                 assert sid not in {item["session_id"] for item in active}
 
+            active_ids = {
+                item["session_id"]
+                for item in (await host.http.get("/api/sessions/active")).json()
+            }
             for bad_ref, message in (
                 ("@missing-worker-package/creatures/general", "Package not installed"),
                 ("@worker-biome/missing", "Path not found in package"),
                 ("@worker-biome/../outside", "escapes the package root"),
-                ("@/creatures/general", "Empty package name"),
+                ("@/creatures/general", "The local project does not exist yet"),
                 ("creatures/general", "requires an absolute remote path"),
             ):
                 rejected = await host.http.post(
@@ -1435,6 +1439,8 @@ async def test_subprocess_worker_spawn_and_chat_round_trip(tmp_path, monkeypatch
                 )
                 assert rejected.status_code == 400, rejected.text
                 assert message in rejected.json()["detail"]
+            active = (await host.http.get("/api/sessions/active")).json()
+            assert {item["session_id"] for item in active} == active_ids
             assert package_config.is_dir()
 
 
