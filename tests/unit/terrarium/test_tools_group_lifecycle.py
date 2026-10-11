@@ -56,6 +56,7 @@ class _FakeEngine:
         self.start = AsyncMock()
         self.stop = AsyncMock()
         self.connect = AsyncMock()
+        self.add_channel = AsyncMock()
         self.emitted = []
 
     def _emit(self, event):
@@ -307,7 +308,7 @@ class TestGroupSpawnChild:
         r = await tool._execute({"config_ref": "./c"})
         assert "failed to spawn" in r.error
 
-    async def test_spawn_wires_default_channel_both_ways_and_delivers_task(
+    async def test_spawn_links_child_without_a_channel_and_delivers_task(
         self, monkeypatch
     ):
         gctx = _gctx()
@@ -323,16 +324,13 @@ class TestGroupSpawnChild:
         )
         body = _parse(r)
         assert body["creature_id"] == "cid-child"
-        assert body["channel"] == "link-caller-cid-child"
-        assert gctx.engine.add_creature.call_args.kwargs["io"] == "none"
+        assert "channel" not in body
+        add_kwargs = gctx.engine.add_creature.call_args.kwargs
+        assert add_kwargs["io"] == "none"
+        assert add_kwargs["parent_creature_id"] == gctx.caller.creature_id
         assert body["task_delivered"] is True
-        # The default channel is wired BOTH ways: two connects on the same
-        # channel (caller<->child).
-        assert gctx.engine.connect.await_count == 2
-        channels = {
-            call.kwargs.get("channel") for call in gctx.engine.connect.await_args_list
-        }
-        assert channels == {"link-caller-cid-child"}
+        gctx.engine.connect.assert_not_awaited()
+        gctx.engine.add_channel.assert_not_awaited()
         # The task reached the child.
         await asyncio.sleep(0.01)
         child.agent._process_event.assert_awaited()
@@ -351,19 +349,6 @@ class TestGroupSpawnChild:
         assert body["task_delivered"] is False
         await asyncio.sleep(0.01)
         child.agent._process_event.assert_not_awaited()
-
-    async def test_channel_wire_failure_surfaced(self, monkeypatch):
-        gctx = _gctx()
-        child = self._child(cid="cid-child", name="worker")
-        gctx.engine.add_creature.return_value = child
-        gctx.engine.connect.side_effect = RuntimeError("wire boom")
-        _patch_resolve(monkeypatch, gctx)
-        monkeypatch.setattr(
-            lifecycle_mod.group_hooks, "attach_session_store", AsyncMock()
-        )
-        tool = lifecycle_mod.GroupSpawnChildTool()
-        r = await tool._execute({"config_ref": "./c"})
-        assert "default channel wiring failed" in r.error
 
 
 # ── group_pause_node / group_resume_node ──────────────────────

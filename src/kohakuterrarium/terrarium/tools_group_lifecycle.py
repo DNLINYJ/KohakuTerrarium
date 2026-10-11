@@ -312,11 +312,6 @@ class GroupStopNodeTool(BaseTool):
         return ok({"stopped": target.creature_id})
 
 
-def _default_link_channel(caller: Any, child: Any) -> str:
-    """Return the stable channel name for a creator-child link."""
-    return f"link-{caller.creature_id}-{child.creature_id}"
-
-
 def _log_spawn_task_error(task: asyncio.Task, child_name: str) -> None:
     """Log failures from the detached initial-task delivery."""
     if task.cancelled():
@@ -362,9 +357,9 @@ class GroupSpawnChildTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Spawn a child creature, auto-wire a default two-way channel "
-            "back to you, and optionally hand it a first task — one call "
-            "to use a graph creature as an unbounded sub-agent"
+            "Spawn a child creature linked to you and optionally hand it a "
+            "first task; talk to it with group_send by name. Not for one-shot "
+            "private work - dispatch a sub-agent."
         )
 
     @property
@@ -424,21 +419,6 @@ class GroupSpawnChildTool(BaseTool):
             gctx.engine, child, config_path=config_ref, config_type="agent"
         )
 
-        # Reciprocal connections make both endpoints senders and listeners.
-        channel = _default_link_channel(gctx.caller, child)
-        try:
-            await gctx.engine.connect(
-                gctx.caller.creature_id, child.creature_id, channel=channel
-            )
-            await gctx.engine.connect(
-                child.creature_id, gctx.caller.creature_id, channel=channel
-            )
-        except Exception as exc:
-            return err(
-                f"spawned {child.creature_id} but default channel wiring "
-                f"failed: {exc}"
-            )
-
         gctx.engine._emit(
             EngineEvent(
                 kind=EventKind.PARENT_LINK_CHANGED,
@@ -459,7 +439,6 @@ class GroupSpawnChildTool(BaseTool):
                 "creature_id": child.creature_id,
                 "name": child.name,
                 "graph_id": child.graph_id,
-                "channel": channel,
                 "task_delivered": delivered,
                 "caller_graph_id": gctx.caller.graph_id,
             }

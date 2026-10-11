@@ -70,6 +70,7 @@ from kohakuterrarium.terrarium.tools_group_channel import GroupChannelTool
 from kohakuterrarium.terrarium.tools_group_lifecycle import (
     GroupAddNodeTool,
     GroupRemoveNodeTool,
+    GroupSpawnChildTool,
     GroupStartNodeTool,
     GroupStopNodeTool,
 )
@@ -613,6 +614,30 @@ class TestTerrariumIntegration:
         assert gs_body["delivered"] is True
         assert gs_body["to"] == worker_id
 
+        # 6b. group_spawn_child — the child joins linked to the lead with no
+        # channel; group_send reaches it by name.
+        channels_before_spawn = set(engine.get_graph(gid).channels)
+        spawn_res = await GroupSpawnChildTool()._execute(
+            {"config_ref": str(worker_yaml), "name": "helper", "task": "warm up"},
+            context=ctx,
+        )
+        assert spawn_res.error is None, spawn_res.error
+        spawn_body = json.loads(spawn_res.output)
+        assert "channel" not in spawn_body
+        assert spawn_body["task_delivered"] is True
+        helper_id = spawn_body["creature_id"]
+        helper = engine.get_creature(helper_id)
+        assert helper.graph_id == gid
+        assert helper.parent_creature_id == "lead"
+        assert helper.listen_channels == [] and helper.send_channels == []
+        assert set(engine.get_graph(gid).channels) == channels_before_spawn
+        assert engine.get_graph(gid).parent_links[helper_id] == "lead"
+        helper_send = await GroupSendTool()._execute(
+            {"to": "helper", "message": "ping helper"}, context=ctx
+        )
+        assert helper_send.error is None, helper_send.error
+        assert json.loads(helper_send.output)["to"] == helper_id
+
         # --- group_channel error paths — every rejection branch --------
         # At this point ``tasks`` + ``orders`` are both live in the graph.
         # create on an existing channel is rejected.
@@ -768,6 +793,9 @@ class TestTerrariumIntegration:
         )
         assert del_res.error is None, del_res.error
         assert "orders" not in engine.get_graph(gid).channels
+        # Both re-checked connectivity; the channel-less helper stays in the
+        # group through its parent link.
+        assert engine.get_creature(helper_id).graph_id == gid
 
         # A designed channel that happens to share the worker's name is a
         # real channel, not the worker's direct alias: the snapshot the
@@ -800,8 +828,11 @@ class TestTerrariumIntegration:
         assert rm_res.error is None, rm_res.error
         assert json.loads(rm_res.output)["removed"] == worker_id
         assert worker_id not in service.engine
-        assert {c.creature_id for c in await service.list_creatures()} == {"lead"}
-        assert engine.get_graph(gid).creature_ids == {"lead"}
+        assert {c.creature_id for c in await service.list_creatures()} == {
+            "lead",
+            helper_id,
+        }
+        assert engine.get_graph(gid).creature_ids == {"lead", helper_id}
         # The privileged node may NOT be removed via the tool.
         deny = await GroupRemoveNodeTool()._execute(
             {"creature_id": "lead"}, context=ctx
