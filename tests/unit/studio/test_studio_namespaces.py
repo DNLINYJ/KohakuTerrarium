@@ -31,6 +31,7 @@ from kohakuterrarium.studio.persistence import (
     store as _persistence_store_mod,
 )
 from kohakuterrarium.testing.terrarium import TestTerrariumBuilder
+from kohakuterrarium.utils.config_dir import config_dir
 
 # ---------------------------------------------------------------------------
 # fixtures
@@ -274,7 +275,9 @@ class TestIdentitySettings:
             "mcp_servers",
             "ui_prefs",
         }
-        # Each config file lives under the advertised home directory.
+        # The advertised home is the live config root (KT_CONFIG_DIR) and every
+        # config file lives directly under it.
+        assert paths["home"] == config_dir()
         for key in ("llm_profiles", "api_keys", "mcp_servers", "ui_prefs"):
             assert paths[key].parent == paths["home"]
 

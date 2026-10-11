@@ -1,10 +1,11 @@
 """Unit tests for :mod:`kohakuterrarium.api.deps`."""
 
+from pathlib import Path
+
 import pytest
 
 from kohakuterrarium.api import deps as mod
 from kohakuterrarium.api.deps import (
-    _DEFAULT_SESSION_DIR,
     _session_dir,
     get_engine,
     get_service_legacy as get_service,
@@ -30,7 +31,7 @@ class TestSessionDir:
         # conftest.py sets ``KT_CONFIG_DIR`` to tmp).
         monkeypatch.delenv("KT_SESSION_DIR", raising=False)
         monkeypatch.delenv("KT_CONFIG_DIR", raising=False)
-        assert _session_dir() == _DEFAULT_SESSION_DIR
+        assert _session_dir() == str(Path.home() / ".kohakuterrarium" / "sessions")
 
     def test_env_override(self, monkeypatch):
         monkeypatch.setenv("KT_SESSION_DIR", "/custom/path")

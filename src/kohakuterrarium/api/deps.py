@@ -49,10 +49,6 @@ def _session_dir() -> str:
     return str(config_dir() / "sessions")
 
 
-# Retained for display compatibility; operational reads must use ``_session_dir()``.
-_DEFAULT_SESSION_DIR = str(Path.home() / ".kohakuterrarium" / "sessions")
-
-
 def _host_drive_kwargs() -> dict:
     """Resolve one immutable host Drive configuration for a new engine."""
     from kohakuterrarium.studio.identity import drive_settings

@@ -3,20 +3,21 @@
 import os
 from pathlib import Path
 
-from kohakuterrarium.llm.api_keys import KEYS_PATH
-from kohakuterrarium.llm.profiles import PROFILES_PATH
-from kohakuterrarium.studio.identity.mcp_servers import MCP_SERVERS_PATH
-from kohakuterrarium.studio.identity.ui_prefs import UI_PREFS_PATH
+from kohakuterrarium.llm.api_keys import _keys_path
+from kohakuterrarium.llm.backends import _profiles_path
+from kohakuterrarium.studio.identity.mcp_servers import mcp_config_path
+from kohakuterrarium.studio.identity.ui_prefs import ui_prefs_path
+from kohakuterrarium.utils.config_dir import config_dir
 
 
 def config_paths() -> dict[str, Path]:
-    """Return the canonical mapping of config-key to path."""
+    """Return the config-key to path mapping the live read/write paths use."""
     return {
-        "home": Path.home() / ".kohakuterrarium",
-        "llm_profiles": PROFILES_PATH,
-        "api_keys": KEYS_PATH,
-        "mcp_servers": MCP_SERVERS_PATH,
-        "ui_prefs": UI_PREFS_PATH,
+        "home": config_dir(),
+        "llm_profiles": _profiles_path(),
+        "api_keys": _keys_path(),
+        "mcp_servers": mcp_config_path(),
+        "ui_prefs": ui_prefs_path(),
     }
 
 
