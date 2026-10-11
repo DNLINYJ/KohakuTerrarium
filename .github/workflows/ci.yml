@@ -20,10 +20,8 @@ jobs:
 
   test:
     runs-on: ${{ matrix.os }}
-    env:
-      # xdist workers for ``-n auto`` (pyproject addopts). Hosted runners have
-      # 3-4 vCPUs; the suite is mostly I/O-bound, so 2x oversubscription.
-      KT_TEST_WORKERS: "8"
+    # ``-n auto`` (pyproject addopts) resolves to one xdist worker per vCPU on
+    # hosted runners; plans/ci-parallel-tests/00-plan.md has the measurements.
     strategy:
       fail-fast: false
       matrix:

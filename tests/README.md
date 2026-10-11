@@ -37,8 +37,9 @@ Every run is parallel through pytest-xdist (`addopts = "-n auto --dist
 loadgroup"`). `-n auto` resolves in `tests/conftest.py`:
 `KT_TEST_WORKERS` when set, otherwise `min(16, cpu_count)`, never above
 64. Measured on an 86-core machine: 16 workers 204 s, 32 workers 251 s,
-64 workers 306 s (the suite is I/O- and startup-bound past 16). CI sets
-`KT_TEST_WORKERS=8` on its 3–4 vCPU runners.
+64 workers 306 s (the suite is I/O- and startup-bound past 16). On a 4-vCPU
+hosted runner the auto value (4) is the measured best: unit 573 s serial →
+199 s, integration 204 s → 118 s; 8–16 workers are no faster.
 
 What keeps tests independent across workers:
 
