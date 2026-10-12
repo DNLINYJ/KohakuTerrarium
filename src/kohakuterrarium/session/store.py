@@ -284,9 +284,8 @@ class SessionStore(StoreAffinityMixin, BranchIndexMixin):
             data["parent_branch_path"] = [list(p) for p in parent_branch_path]
         if "ts" not in data:
             data["ts"] = time.time()
-        self.events[key] = data
+        self._branch_maxima.append(self.events, key, agent, data)
         self._event_keys.record(key, event_id)
-        self._branch_maxima.record(agent, data)
 
         text = data.get("content") or data.get("output") or data.get("text") or ""
         if isinstance(text, str) and len(text) > 10:
