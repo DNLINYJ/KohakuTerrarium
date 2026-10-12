@@ -12,6 +12,7 @@ from kohakuterrarium.llm.base import (
     BaseLLMProvider,
     ChatResponse,
     LLMConfig,
+    LLMProvider,
     NativeToolCall,
     OverflowRecoveryState,
     ToolSchema,
@@ -83,6 +84,16 @@ class _StubProvider(BaseLLMProvider):
             usage={"prompt_tokens": 1},
             model="m",
         )
+
+
+class TestProviderLifecycle:
+    async def test_default_close_is_inherited_and_repeatable(self):
+        provider = _StubProvider(LLMConfig(model="m"))
+        assert callable(LLMProvider.close)
+        assert isinstance(provider, LLMProvider)
+        assert await provider.close() is None
+        assert await provider.close() is None
+        assert provider.config.model == "m"
 
 
 class TestBaseLLMProviderNormalisation:
