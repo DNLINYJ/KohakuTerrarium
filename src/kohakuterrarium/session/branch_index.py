@@ -24,9 +24,15 @@ class BranchIndex:
         if isinstance(turn, int) and isinstance(branch, int):
             index[turn] = max(index.get(turn, 0), branch)
 
-    def record(self, agent: str, event: dict) -> None:
-        """Update a built namespace after a successful native append."""
+    def append(self, table: Any, key: str, agent: str, event: dict) -> None:
+        """Publish a native event row and update derived branch maxima under lock."""
         with self._lock:
+            try:
+                table[key] = event
+            except BaseException:
+                self._generation += 1
+                self._agents.pop(agent, None)
+                raise
             self._generation += 1
             index = self._agents.get(agent)
             if index is not None:

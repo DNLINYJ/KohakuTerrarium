@@ -1766,7 +1766,23 @@ class TestCoreIntegration:
                 for event in store.get_events(agent.config.name)
                 if event.get("turn_index") == 2
             }
-            await agent.inject_input("continue original", branch_view={1: 1})
+            assert agent._max_branch_id_for_turn(2) == max(previous_branches)
+            published_maxima = []
+
+            def observe_publication(key, event):
+                if event.get("type") == "user_message" and event.get("turn_index") == 2:
+                    published_maxima.append(
+                        (event["branch_id"], agent._max_branch_id_for_turn(2))
+                    )
+
+            store.subscribe(observe_publication)
+            try:
+                await agent.inject_input("continue original", branch_view={1: 1})
+            finally:
+                store.unsubscribe(observe_publication)
+            assert published_maxima == [
+                (max(previous_branches) + 1, max(previous_branches) + 1)
+            ]
             continuation = next(
                 event
                 for event in store.get_events(agent.config.name)
