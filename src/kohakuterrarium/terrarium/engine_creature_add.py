@@ -34,6 +34,7 @@ async def add_creature(
     graph: GraphTopology | str | None = None,
     creature_id: str | None = None,
     llm: Any = None,
+    fallback_llm: str | None = None,
     pwd: str | None = None,
     start: bool = True,
     is_privileged: bool = False,
@@ -55,6 +56,7 @@ async def add_creature(
         config,
         creature_id=creature_id,
         llm=llm,
+        fallback_llm=fallback_llm,
         pwd=pwd,
         io=io,
         strict=strict,
@@ -170,12 +172,14 @@ def _prepare_creature(
     tools: list[Any] | None,
     plugins: list[Any] | None,
     builder,
+    fallback_llm: str | None = None,
 ) -> Creature:
     if isinstance(config, Creature):
         ignored = [
             key
             for key, value in (
                 ("llm", llm),
+                ("fallback_llm", fallback_llm),
                 ("pwd", pwd),
                 ("io", io),
                 ("tools", tools),
@@ -200,6 +204,7 @@ def _prepare_creature(
             strict=strict,
             tools=tools,
             plugins=plugins,
+            fallback_llm=fallback_llm,
         )
     if creature_id and creature.creature_id != creature_id:
         creature.creature_id = creature_id

@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from kohakuterrarium.bootstrap.llm import config_names_llm
 from kohakuterrarium.builtins.inputs.none import NoneInput
 from kohakuterrarium.builtins.outputs.none import NoneOutput
 from kohakuterrarium.core.agent import Agent
@@ -671,6 +672,13 @@ def _with_terrarium_plugin_defaults(config: AgentConfig) -> AgentConfig:
     return config
 
 
+def _effective_llm(llm: Any, fallback_llm: str | None, config: AgentConfig) -> Any:
+    """Return ``llm``, else ``fallback_llm`` when the config names no model."""
+    if llm is not None or not fallback_llm or config_names_llm(config):
+        return llm
+    return fallback_llm
+
+
 def _runtime_injection_labels(llm, tools, plugins) -> tuple[str, ...]:
     return tuple(
         label
@@ -765,6 +773,7 @@ def build_creature(
     strict: bool = True,
     tools: list[Any] | None = None,
     plugins: list[Any] | None = None,
+    fallback_llm: str | None = None,
 ) -> Creature:
     """Build a :class:`Creature` from any of the supported config shapes.
 
@@ -796,6 +805,8 @@ def build_creature(
       the session store, and N concurrent agents must not interleave
       writes on the console.  Named outputs from the config are
       preserved.
+
+    ``fallback_llm`` selects the model when neither ``llm`` nor the config does.
     """
     if io not in ("config", "none", "headless"):
         raise ValueError(f"io= must be 'config', 'none', or 'headless' — got {io!r}")
@@ -811,6 +822,7 @@ def build_creature(
             strict=strict,
             tools=tools,
             plugins=plugins,
+            fallback_llm=fallback_llm,
         )
 
 
@@ -826,11 +838,13 @@ def _build_creature_from_config(
     strict: bool,
     tools: list[Any] | None,
     plugins: list[Any] | None,
+    fallback_llm: str | None = None,
 ) -> Creature:
     _io_override = NoneInput() if io in ("none", "headless") else None
     _out_override = NoneOutput() if io == "headless" else None
     if isinstance(config, (str, Path)):
         agent_config = _with_terrarium_plugin_defaults(load_agent_config(config))
+        llm = _effective_llm(llm, fallback_llm, agent_config)
         agent = Agent(
             agent_config,
             input_module=_io_override,
@@ -863,6 +877,7 @@ def _build_creature_from_config(
 
     if isinstance(config, AgentConfig):
         config = _with_terrarium_plugin_defaults(config)
+        llm = _effective_llm(llm, fallback_llm, config)
         session = (
             environment.get_session(creature_id or config.name) if environment else None
         )
@@ -896,6 +911,7 @@ def _build_creature_from_config(
         agent_config = _with_terrarium_plugin_defaults(
             build_agent_config(config.config_data, config.base_dir)
         )
+        llm = _effective_llm(llm, fallback_llm, agent_config)
         # CreatureConfig (in-recipe / hot-plug) is always engine-managed
         # and channel-driven — its input is suppressed unconditionally;
         # ``io="headless"`` additionally silences the default output.

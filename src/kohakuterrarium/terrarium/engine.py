@@ -276,15 +276,21 @@ class Terrarium:
         name: str | None = None,
         tools: list[Any] | None = None,
         plugins: list[Any] | None = None,
+        fallback_llm: str | None = None,
         _identity_reserved: bool = False,
     ) -> Creature:
-        """Build and insert one creature into the engine."""
+        """Build and insert one creature into the engine.
+
+        ``fallback_llm`` selects the model when neither ``llm`` nor the
+        config does.
+        """
         return await _engine_creature_add.add_creature(
             self,
             config,
             graph=graph,
             creature_id=creature_id,
             llm=llm,
+            fallback_llm=fallback_llm,
             pwd=pwd,
             start=start,
             is_privileged=is_privileged,

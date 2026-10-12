@@ -6,6 +6,7 @@ from typing import Any
 import kohakuterrarium.terrarium.group_hooks as group_hooks
 from kohakuterrarium.builtins.tool_catalog import register_builtin
 from kohakuterrarium.core.events import create_creature_output_event
+from kohakuterrarium.llm.profiles import resolve_controller_llm
 from kohakuterrarium.modules.tool.base import (
     BaseTool,
     ExecutionMode,
@@ -36,6 +37,21 @@ def _caller_pwd(gctx: GroupContext) -> str:
         if wd is not None:
             return str(wd)
     return ""
+
+
+def _caller_llm(gctx: GroupContext) -> str | None:
+    """Return the caller's model selector, or None when it names no profile."""
+    get_ident = getattr(gctx.caller.agent, "llm_identifier", None)
+    identifier = get_ident() if callable(get_ident) else ""
+    if not identifier or resolve_controller_llm({}, llm=identifier) is None:
+        return None
+    return identifier
+
+
+_LLM_PARAM = {
+    "type": "string",
+    "description": "Model selector; default is the config's model, else yours.",
+}
 
 
 def _resolve_worker_target(
@@ -84,7 +100,7 @@ class GroupAddNodeTool(BaseTool):
                     "description": "Creature config path or @pkg/creatures/<name>",
                 },
                 "name": {"type": "string"},
-                "llm": {"type": "string"},
+                "llm": _LLM_PARAM,
                 "pwd": {"type": "string"},
             },
             "required": ["config_path"],
@@ -110,7 +126,8 @@ class GroupAddNodeTool(BaseTool):
             new = await gctx.engine.add_creature(
                 config_path,
                 graph=gctx.caller.graph_id,
-                llm=args.get("llm"),
+                llm=args.get("llm") or None,
+                fallback_llm=_caller_llm(gctx),
                 pwd=pwd,
                 name=name or None,
                 is_privileged=False,
@@ -383,7 +400,7 @@ class GroupSpawnChildTool(BaseTool):
                     "type": "string",
                     "description": "Optional display name for the child.",
                 },
-                "llm": {"type": "string"},
+                "llm": _LLM_PARAM,
                 "pwd": {"type": "string"},
             },
             "required": ["config_ref"],
@@ -405,7 +422,8 @@ class GroupSpawnChildTool(BaseTool):
             child = await gctx.engine.add_creature(
                 config_ref,
                 graph=gctx.caller.graph_id,
-                llm=args.get("llm"),
+                llm=args.get("llm") or None,
+                fallback_llm=_caller_llm(gctx),
                 pwd=pwd,
                 name=name or None,
                 is_privileged=False,

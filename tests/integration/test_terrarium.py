@@ -23,6 +23,7 @@ coordination are all real.
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -60,6 +61,7 @@ from kohakuterrarium.terrarium.drive.registration import (
     GenericDriveRegistration,
 )
 from kohakuterrarium.terrarium.drive.requests import CreateDriveRequest, DriveQuery
+from kohakuterrarium.llm.presets import get_all_presets
 from kohakuterrarium.testing.llm import ScriptEntry
 from kohakuterrarium.terrarium.creature_ops import build_runtime_graph_snapshot_for
 from kohakuterrarium.terrarium.engine import Terrarium
@@ -473,16 +475,20 @@ class TestTerrariumIntegration:
         service = make_service()
         engine = service.engine
 
-        # A privileged "lead" — the user-created shape (Studio "new
-        # creature" and lifecycle.start_creature pass is_privileged).
+        # A privileged "lead" on a user-picked model — the shape Studio
+        # "new creature" and lifecycle.start_creature build.
+        provider, preset = next(iter(get_all_presets()))
         lead = await service.add_creature(
-            _agent_config("lead", tmp_path),
+            replace(_agent_config("lead", tmp_path), model="", provider=""),
             creature_id="lead",
             is_privileged=True,
+            llm=f"{provider}/{preset}",
         )
         gid = lead.graph_id
         # Privileged creatures get the full group_* tool surface.
         lead_agent = engine.get_creature("lead").agent
+        lead_model = lead_agent.llm_identifier()
+        assert lead_model == f"{provider}/{preset}"
         assert "group_add_node" in lead_agent.registry.list_tools()
         assert "group_channel" in lead_agent.registry.list_tools()
 
@@ -511,6 +517,8 @@ class TestTerrariumIntegration:
         assert worker.is_privileged is False  # tool-spawned workers are NOT privileged
         assert worker.parent_creature_id == "lead"
         assert "group_add_node" not in worker.agent.registry.list_tools()
+        # The worker config names its own model, so it keeps it.
+        assert worker.agent._llm_selector is None
 
         # 2. wire — an undeclared channel is refused and changes nothing;
         # once created, the same wire gives the worker a listen edge.
@@ -614,11 +622,18 @@ class TestTerrariumIntegration:
         assert gs_body["delivered"] is True
         assert gs_body["to"] == worker_id
 
-        # 6b. group_spawn_child — the child joins linked to the lead with no
-        # channel; group_send reaches it by name.
+        # 6b. group_spawn_child — a model-less child joins on the lead's model,
+        # linked with no channel; group_send reaches it by name.
+        helper_yaml = tmp_path / "helper.yaml"
+        helper_yaml.write_text(
+            "name: helper\nsystem_prompt: You are helper.\n"
+            "tool_format: bracket\ninput:\n  type: none\n"
+            "output:\n  type: stdout\n",
+            encoding="utf-8",
+        )
         channels_before_spawn = set(engine.get_graph(gid).channels)
         spawn_res = await GroupSpawnChildTool()._execute(
-            {"config_ref": str(worker_yaml), "name": "helper", "task": "warm up"},
+            {"config_ref": str(helper_yaml), "name": "helper", "task": "warm up"},
             context=ctx,
         )
         assert spawn_res.error is None, spawn_res.error
@@ -629,6 +644,7 @@ class TestTerrariumIntegration:
         helper = engine.get_creature(helper_id)
         assert helper.graph_id == gid
         assert helper.parent_creature_id == "lead"
+        assert helper.agent.llm_identifier() == lead_model
         assert helper.listen_channels == [] and helper.send_channels == []
         assert set(engine.get_graph(gid).channels) == channels_before_spawn
         assert engine.get_graph(gid).parent_links[helper_id] == "lead"

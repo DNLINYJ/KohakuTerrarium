@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import kohakuterrarium.bootstrap.agent_init as agent_init
 from kohakuterrarium.errors import SessionNotResumableError
 from kohakuterrarium.terrarium.creature_host import Creature
 from kohakuterrarium.terrarium.engine import Terrarium
@@ -17,6 +18,7 @@ from kohakuterrarium.terrarium.drive.store import (
     DriveRepositoryClosedError,
 )
 from kohakuterrarium.terrarium.events import EventFilter, EventKind
+from kohakuterrarium.testing.llm import ScriptedLLM
 from kohakuterrarium.testing.terrarium import _FakeAgent, TestTerrariumBuilder
 
 
@@ -609,6 +611,33 @@ class TestSubscribe:
             pre = Creature(creature_id="pre", name="pre", agent=_FakeAgent(name="pre"))
             with pytest.raises(ValueError, match="pre-built Creature"):
                 await t.add_creature(pre, llm="some/selector")
+            with pytest.raises(ValueError, match="fallback_llm"):
+                await t.add_creature(pre, fallback_llm="some/selector")
+            assert "pre" not in t
+        finally:
+            await t.shutdown()
+
+    async def test_fallback_llm_reaches_a_config_that_names_no_model(
+        self, tmp_path, monkeypatch
+    ):
+        seen = []
+
+        def record(config, llm=None):
+            seen.append(llm)
+            return ScriptedLLM(["hi"])
+
+        monkeypatch.setattr(agent_init, "create_llm_provider", record)
+        (tmp_path / "config.yaml").write_text(
+            "name: kid\ninput:\n  type: none\noutput:\n  type: stdout\n",
+            encoding="utf-8",
+        )
+        t = Terrarium()
+        try:
+            kid = await t.add_creature(
+                str(tmp_path), fallback_llm="openai/parent", start=False
+            )
+            assert seen == ["openai/parent"]
+            assert kid.agent._llm_selector == "openai/parent"
         finally:
             await t.shutdown()
 

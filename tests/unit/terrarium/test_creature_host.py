@@ -3,12 +3,16 @@
 import asyncio
 
 import pytest
+import yaml
 
+import kohakuterrarium.bootstrap.agent_init as agent_init
 from kohakuterrarium.builtins.inputs.none import NoneInput
 from kohakuterrarium.builtins.outputs.none import NoneOutput
 from kohakuterrarium.builtins.outputs.stdout import StdoutOutput
+from kohakuterrarium.core.config import build_agent_config
 from kohakuterrarium.modules.trigger.base import BaseTrigger
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.terrarium.config import CreatureConfig
 from kohakuterrarium.terrarium.creature_host import Creature, build_creature
 from kohakuterrarium.testing.llm import ScriptedLLM
 from kohakuterrarium.testing.terrarium import _FakeAgent
@@ -70,6 +74,61 @@ class TestBuildCreatureLLMInjection:
             )
             == 1
         )
+
+
+def _config_shape(shape, tmp_path, controller):
+    data = {
+        "name": "child",
+        "input": {"type": "none"},
+        "output": {"type": "stdout"},
+        "controller": controller,
+    }
+    if shape == "path":
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump(data), encoding="utf-8")
+        return str(tmp_path)
+    if shape == "agent_config":
+        return build_agent_config(data, tmp_path)
+    return CreatureConfig(name="child", config_data=data, base_dir=tmp_path)
+
+
+class TestBuildCreatureFallbackLLM:
+    @pytest.fixture
+    def selectors(self, monkeypatch):
+        seen = []
+
+        def record(config, llm=None):
+            seen.append(llm)
+            return ScriptedLLM(["hi"])
+
+        monkeypatch.setattr(agent_init, "create_llm_provider", record)
+        return seen
+
+    @pytest.mark.parametrize("shape", ["path", "agent_config", "creature_config"])
+    def test_config_without_a_model_takes_the_fallback(
+        self, shape, tmp_path, selectors
+    ):
+        config = _config_shape(shape, tmp_path, {})
+        creature = build_creature(config, io="none", fallback_llm="openai/parent")
+        assert selectors == ["openai/parent"]
+        assert creature.agent._llm_selector == "openai/parent"
+
+    @pytest.mark.parametrize("shape", ["path", "agent_config", "creature_config"])
+    @pytest.mark.parametrize(
+        "controller", [{"model": "own-model"}, {"llm": "openai/own"}]
+    )
+    def test_config_that_names_a_model_keeps_it(
+        self, shape, controller, tmp_path, selectors
+    ):
+        config = _config_shape(shape, tmp_path, controller)
+        build_creature(config, io="none", fallback_llm="openai/parent")
+        assert selectors == [None]
+
+    def test_explicit_llm_beats_the_fallback(self, tmp_path, selectors):
+        config = _config_shape("path", tmp_path, {})
+        build_creature(
+            config, io="none", llm="openai/explicit", fallback_llm="openai/parent"
+        )
+        assert selectors == ["openai/explicit"]
 
 
 # ── warm pause + kill markers (UXI-11) ─────────────────────────

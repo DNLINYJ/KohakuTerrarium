@@ -17,6 +17,7 @@ from kohakuterrarium.bootstrap.llm import (
     _create_from_profile,
     _extract_controller_data,
     _is_meaningful_config_value,
+    config_names_llm,
     create_llm_provider,
     create_llm_from_profile_name,
 )
@@ -86,6 +87,22 @@ class TestExtractControllerData:
         cfg = AgentConfig(name="a", llm_profile="openai/gpt-4")
         data = _extract_controller_data(cfg)
         assert data["llm"] == "openai/gpt-4"
+
+
+class TestConfigNamesLLM:
+    @pytest.mark.parametrize(
+        "fields",
+        [{"model": "gpt-4"}, {"llm_profile": "openai/gpt-4"}],
+    )
+    def test_a_named_model_or_profile_counts(self, fields):
+        assert config_names_llm(AgentConfig(name="a", **fields)) is True
+
+    @pytest.mark.parametrize(
+        "fields",
+        [{}, {"provider": "openai"}, {"temperature": 0.1}, {"extra_body": {"k": 1}}],
+    )
+    def test_settings_without_a_model_do_not_count(self, fields):
+        assert config_names_llm(AgentConfig(name="a", **fields)) is False
 
 
 # ── create_llm_provider routes ──────────────────────────────────

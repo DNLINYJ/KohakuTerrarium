@@ -135,6 +135,12 @@ def _extract_controller_data(config: AgentConfig) -> dict[str, Any]:
     return data
 
 
+def config_names_llm(config: AgentConfig) -> bool:
+    """Return whether the config selects its own model or profile."""
+    data = _extract_controller_data(config)
+    return "llm" in data or "model" in data
+
+
 def _create_from_profile(profile: LLMProfile) -> LLMProvider:
     """Instantiate the provider described by a resolved profile."""
     logger.info(

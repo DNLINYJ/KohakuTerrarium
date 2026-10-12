@@ -15,7 +15,7 @@ Adds a new creature to your graph and links it to you as its parent.
 | --- | --- | --- | --- |
 | config_path | string | yes | Creature folder or `@pkg/...` reference |
 | name | string | no | Runtime name; defaults to the config's |
-| llm | string | no | Model override for the new member |
+| llm | string | no | Model selector; defaults to the config's model, else yours |
 | pwd | string | no | Working directory; defaults to yours |
 
 ## Behavior

@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import kohakuterrarium.terrarium.tools_group_lifecycle as lifecycle_mod
+from kohakuterrarium.llm.presets import get_all_presets
 
 # ── helpers ───────────────────────────────────────────────────
 
@@ -349,6 +350,80 @@ class TestGroupSpawnChild:
         assert body["task_delivered"] is False
         await asyncio.sleep(0.01)
         child.agent._process_event.assert_not_awaited()
+
+
+# ── spawned model: explicit, else config, else caller ─────────
+
+
+def _preset_selector() -> str:
+    provider, name = next(iter(get_all_presets()))
+    return f"{provider}/{name}"
+
+
+def _caller_on(identifier):
+    caller = _FakeCreature(cid="caller", name="root", is_privileged=True)
+    caller.agent = SimpleNamespace(executor=None, llm_identifier=lambda: identifier)
+    return caller
+
+
+_SPAWN_TOOLS = [
+    (lifecycle_mod.GroupAddNodeTool, "config_path"),
+    (lifecycle_mod.GroupSpawnChildTool, "config_ref"),
+]
+
+
+class TestSpawnedModel:
+    async def _spawn(self, monkeypatch, tool_cls, ref_key, caller, **args):
+        gctx = _gctx(caller=caller)
+        child = _FakeCreature(cid="cid-child", name="worker")
+        child.agent = SimpleNamespace(executor=None, _process_event=AsyncMock())
+        gctx.engine.add_creature.return_value = child
+        _patch_resolve(monkeypatch, gctx)
+        monkeypatch.setattr(
+            lifecycle_mod.group_hooks, "attach_session_store", AsyncMock()
+        )
+        r = await tool_cls()._execute({ref_key: "./c", **args})
+        assert r.error is None
+        return gctx.engine.add_creature.call_args.kwargs
+
+    @pytest.mark.parametrize("tool_cls,ref_key", _SPAWN_TOOLS)
+    async def test_caller_model_is_the_fallback(self, monkeypatch, tool_cls, ref_key):
+        selector = _preset_selector()
+        kwargs = await self._spawn(monkeypatch, tool_cls, ref_key, _caller_on(selector))
+        assert kwargs["llm"] is None
+        assert kwargs["fallback_llm"] == selector
+
+    @pytest.mark.parametrize("tool_cls,ref_key", _SPAWN_TOOLS)
+    async def test_explicit_llm_is_passed_as_the_override(
+        self, monkeypatch, tool_cls, ref_key
+    ):
+        selector = _preset_selector()
+        kwargs = await self._spawn(
+            monkeypatch,
+            tool_cls,
+            ref_key,
+            _caller_on(selector),
+            llm="openai/explicit",
+        )
+        assert kwargs["llm"] == "openai/explicit"
+        assert kwargs["fallback_llm"] == selector
+
+    @pytest.mark.parametrize("tool_cls,ref_key", _SPAWN_TOOLS)
+    @pytest.mark.parametrize("identifier", ["", "no-such-provider/no-such-model"])
+    async def test_caller_without_a_resolvable_profile_gives_no_fallback(
+        self, monkeypatch, tool_cls, ref_key, identifier
+    ):
+        kwargs = await self._spawn(
+            monkeypatch, tool_cls, ref_key, _caller_on(identifier)
+        )
+        assert kwargs["fallback_llm"] is None
+
+    @pytest.mark.parametrize("tool_cls,ref_key", _SPAWN_TOOLS)
+    async def test_caller_without_llm_identifier_gives_no_fallback(
+        self, monkeypatch, tool_cls, ref_key
+    ):
+        kwargs = await self._spawn(monkeypatch, tool_cls, ref_key, None)
+        assert kwargs["fallback_llm"] is None
 
 
 # ── group_pause_node / group_resume_node ──────────────────────

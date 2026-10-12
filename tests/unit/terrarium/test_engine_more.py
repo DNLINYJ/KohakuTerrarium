@@ -216,6 +216,7 @@ class TestAddCreatureBranches:
             strict=True,
             tools=None,
             plugins=None,
+            fallback_llm=None,
         ):
             assert config == "some-config-path"
             return built
