@@ -133,6 +133,10 @@ class LLMProvider(Protocol):
         """Return a complete response for the supplied conversation."""
         ...
 
+    async def close(self) -> None:
+        """Release provider-owned resources at shutdown."""
+        ...
+
     def reload_credentials(self) -> bool:
         """Re-resolve API credentials + rebuild the SDK client.
 
@@ -202,6 +206,9 @@ class BaseLLMProvider:
         # Host compaction gets one chance to shrink context before destructive recovery.
         self._overflow_rescue: Callable[[], Any] | None = None
         self._request_ceiling = RequestCeiling()
+
+    async def close(self) -> None:
+        """No-op cleanup for providers without persistent resources."""
 
     def fork(self) -> "BaseLLMProvider":
         """Return a sibling for an independent conversation.

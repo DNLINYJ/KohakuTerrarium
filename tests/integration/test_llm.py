@@ -2625,6 +2625,8 @@ class TestLlmIntegration:
                         for part in signed[0]["_kt_antigravity_content"]["parts"]
                     )
                     session_path = creature.agent.session_store.path
+                    await engine.stop(creature)
+                    assert creature.status == "stopped"
                 resumed = await Terrarium.resume(str(session_path), llm=agy)
                 try:
                     worker = resumed.list_creatures()[0]
@@ -2648,6 +2650,9 @@ class TestLlmIntegration:
                     assert (
                         await worker.run("after compact", timeout=10)
                     ).text == "AGY_OK"
+                    await compacted.remove_creature(worker)
+                    assert worker.creature_id not in compacted
+                    assert compacted.list_graphs() == []
                 finally:
                     await compacted.__aexit__(None, None, None)
                 assert len(submissions) == 5
