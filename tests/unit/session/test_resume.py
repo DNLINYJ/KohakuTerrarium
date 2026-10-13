@@ -12,6 +12,7 @@ import time
 import pytest
 
 import kohakuterrarium.session.resume as resume_mod
+import kohakuterrarium.session.resume_branch as resume_branch_mod
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
 from kohakuterrarium.core.agent_compact import restore_compact_state_from_session
@@ -109,6 +110,103 @@ class _CountingStore:
 
 
 # ── _create_io_modules ────────────────────────────────────────────
+
+
+class TestPrepareSavedSnapshot:
+    @pytest.mark.parametrize("kind", ["missing", "empty", "non_list", "invalid"])
+    def test_no_valid_records_skips_branch_analysis(self, tmp_path, monkeypatch, kind):
+        store = SessionStore(tmp_path / "no-checkpoints.kohakutr")
+        try:
+            store.append_event(
+                "alice",
+                "user_message",
+                {"content": "question"},
+                turn_index=1,
+                branch_id=1,
+            )
+            events = store.get_events("alice")
+            raw = {
+                "empty": [],
+                "non_list": {"path": [[1, 1]]},
+                "invalid": [
+                    {
+                        "path": [[1, 1]],
+                        "watermark": 1,
+                        "messages": [{"role": "not-a-role", "content": "invalid"}],
+                        "compact_state": {"compact_count": 0, "last_compact_time": 0.0},
+                    }
+                ],
+            }
+            if kind != "missing":
+                store.state["alice:branch_snapshots"] = raw[kind]
+
+            def forbidden(*args, **kwargs):
+                raise AssertionError("No checkpoints must skip branch preparation")
+
+            monkeypatch.setattr(resume_branch_mod, "index_parent_paths", forbidden)
+            monkeypatch.setattr(
+                resume_branch_mod, "resolve_selected_branches", forbidden
+            )
+            monkeypatch.setattr(
+                resume_branch_mod, "load_persisted_branch_view", forbidden
+            )
+            monkeypatch.setattr(resume_branch_mod, "prepare_snapshot", forbidden)
+            assert (
+                resume_branch_mod.prepare_saved_snapshot(store, "alice", events) is None
+            )
+        finally:
+            store.close(update_status=False)
+
+    @pytest.mark.parametrize("mixed", [False, True])
+    def test_valid_records_are_read_once_and_honor_selected_branch(
+        self, tmp_path, monkeypatch, mixed
+    ):
+        store = SessionStore(tmp_path / "checkpoints.kohakutr")
+        try:
+            for branch in (1, 2):
+                store.append_event(
+                    "alice",
+                    "user_message",
+                    {"content": f"branch {branch}"},
+                    turn_index=1,
+                    branch_id=branch,
+                )
+            messages = [
+                {
+                    "role": "user",
+                    "content": "branch 1",
+                    "metadata": {"turn_index": 1, "branch_id": 1},
+                },
+                {"role": "assistant", "content": "checkpoint-only answer"},
+            ]
+            store.save_branch_snapshot(
+                "alice",
+                messages,
+                branch={"turn_index": 1, "branch_id": 1, "parent_branch_path": []},
+                watermark=store.max_event_id("alice"),
+            )
+            if mixed:
+                store.state["alice:branch_snapshots"] = [
+                    {"path": "invalid"},
+                    *store.state["alice:branch_snapshots"],
+                ]
+            persist_branch_view(store, "alice", {1: 1})
+            events = store.get_events("alice")
+            reads = []
+            real_get = type(store.state).get
+
+            def count_get(vault, key, *args, **kwargs):
+                if vault is store.state and key == "alice:branch_snapshots":
+                    reads.append(key)
+                return real_get(vault, key, *args, **kwargs)
+
+            monkeypatch.setattr(type(store.state), "get", count_get)
+            prepared = resume_branch_mod.prepare_saved_snapshot(store, "alice", events)
+            assert prepared["messages"] == messages
+            assert prepared["selected"] == {1: 1}
+            assert reads == ["alice:branch_snapshots"]
+        finally:
+            store.close(update_status=False)
 
 
 class TestCreateIoModules:
