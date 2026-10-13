@@ -9,6 +9,7 @@ Vertical sub-agent usage is attributed to the parent turn from
 interrupted sub-agents visible in trace and cost totals.
 """
 
+from collections.abc import Iterable
 from typing import Any
 
 from kohakuterrarium.session.history import dedupe_adjacent_duplicate_events
@@ -395,14 +396,20 @@ def _merge_own_rollups(stored: list[dict], derived: list[dict]) -> list[dict]:
     return sorted(by_turn.values(), key=lambda row: _as_int(row.get("turn_index")))
 
 
+def _own_rollups_from_events(
+    agent: str, events: list[dict], stored: list[dict]
+) -> list[dict]:
+    """Merge stored own-turn rows with diagnostics from preloaded deduped events."""
+    derived = derive_own_turns_from_events(events, agent)
+    return _merge_own_rollups(stored, derived) if stored else derived
+
+
 def _own_rollups_or_derived(
     store: SessionStore, agent: str, events: list[dict] | None = None
 ) -> list[dict]:
     if events is None:
         events = dedupe_adjacent_duplicate_events(store.get_events(agent))
-    derived = derive_own_turns_from_events(events, agent)
-    stored = store.list_turn_rollups(agent)
-    return _merge_own_rollups(stored, derived) if stored else derived
+    return _own_rollups_from_events(agent, events, store.list_turn_rollups(agent))
 
 
 def rollups_or_derived(store: SessionStore, agent: str) -> list[dict]:
@@ -455,68 +462,80 @@ def _empty_aggregate(turn_index: int) -> dict:
     }
 
 
-def _iter_rollup_contributions(store: SessionStore, name: str, kind: str):
-    events = dedupe_adjacent_duplicate_events(store.get_events(name))
-    for row in _own_rollups_or_derived(store, name, events):
+def _iter_rollup_contributions_from_events(
+    name: str, kind: str, events: list[dict], stored: list[dict]
+) -> Iterable[tuple[str, str, dict]]:
+    """Yield (contrib_name, kind, row) from preloaded deduped events and stored rows."""
+    for row in _own_rollups_from_events(name, events, stored):
         yield name, kind, row
     for row in derive_subagent_turns_from_events(events, name):
         yield row.get("agent") or name, "subagent", row
 
 
-def aggregate_turn_rollups(store: SessionStore) -> list[dict]:
-    """Sum each turn across all controller-loop contributions.
+def _iter_rollup_contributions(store: SessionStore, name: str, kind: str):
+    events = dedupe_adjacent_duplicate_events(store.get_events(name))
+    stored = store.list_turn_rollups(name)
+    yield from _iter_rollup_contributions_from_events(name, kind, events, stored)
 
-    The breakdown includes main, attached, and vertical sub-agent rows so
-    sub-agent usage remains visible without a dedicated event namespace.
-    """
+
+def _aggregate_rollup_contributions(
+    contributions: Iterable[tuple[str, str, dict]],
+) -> list[dict]:
+    """Fold (name, kind, row) contributions into per-turn aggregates."""
     by_turn: dict[int, dict] = {}
-    for name, kind in list_agent_namespaces(store):
-        for contrib_name, contrib_kind, row in _iter_rollup_contributions(
-            store, name, kind
-        ):
-            ti = row.get("turn_index")
-            if not isinstance(ti, int) or ti <= 0:
-                continue
-            agg = by_turn.get(ti)
-            if agg is None:
-                agg = _empty_aggregate(ti)
-                by_turn[ti] = agg
-            tin = int(row.get("tokens_in") or 0)
-            tout = int(row.get("tokens_out") or 0)
-            tcached = int(row.get("tokens_cached") or 0)
-            tcalls = int(row.get("tool_calls") or 0)
-            agg["tokens_in"] += tin
-            agg["tokens_out"] += tout
-            agg["tokens_cached"] += tcached
-            agg["tool_calls"] += tcalls
-            cost = row.get("cost_usd")
-            if cost is not None:
-                try:
-                    agg["cost_usd"] = float(agg["cost_usd"] or 0) + float(cost)
-                except (TypeError, ValueError):
-                    pass
-            sa = row.get("started_at")
-            ea = row.get("ended_at")
-            if sa is not None and (agg["started_at"] is None or sa < agg["started_at"]):
-                agg["started_at"] = sa
-            if ea is not None and (agg["ended_at"] is None or ea > agg["ended_at"]):
-                agg["ended_at"] = ea
-            if row.get("has_error"):
-                agg["has_error"] = True
-            if row.get("compacted"):
-                agg["compacted"] = True
-            agg["breakdown"].append(
-                {
-                    "agent": contrib_name,
-                    "kind": contrib_kind,
-                    "tokens_in": tin,
-                    "tokens_out": tout,
-                    "tokens_cached": tcached,
-                    "cost_usd": cost,
-                    "tool_calls": tcalls,
-                }
-            )
+    for contrib_name, contrib_kind, row in contributions:
+        ti = row.get("turn_index")
+        if not isinstance(ti, int) or ti <= 0:
+            continue
+        agg = by_turn.get(ti)
+        if agg is None:
+            agg = _empty_aggregate(ti)
+            by_turn[ti] = agg
+        tin = int(row.get("tokens_in") or 0)
+        tout = int(row.get("tokens_out") or 0)
+        tcached = int(row.get("tokens_cached") or 0)
+        tcalls = int(row.get("tool_calls") or 0)
+        agg["tokens_in"] += tin
+        agg["tokens_out"] += tout
+        agg["tokens_cached"] += tcached
+        agg["tool_calls"] += tcalls
+        cost = row.get("cost_usd")
+        if cost is not None:
+            try:
+                agg["cost_usd"] = float(agg["cost_usd"] or 0) + float(cost)
+            except (TypeError, ValueError):
+                pass
+        sa = row.get("started_at")
+        ea = row.get("ended_at")
+        if sa is not None and (agg["started_at"] is None or sa < agg["started_at"]):
+            agg["started_at"] = sa
+        if ea is not None and (agg["ended_at"] is None or ea > agg["ended_at"]):
+            agg["ended_at"] = ea
+        if row.get("has_error"):
+            agg["has_error"] = True
+        if row.get("compacted"):
+            agg["compacted"] = True
+        agg["breakdown"].append(
+            {
+                "agent": contrib_name,
+                "kind": contrib_kind,
+                "tokens_in": tin,
+                "tokens_out": tout,
+                "tokens_cached": tcached,
+                "cost_usd": cost,
+                "tool_calls": tcalls,
+            }
+        )
     return [by_turn[k] for k in sorted(by_turn.keys())]
+
+
+def aggregate_turn_rollups(store: SessionStore) -> list[dict]:
+    """Sum main, attached, and vertical sub-agent contributions by turn."""
+    return _aggregate_rollup_contributions(
+        contrib
+        for name, kind in list_agent_namespaces(store)
+        for contrib in _iter_rollup_contributions(store, name, kind)
+    )
 
 
 def _creature_total_usage(events: list[dict], rollups: list[dict]) -> dict[str, Any]:

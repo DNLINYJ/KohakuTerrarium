@@ -537,7 +537,25 @@ class TestStudioIntegration:
                 assert [n["id"] for n in tree["nodes"]] == [tree["session_id"]]
                 assert tree["edges"] == []
 
-                summary = studio.persistence.viewer.summary(store, saved_stem, None)
+                read_names = []
+                original_get_events = store.get_events
+
+                def read_events(name, *args, **kwargs):
+                    read_names.append(name)
+                    return original_get_events(name, *args, **kwargs)
+
+                with monkeypatch.context() as counters:
+                    counters.setattr(store, "get_events", read_events)
+                    summary = studio.persistence.viewer.summary(store, saved_stem, None)
+                    assert read_names == ["scout"]
+                    read_names.clear()
+                    scoped_summary = studio.persistence.viewer.summary(
+                        store, saved_stem, "scout"
+                    )
+                    assert read_names == ["scout"]
+                assert scoped_summary["totals"] == summary["totals"]
+                assert scoped_summary["error_turns"] == summary["error_turns"]
+                assert scoped_summary["compact_turns"] == summary["compact_turns"]
                 assert summary["agents"] == ["scout"]
                 assert summary["config_type"] == "agent"
                 assert summary["totals"]["turns"] == 2
