@@ -19,10 +19,14 @@ from kohakuterrarium.session.history import (
     resolve_selected_branches,
     select_live_event_ids,
 )
+from kohakuterrarium.session.snapshot import load_records
 
 
 def prepare_saved_snapshot(store, namespace: str, events: list[dict]) -> dict | None:
     """Select a branch checkpoint under the persisted resume view."""
+    records = load_records(store, namespace)
+    if not records:
+        return None
     selected = resolve_selected_branches(
         events, index_parent_paths(events), load_persisted_branch_view(store, namespace)
     )
@@ -31,6 +35,7 @@ def prepare_saved_snapshot(store, namespace: str, events: list[dict]) -> dict | 
         namespace,
         events,
         selected,
+        records=records,
         replay=replay_with_settled_tools,
         needs_replay=snapshot_needs_settled_tool_replay,
     )

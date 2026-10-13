@@ -5,11 +5,13 @@ from pathlib import Path
 
 import pytest
 
+from kohakuterrarium.core import snapshot_history
 from kohakuterrarium.core.agent_message_history import (
     replay_with_settled_tools,
     snapshot_needs_settled_tool_replay,
 )
 from kohakuterrarium.core.snapshot_history import prepare_snapshot
+from kohakuterrarium.session.snapshot import load_records
 from kohakuterrarium.session.store import SessionStore
 
 _EVENTS = [
@@ -293,6 +295,67 @@ def test_prepare_snapshot_exact_checkpoint_ignores_latest_mirror(
         "snap_u2_a",
         "snap_a2",
     ]
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_prepare_snapshot_uses_preloaded_records_without_reading_store(
+    store, base_events, monkeypatch, empty
+):
+    _save_branch_msgs_a(store)
+    records = [] if empty else load_records(store, "alice")
+    original_records = copy.deepcopy(records)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Preloaded records must not trigger another read")
+
+    monkeypatch.setattr(snapshot_history, "load_records", forbidden)
+    outcome = prepare_snapshot(
+        store,
+        "alice",
+        base_events,
+        {1: 1, 2: 1},
+        records=records,
+        replay=replay_with_settled_tools,
+        needs_replay=snapshot_needs_settled_tool_replay,
+    )
+    if empty:
+        assert outcome is None
+    else:
+        assert outcome["messages"] == _MSGS_A
+        outcome["messages"][0]["content"] = "changed result"
+    assert records == original_records
+    assert store.state["alice:branch_snapshots"][0]["messages"] == _MSGS_A
+
+
+@pytest.mark.parametrize("kind", ["text_chunk", "text", "assistant_reasoning"])
+def test_preloaded_records_preserve_late_same_turn_invalidation(
+    store, base_events, kind
+):
+    _save_branch_msgs_a(store)
+    records = load_records(store, "alice")
+    later = base_events + [
+        {
+            "event_id": 7,
+            "type": kind,
+            "content": "late",
+            "reasoning_content": "late reasoning",
+            "turn_index": 2,
+            "branch_id": 1,
+            "parent_branch_path": [[1, 1]],
+        }
+    ]
+    assert (
+        prepare_snapshot(
+            store,
+            "alice",
+            later,
+            {1: 1, 2: 1},
+            records=records,
+            replay=replay_with_settled_tools,
+            needs_replay=snapshot_needs_settled_tool_replay,
+        )
+        is None
+    )
 
 
 def test_prepare_snapshot_compatible_prefix_trim(

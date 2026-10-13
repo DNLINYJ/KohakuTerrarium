@@ -681,6 +681,56 @@ class TestSessionIntegration:
             assert all(t in plain_users for t in recorded_user_turns)
         finally:
             plain_store.close()
+        legacy = SessionStore(session_path)
+        try:
+            legacy_messages = legacy.load_conversation("scribe")
+            legacy_messages.append(
+                {
+                    "role": "assistant",
+                    "content": "Only the legacy snapshot contains this answer.",
+                }
+            )
+            legacy.save_conversation("scribe", legacy_messages)
+            legacy.state.pop("scribe:branch_snapshots", None)
+            legacy.state["scribe:snapshot_event_id"] = legacy.max_event_id("scribe")
+            legacy.append_event(
+                "scribe",
+                "plugin_hook_timing",
+                {"hook": "post_llm_call", "duration_s": 0.0},
+                turn_index=3,
+                branch_id=1,
+                parent_branch_path=[[1, 1], [2, 1]],
+            )
+        finally:
+            legacy.close(update_status=False)
+        legacy_agent, legacy_store = await resume_agent_async(session_path)
+        try:
+            legacy_wire = legacy_agent.controller.conversation.to_messages()
+            assert (
+                legacy_wire[-1]["content"]
+                == "Only the legacy snapshot contains this answer."
+            )
+            assert [
+                message["content"]
+                for message in legacy_wire
+                if message.get("role") == "user"
+                and message["content"] in recorded_user_turns
+            ] == recorded_user_turns
+            assert any(
+                "echoed: persisted" in str(message.get("content"))
+                for message in legacy_wire
+            )
+            assert legacy_agent._turn_index == 3
+            assert legacy_agent._branch_id == 1
+            assert legacy_agent._parent_branch_path == [(1, 1), (2, 1)]
+            assert legacy_agent.session.scratchpad.get("project") == "terrarium"
+            assert (
+                legacy_agent._pending_resume_events[-1]["type"] == "plugin_hook_timing"
+            )
+        finally:
+            await legacy_agent._session_output.drain()
+            await asyncio.to_thread(legacy_store.close, update_status=False)
+
         # Resume interrupted output through the async API, then stop with a
         # short tail that never reached the durable streaming checkpoint.
         interrupted = SessionStore(str(session_path))

@@ -192,9 +192,11 @@ def prepare_snapshot(
     replay: Callable,
     needs_replay: Callable,
     before_turn: int | None = None,
+    records: list[dict] | None = None,
 ) -> dict | None:
-    """Restore a proven checkpoint prefix, preserving late-result replay checks."""
-    records = load_records(store, namespace)
+    """Restore a proven checkpoint prefix from validated records, loading when omitted."""
+    if records is None:
+        records = load_records(store, namespace)
     if not records:
         return None
     raw_pairs = {
