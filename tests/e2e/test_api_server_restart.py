@@ -53,7 +53,10 @@ def _write_fixtures(root: Path) -> tuple[Path, Path, Path, Path]:
         "tools:\n  - name: bash\n    type: builtin\n",
         encoding="utf-8",
     )
+    shell_type = "powershell" if sys.platform == "win32" else "bash"
     sleeper = f'"{Path(sys.executable).as_posix()}" -c "import time; time.sleep(90)"'
+    if sys.platform == "win32":
+        sleeper = "& " + sleeper
     recipe = root / "terrariums" / "pair"
     recipe.mkdir(parents=True)
     rel = os.path.relpath(creature, recipe).replace("\\", "/")
@@ -76,7 +79,7 @@ def _write_fixtures(root: Path) -> tuple[Path, Path, Path, Path]:
                     },
                     {
                         "response": "[/bash]\n@@run_in_background=true\n"
-                        f"{sleeper}\n[bash/]",
+                        f"@@type={shell_type}\n{sleeper}\n[bash/]",
                         "match": "start the sleeper",
                     },
                     {"response": "Rerunning the sleeper.", "match": "were killed"},
@@ -252,6 +255,13 @@ def test_crashed_server_restores_running_sessions(tmp_path):
             )
         )
         time.sleep(6)  # past one heartbeat, mid-reply
+        epsilon_before_crash = _history(
+            s1.client, epsilon["session_id"], epsilon["agent_id"]
+        )
+        assert epsilon_before_crash.get("live_job_ids"), (
+            "The sleeper must still be running before the crash",
+            epsilon_before_crash["messages"],
+        )
     finally:
         s1.kill()
 
