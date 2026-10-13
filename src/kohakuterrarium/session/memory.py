@@ -10,6 +10,7 @@ from typing import Any
 from kohakuvault import KVault, TextVault, VectorKVault
 
 from kohakuterrarium.session.embedding import BaseEmbedder, NullEmbedder
+from kohakuterrarium.session.memory_resources import MemoryResources
 from kohakuterrarium.session.memory_blocks import (
     Block,
     RebuildRequired,
@@ -76,18 +77,34 @@ class SessionMemory:
         self._embedder = embedder or NullEmbedder()
         self._has_vectors = not isinstance(self._embedder, NullEmbedder)
 
-        self._fts = TextVault(db_path, table="memory_fts")
+        self._resources = MemoryResources(db_path)
+        try:
+            self._open_indexes(db_path)
+        except BaseException:
+            self._resources.close()
+            raise
+
+    def _open_indexes(self, db_path: str) -> None:
+        self._fts = self._resources.open(
+            TextVault, db_path, table="memory_fts", native_attr="_vault"
+        )
         self._fts.enable_auto_pack()
 
-        self._state = KVault(db_path, table="memory_state")
+        self._state = self._resources.open(
+            KVault, db_path, table="memory_state", native_attr="_inner"
+        )
         self._state.enable_auto_pack()
 
         # Dimension-specific tables prevent incompatible embedding models from mixing.
         self._vec: VectorKVault | None = None
         if self._has_vectors and self._embedder.dimensions > 0:
             dims = self._embedder.dimensions
-            self._vec = VectorKVault(
-                db_path, table=f"memory_vec_{dims}d", dimensions=dims
+            self._vec = self._resources.open(
+                VectorKVault,
+                db_path,
+                table=f"memory_vec_{dims}d",
+                dimensions=dims,
+                native_attr="_vault",
             )
             self._state["vec_dimensions"] = dims
         elif not self._has_vectors:
@@ -95,10 +112,12 @@ class SessionMemory:
             try:
                 saved_dims = self._state["vec_dimensions"]
                 if saved_dims and saved_dims > 0:
-                    self._vec = VectorKVault(
+                    self._vec = self._resources.open(
+                        VectorKVault,
                         db_path,
                         table=f"memory_vec_{saved_dims}d",
                         dimensions=saved_dims,
+                        native_attr="_vault",
                     )
             except (KeyError, Exception):
                 pass
@@ -114,23 +133,7 @@ class SessionMemory:
         are dropped explicitly because public vault close paths can retain Windows
         file locks until garbage collection.
         """
-        state = getattr(self, "_state", None)
-        if state is not None and hasattr(state, "close"):
-            try:
-                state.close()
-            except Exception as e:  # pragma: no cover - cleanup continues per handle
-                logger.warning("memory state close failed", error=str(e), exc_info=True)
-        for table, attr in (
-            (getattr(self, "_state", None), "_inner"),
-            (getattr(self, "_fts", None), "_vault"),
-            (getattr(self, "_vec", None), "_vault"),
-        ):
-            if table is None:
-                continue
-            try:
-                delattr(table, attr)
-            except AttributeError:
-                pass
+        self._resources.close()
 
     def _get_indexed_count(self, agent: str) -> int:
         """Get number of events already indexed for an agent."""
@@ -163,11 +166,13 @@ class SessionMemory:
             # library; its CREATE IF NOT EXISTS leaves the vec0 table intact.
             # Python sqlite3 must not open a live vault: separate SQLite copies
             # can invalidate each other's WAL/locking state on POSIX.
-            reader = TextVault(self._path, table=f"memory_vec_{dims}d")
+            reader = self._resources.open(
+                TextVault, self._path, table=f"memory_vec_{dims}d", native_attr="_vault"
+            )
             try:
                 ids = reader.keys(limit=vault.count())
             finally:
-                del reader._vault
+                self._resources.drop(reader)
         for row_id in ids:
             _, meta = vault.get_by_id(row_id)
             if isinstance(meta, dict) and meta.get("agent") == agent:
@@ -259,11 +264,16 @@ class SessionMemory:
         self._embedder = embedder
         self._has_vectors = not isinstance(embedder, NullEmbedder)
         if self._has_vectors and embedder.dimensions > 0:
-            self._vec = VectorKVault(
+            previous = self._vec
+            self._vec = self._resources.open(
+                VectorKVault,
                 self._path,
                 table=f"memory_vec_{embedder.dimensions}d",
                 dimensions=embedder.dimensions,
+                native_attr="_vault",
             )
+            if previous is not None:
+                self._resources.drop(previous)
             self._state["vec_dimensions"] = embedder.dimensions
 
     def _vector_batch(self, agent: str, events: list[dict], start_from: int = 0):

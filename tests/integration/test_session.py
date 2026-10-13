@@ -64,6 +64,7 @@ from kohakuterrarium.session.migrations import (
     path_for_version,
 )
 from kohakuterrarium.session.readonly import read_session_meta
+from kohakuterrarium.session.resource_gate import try_fast
 from kohakuterrarium.session.raw_history import UserMessageSelector
 from kohakuterrarium.session.resume import detect_session_type, resume_agent
 from kohakuterrarium.session.resume_async import resume_agent_async
@@ -948,7 +949,10 @@ class TestSessionIntegration:
         # ONLY the new events — _extract_blocks emits a tool block and
         # the indexed counter advances past the original two turns.
         patched_llm["script"] = ["[/echo]search-target-token[echo/]", "noted."]
+        assert try_fast(session_path).reason == "not_eligible"
+        assert try_fast(session_path, eligible=True).reason == "legacy_enrolled"
         store.close()
+        assert try_fast(session_path, eligible=True).reason == "legacy_enrolled"
         agent2, store = resume_agent(session_path)
         echo2 = _EchoTool()
         agent2.registry.register_tool(echo2)
@@ -1045,6 +1049,15 @@ class TestSessionIntegration:
                 h.content for h in hits
             }
         store.close()
+        admission = try_fast(session_path, eligible=True)
+        assert admission.reason == "ok"
+        admission.lease.finish(source_released=True)
+        reopened = SessionStore.open_readonly(session_path)
+        try:
+            assert try_fast(session_path, eligible=True).reason == "legacy_enrolled"
+            assert reopened.get_events("seeker")
+        finally:
+            reopened.close()
 
     async def test_fork_at_event_copies_lineage(self, patched_llm, tmp_path):
         """Run an agent, then fork its session at a mid-stream event.

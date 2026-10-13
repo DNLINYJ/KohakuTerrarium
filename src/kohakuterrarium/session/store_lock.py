@@ -57,67 +57,108 @@ def close_tables(
     fts,
     lock: "FileLock | None",
     companion_closers: Iterable[Callable[[], None]] = (),
-) -> None:
+) -> bool:
     """Close every KVault table, drop native handles, release the lock.
 
     Companion resources close first in LIFO order. Native vault handles are
     explicitly dropped because their public close paths can retain SQLite file
     handles on Windows. The writer lock is released even if cleanup fails.
+    Return True only when companions succeeded and native handles were dropped.
     """
+    released = True
     try:
         for closer in reversed(list(companion_closers)):
             try:
                 closer()
             except Exception:
+                released = False
                 logger.warning("Companion closer failed at close", exc_info=True)
         for table in tables:
+            daemon = getattr(table, "_daemon_thread", None)
             table.close()
+            if daemon is not None and daemon.is_alive():
+                released = False
         for table in tables:
             try:
                 del table._inner
             except AttributeError:
                 pass
-        try:
-            del fts._vault
-        except AttributeError:
-            pass
+            except Exception:
+                released = False
+                logger.warning("Native table handle drop failed", exc_info=True)
+        if fts is not None:
+            try:
+                del fts._vault
+            except AttributeError:
+                pass
+            except Exception:
+                released = False
+                logger.warning("Native FTS handle drop failed", exc_info=True)
+    except BaseException:
+        released = False
+        raise
     finally:
         release_writer_lock(lock)
+    return released
 
 
-def discard_partial_open(tables: Iterable[tuple[str, Any]], fts, path: str) -> None:
+def _drop_native_handle(obj: Any, attr: str, *, table: str, path: str) -> bool:
+    try:
+        delattr(obj, attr)
+    except AttributeError:
+        return False
+    except Exception:
+        logger.warning(
+            "partial-open native handle drop failed",
+            table=table,
+            path=path,
+            exc_info=True,
+        )
+        return False
+    return True
+
+
+def discard_partial_open(tables: Iterable[tuple[str, Any]], fts, path: str) -> bool:
     """Release tables opened before a store construction failure.
 
     ``tables`` pairs each attribute name with its KVault, or ``None`` when the
     failure happened before that table opened. Every step is best-effort so one
     failing table cannot keep the others, or the events cache daemon, alive.
+    Return True only after every table and FTS handle was assigned and dropped.
     """
+    released = True
     for name, table in tables:
         if table is None:
+            released = False
             continue
+        daemon = getattr(table, "_daemon_thread", None)
         for step in (table.disable_cache, table.close):
             try:
                 step()
             except Exception:
+                released = False
                 logger.warning(
                     "partial-open cleanup step failed",
                     table=name,
                     path=path,
                     exc_info=True,
                 )
-        try:
-            del table._inner
-        except AttributeError:
-            pass
+        if daemon is not None and daemon.is_alive():
+            released = False
+        if not _drop_native_handle(table, "_inner", table=name, path=path):
+            released = False
     if fts is None:
-        return
+        return False
     try:
         fts.close()
     except Exception:
+        released = False
         logger.warning(
-            "partial-open cleanup step failed", table="fts", path=path, exc_info=True
+            "partial-open cleanup step failed",
+            table="fts",
+            path=path,
+            exc_info=True,
         )
-    try:
-        del fts._vault
-    except AttributeError:
-        pass
+    if not _drop_native_handle(fts, "_vault", table="fts", path=path):
+        released = False
+    return released
