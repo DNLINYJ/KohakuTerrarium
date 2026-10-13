@@ -198,6 +198,52 @@ class TestGetProfile:
 # ---------------------------------------------------------------------------
 
 
+class TestDeprecatedPresets:
+    @pytest.mark.parametrize(
+        "selector,provider,model",
+        [
+            ("gemini/gemini-3.1-pro", "gemini", "gemini-4-argon"),
+            ("gemini/gemini-3.5-flash", "gemini", "gemini-3.8-flash"),
+            ("gemini/gemini-3.1-flash-lite", "gemini", "gemini-3.5-flash-lite"),
+            ("openrouter/gemini-3.1-pro", "openrouter", "google/gemini-4-argon"),
+            ("gemini-3.5-flash-or", "openrouter", "google/gemini-3.8-flash"),
+            ("gemini-3.1-pro-direct", "gemini", "gemini-4-argon"),
+            (
+                "google-antigravity/gemini-3.7-flash",
+                "google-antigravity",
+                "gemini-3.8-flash",
+            ),
+        ],
+    )
+    def test_retired_preset_resolves_to_its_successor(self, selector, provider, model):
+        profile = get_profile(selector)
+        assert (profile.provider, profile.model) == (provider, model)
+
+    def test_successor_variation_still_applies(self):
+        profile = get_profile("gemini/gemini-3.1-pro@thinking=low")
+        assert profile.extra_body == {
+            "extra_body": {"google": {"thinking_config": {"thinking_level": "LOW"}}}
+        }
+
+    def test_bare_retired_name_on_several_providers_is_ambiguous(self):
+        with pytest.raises(ValueError, match="Deprecated preset 'gemini-3.1-pro'"):
+            get_profile("gemini-3.1-pro")
+
+    def test_user_preset_with_a_retired_name_wins(self):
+        save_profile(
+            LLMPreset(
+                name="gemini-3.1-pro", model="gemini-3.1-pro-preview", provider="gemini"
+            )
+        )
+        profile = get_profile("gemini/gemini-3.1-pro")
+        assert profile.model == "gemini-3.1-pro-preview"
+
+    def test_short_aliases_follow_the_current_lineup(self):
+        assert get_profile("gemini").model == "gemini-4-argon"
+        assert get_profile("gemini-flash").model == "gemini-3.8-flash"
+        assert get_profile("gemini-lite").model == "gemini-3.5-flash-lite"
+
+
 class TestVariationSelectors:
     def test_selector_applies_variation_patch(self):
         # claude-opus-4.7 reasoning group: 'low' -> extra_body.output_config.effort

@@ -42,7 +42,11 @@ from kohakuterrarium.llm.preset_store import preset_from_data as _preset_from_da
 from kohakuterrarium.llm.preset_store import serialize_user_data as _serialize_user_data
 from kohakuterrarium.llm.presets import ALIASES as ALIASES
 from kohakuterrarium.llm.presets import PRESETS as PRESETS
-from kohakuterrarium.llm.presets import get_all_presets, resolve_alias
+from kohakuterrarium.llm.presets import (
+    get_all_presets,
+    resolve_alias,
+    resolve_deprecated,
+)
 from kohakuterrarium.llm.profile_types import LLMBackend, LLMPreset, LLMProfile
 from kohakuterrarium.llm.variations import (
     _SHORTHAND_SELECTION_KEY,
@@ -164,7 +168,7 @@ _PROVIDER_DEFAULT_MODELS: list[tuple[str, str]] = [
     ("openrouter", "mimo-v2.5-pro"),
     ("anthropic", "claude-opus-4.8"),
     ("openai", "gpt-5.6-sol"),
-    ("gemini", "gemini-3.1-pro"),
+    ("gemini", "gemini-4-argon"),
     ("mimo", "mimo-v2.5-pro"),
     ("kimi-code", "kimi-for-coding"),
     ("glm-coding", "glm-5.3"),
@@ -324,6 +328,28 @@ def _split_provider_prefix(name: str) -> tuple[str, str]:
     return provider, bare
 
 
+def _deprecated_successor(
+    definitions: dict[tuple[str, str], LLMPreset], name: str, provider: str = ""
+) -> LLMPreset | None:
+    """Resolve a retired built-in preset name to its successor, with a warning."""
+    successors = resolve_deprecated(name, provider)
+    if not successors:
+        return None
+    if len(successors) > 1:
+        providers = sorted(prov for prov, _ in successors)
+        raise ValueError(
+            f"Deprecated preset {name!r} exists under multiple providers: "
+            f"{', '.join(providers)}. Use 'provider/name' with its successor."
+        )
+    successor_provider, successor = successors[0]
+    logger.warning(
+        "Preset is deprecated, using its successor",
+        preset=f"{successor_provider}/{name}",
+        successor=f"{successor_provider}/{successor}",
+    )
+    return definitions.get((successor_provider, successor))
+
+
 def _get_preset_definition(name: str, provider: str = "") -> LLMPreset | None:
     """Resolve qualified names, aliases, or uniquely matched bare preset names."""
     base_name, _ = parse_variation_selector(name)
@@ -342,11 +368,11 @@ def _get_preset_definition(name: str, provider: str = "") -> LLMPreset | None:
         preset = definitions.get((qualified_provider, bare_name))
         if preset is not None:
             return preset
-        return None
+        return _deprecated_successor(definitions, bare_name, qualified_provider)
 
     matches = [p for (prov, n), p in definitions.items() if n == bare_name]
     if not matches:
-        return None
+        return _deprecated_successor(definitions, bare_name)
     if len(matches) > 1:
         providers = sorted({p.provider or "(none)" for p in matches})
         raise ValueError(

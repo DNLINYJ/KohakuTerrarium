@@ -12,7 +12,11 @@ from typing import Any
 from kohakuterrarium.llm.antigravity_presets import PRESETS as AGY_PRESETS
 from kohakuterrarium.llm.codex_presets import PRESETS as GPT6_CODEX_PRESETS
 
-from kohakuterrarium.llm.preset_aliases import _CANONICAL_NAMES, ALIASES
+from kohakuterrarium.llm.preset_aliases import (
+    _CANONICAL_NAMES,
+    ALIASES,
+    resolve_deprecated,
+)
 from kohakuterrarium.llm.preset_groups import (
     _ANTHROPIC_EFFORT_46_GROUP,
     _ANTHROPIC_EFFORT_47_GROUP,
@@ -20,7 +24,6 @@ from kohakuterrarium.llm.preset_groups import (
     _CODEX_SPEED_GROUP,
     _GEMINI_THINKING_GROUP,
     _GEMINI_THINKING_GROUP_WITH_MINIMAL,
-    _GEMINI_THINKING_LITE_GROUP,
     _GLM_EFFORT_GROUP,
     _GPT56_MODE_GROUP,
     _GPT56_REASONING_GROUP,
@@ -33,8 +36,10 @@ from kohakuterrarium.llm.preset_groups import (
     _OPENAI_SPEED_GROUP,
     _OR_REASONING_GROUP,
     _OR_REASONING_GROUP_56,
+    _OR_REASONING_GROUP_NO_MINIMAL,
     _OR_REASONING_GROUP_WITH_XHIGH,
     _OR_REASONING_TOGGLE_GROUP,
+    _gemini_thinking,
 )
 from kohakuterrarium.packages.walk import list_packages
 from kohakuterrarium.utils.logging import get_logger
@@ -45,6 +50,7 @@ __all__ = [
     "get_all_presets",
     "iter_all_presets",
     "resolve_alias",
+    "resolve_deprecated",
 ]
 
 logger = get_logger(__name__)
@@ -511,68 +517,67 @@ PRESETS: dict[str, dict[str, Any]] = {
         },
     },
     # ═══════════════════════════════════════════════════════
-    #  Google Gemini Direct API (primary — OpenAI-compat endpoint).
-    #  3.1 Pro is still the Pro tier (3.5 Pro not GA yet, ~mid-July
-    #  2026); Flash moved to 3.5 (GA); Flash-Lite 3.1 id is stable.
+    #  Google Gemini Direct API (OpenAI-compat endpoint).
+    #  4 Argon is the flagship; 3.8 Flash and 3.5 Flash-Lite are
+    #  the stable Flash tiers.
     # ═══════════════════════════════════════════════════════
-    "gemini-3.1-pro": {
+    "gemini-4-argon": {
         "provider": "gemini",
-        "model": "gemini-3.1-pro-preview",
+        "model": "gemini-4-argon",
         "max_context": 1048576,
-        "extra_body": {"google": {"thinking_config": {"thinking_level": "HIGH"}}},
+        "max_output": 65536,
+        "extra_body": _gemini_thinking("HIGH"),
         "variation_groups": {"thinking": _GEMINI_THINKING_GROUP},
     },
-    "gemini-3.5-flash": {
+    "gemini-3.8-flash": {
         "provider": "gemini",
-        "model": "gemini-3.5-flash",
+        "model": "gemini-3.8-flash",
         "max_context": 1048576,
         "max_output": 65536,
-        "extra_body": {"google": {"thinking_config": {"thinking_level": "HIGH"}}},
-        # Flash supports the full set MINIMAL/LOW/MEDIUM/HIGH (default
-        # MEDIUM per the 2026-07 docs).
-        "variation_groups": {"thinking": _GEMINI_THINKING_GROUP_WITH_MINIMAL},
+        "extra_body": _gemini_thinking("HIGH"),
+        "variation_groups": {"thinking": _GEMINI_THINKING_GROUP},
     },
-    "gemini-3.1-flash-lite": {
+    "gemini-3.5-flash-lite": {
         "provider": "gemini",
-        "model": "gemini-3.1-flash-lite",
+        "model": "gemini-3.5-flash-lite",
         "max_context": 1048576,
         "max_output": 65536,
-        # Lite accepts MINIMAL/LOW/MEDIUM only (no HIGH; default MINIMAL).
-        "extra_body": {"google": {"thinking_config": {"thinking_level": "MEDIUM"}}},
-        "variation_groups": {"thinking": _GEMINI_THINKING_LITE_GROUP},
+        "extra_body": _gemini_thinking("MEDIUM"),
+        "variation_groups": {"thinking": _GEMINI_THINKING_GROUP_WITH_MINIMAL},
     },
     # ═══════════════════════════════════════════════════════
     #  Google Gemini via OpenRouter (-or suffix).
-    #  OR keeps the ``-preview`` suffix on flash-lite even though
-    #  the direct API id is stable.
     # ═══════════════════════════════════════════════════════
-    "gemini-3.1-pro-or": {
+    "gemini-4-argon-or": {
         "provider": "openrouter",
-        "model": "google/gemini-3.1-pro-preview",
+        "model": "google/gemini-4-argon",
         "max_context": 1048576,
+        "max_output": 65536,
         "extra_body": {"reasoning": {"enabled": True, "effort": "high"}},
-        "variation_groups": {"reasoning": _OR_REASONING_GROUP},
+        "variation_groups": {"reasoning": _OR_REASONING_GROUP_NO_MINIMAL},
     },
-    "gemini-3.5-flash-or": {
+    "gemini-3.8-flash-or": {
         "provider": "openrouter",
-        "model": "google/gemini-3.5-flash",
+        "model": "google/gemini-3.8-flash",
         "max_context": 1048576,
+        "max_output": 65536,
         "extra_body": {"reasoning": {"enabled": True, "effort": "high"}},
-        "variation_groups": {"reasoning": _OR_REASONING_GROUP},
+        "variation_groups": {"reasoning": _OR_REASONING_GROUP_NO_MINIMAL},
     },
-    "gemini-3.1-flash-lite-or": {
+    "gemini-3.5-flash-lite-or": {
         "provider": "openrouter",
-        "model": "google/gemini-3.1-flash-lite-preview",
+        "model": "google/gemini-3.5-flash-lite",
         "max_context": 1048576,
+        "max_output": 65536,
         "extra_body": {"reasoning": {"enabled": True, "effort": "high"}},
         "variation_groups": {"reasoning": _OR_REASONING_GROUP},
     },
     # Image generation — reasoning doesn't apply.
     "nano-banana": {
         "provider": "openrouter",
-        # "Nano Banana 2" (Gemini 3.1 Flash Image).
-        "model": "google/gemini-3.1-flash-image-preview",
-        "max_context": 131072,
+        # "Nano Banana 2.1".
+        "model": "google/gemini-nano-banana-2.1",
+        "max_context": 65536,
         "max_output": 32768,
     },
     "nano-banana-pro": {

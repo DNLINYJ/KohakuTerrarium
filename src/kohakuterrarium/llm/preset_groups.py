@@ -8,6 +8,8 @@ copy-pasted option dictionaries.
 
 from typing import Any
 
+from kohakuterrarium.llm.variations import apply_patch_map
+
 # Codex OAuth accepts a top-level effort value; unlike the direct API, it omits none.
 _CODEX_REASONING_GROUP: dict[str, dict[str, Any]] = {
     "low": {"reasoning_effort": "low"},
@@ -103,6 +105,13 @@ _OR_REASONING_GROUP: dict[str, dict[str, Any]] = {
     "high": {"extra_body.reasoning.effort": "high"},
 }
 
+# Models without a minimal level, where OpenRouter would silently clamp it to low.
+_OR_REASONING_GROUP_NO_MINIMAL: dict[str, dict[str, Any]] = {
+    effort: patch
+    for effort, patch in _OR_REASONING_GROUP.items()
+    if effort != "minimal"
+}
+
 # Keep xhigh separate because many OpenRouter models silently clamp it to high.
 _OR_REASONING_GROUP_WITH_XHIGH: dict[str, dict[str, Any]] = {
     **_OR_REASONING_GROUP,
@@ -151,28 +160,23 @@ _ANTHROPIC_EFFORT_47_GROUP: dict[str, dict[str, Any]] = {
     "max": {"extra_body.output_config.effort": "max"},
 }
 
-# Gemini direct ``thinking_level`` (enum — replaced ``thinking_budget``).
-#   Gemini 3.1 Pro:         LOW / MEDIUM / HIGH        (default HIGH)
-#   Gemini 3.5 Flash:       MINIMAL / LOW / MEDIUM / HIGH  (default MEDIUM)
-#   Gemini 3.1 Flash-Lite:  MINIMAL / LOW / MEDIUM     (default MINIMAL)
-# (All per the 2026-07 Google AI for Developers docs.)
+# Gemini OpenAI-compat reads ``google`` only nested in a body-level
+# ``extra_body``. 4 Argon / 3.8 Flash reject MINIMAL; 3.5 Flash-Lite takes it.
+_GEMINI_THINKING_PATH = "extra_body.extra_body.google.thinking_config.thinking_level"
 _GEMINI_THINKING_GROUP: dict[str, dict[str, Any]] = {
-    "low": {"extra_body.google.thinking_config.thinking_level": "LOW"},
-    "medium": {"extra_body.google.thinking_config.thinking_level": "MEDIUM"},
-    "high": {"extra_body.google.thinking_config.thinking_level": "HIGH"},
+    level.lower(): {_GEMINI_THINKING_PATH: level} for level in ("LOW", "MEDIUM", "HIGH")
 }
 
 _GEMINI_THINKING_GROUP_WITH_MINIMAL: dict[str, dict[str, Any]] = {
-    "minimal": {"extra_body.google.thinking_config.thinking_level": "MINIMAL"},
+    "minimal": {_GEMINI_THINKING_PATH: "MINIMAL"},
     **_GEMINI_THINKING_GROUP,
 }
 
-# Flash-Lite omits HIGH from its accepted thinking levels.
-_GEMINI_THINKING_LITE_GROUP: dict[str, dict[str, Any]] = {
-    "minimal": {"extra_body.google.thinking_config.thinking_level": "MINIMAL"},
-    "low": {"extra_body.google.thinking_config.thinking_level": "LOW"},
-    "medium": {"extra_body.google.thinking_config.thinking_level": "MEDIUM"},
-}
+
+def _gemini_thinking(level: str) -> dict[str, Any]:
+    """Preset ``extra_body`` with a default level, at ``_GEMINI_THINKING_GROUP``'s path."""
+    return apply_patch_map({}, {_GEMINI_THINKING_PATH: level})["extra_body"]
+
 
 # Xiaomi MiMo 2.5 direct API: hybrid thinking is a binary toggle
 # ``thinking.type = enabled | disabled`` (default disabled). There is no

@@ -3,6 +3,8 @@
 Map flat preset keys and user-facing aliases to canonical provider/name pairs.
 """
 
+from kohakuterrarium.llm.antigravity_presets import DEPRECATED as AGY_DEPRECATED
+
 # Provider identity disambiguates flat keys whose public names drop route suffixes.
 _CANONICAL_NAMES: dict[str, str] = {
     # OpenAI Direct API — ``-api`` suffix.
@@ -30,9 +32,9 @@ _CANONICAL_NAMES: dict[str, str] = {
     "claude-sonnet-4.6-or": "claude-sonnet-4.6",
     "claude-haiku-4.5-or": "claude-haiku-4.5",
     # Gemini via OpenRouter — ``-or`` suffix.
-    "gemini-3.1-pro-or": "gemini-3.1-pro",
-    "gemini-3.5-flash-or": "gemini-3.5-flash",
-    "gemini-3.1-flash-lite-or": "gemini-3.1-flash-lite",
+    "gemini-4-argon-or": "gemini-4-argon",
+    "gemini-3.8-flash-or": "gemini-3.8-flash",
+    "gemini-3.5-flash-lite-or": "gemini-3.5-flash-lite",
     # MiMo via OpenRouter — ``-or`` suffix.
     "mimo-v2.5-pro-or": "mimo-v2.5-pro",
     "mimo-v2.5-or": "mimo-v2.5",
@@ -53,10 +55,10 @@ ALIASES: dict[str, tuple[str, str]] = {
     "luna": ("codex", "gpt-5.6-luna"),
     "gpt55": ("codex", "gpt-5.5"),
     "gpt54": ("codex", "gpt-5.4"),
-    "gemini": ("gemini", "gemini-3.1-pro"),
-    "gemini-pro": ("gemini", "gemini-3.1-pro"),
-    "gemini-flash": ("gemini", "gemini-3.5-flash"),
-    "gemini-lite": ("gemini", "gemini-3.1-flash-lite"),
+    "gemini": ("gemini", "gemini-4-argon"),
+    "gemini-pro": ("gemini", "gemini-4-argon"),
+    "gemini-flash": ("gemini", "gemini-3.8-flash"),
+    "gemini-lite": ("gemini", "gemini-3.5-flash-lite"),
     "claude": ("anthropic", "claude-sonnet-5"),
     "claude-sonnet": ("anthropic", "claude-sonnet-5"),
     "claude-opus": ("anthropic", "claude-opus-4.8"),
@@ -127,12 +129,15 @@ ALIASES: dict[str, tuple[str, str]] = {
     "claude-sonnet-4.6-or": ("openrouter", "claude-sonnet-4.6"),
     "claude-haiku-4.5-or": ("openrouter", "claude-haiku-4.5"),
     # Gemini direct (``-direct``) + OR.
-    "gemini-3.1-pro-direct": ("gemini", "gemini-3.1-pro"),
-    "gemini-3.5-flash-direct": ("gemini", "gemini-3.5-flash"),
-    "gemini-3.1-flash-lite-direct": ("gemini", "gemini-3.1-flash-lite"),
-    "gemini-3.1-pro-or": ("openrouter", "gemini-3.1-pro"),
-    "gemini-3.5-flash-or": ("openrouter", "gemini-3.5-flash"),
-    "gemini-3.1-flash-lite-or": ("openrouter", "gemini-3.1-flash-lite"),
+    "gemini-3.1-pro-direct": ("gemini", "gemini-4-argon"),
+    "gemini-3.5-flash-direct": ("gemini", "gemini-3.8-flash"),
+    "gemini-3.1-flash-lite-direct": ("gemini", "gemini-3.5-flash-lite"),
+    "gemini-3.1-pro-or": ("openrouter", "gemini-4-argon"),
+    "gemini-3.5-flash-or": ("openrouter", "gemini-3.8-flash"),
+    "gemini-3.1-flash-lite-or": ("openrouter", "gemini-3.5-flash-lite"),
+    "gemini-4-argon-or": ("openrouter", "gemini-4-argon"),
+    "gemini-3.8-flash-or": ("openrouter", "gemini-3.8-flash"),
+    "gemini-3.5-flash-lite-or": ("openrouter", "gemini-3.5-flash-lite"),
     # MiMo direct + OR.
     "mimo-v2.5-pro-direct": ("mimo", "mimo-v2.5-pro"),
     "mimo-v2.5-direct": ("mimo", "mimo-v2.5"),
@@ -143,3 +148,24 @@ ALIASES: dict[str, tuple[str, str]] = {
     "glm-5.2-1m-coding": ("glm-coding", "glm-5.2-1m"),
     "glm-5.2-or": ("openrouter", "glm-5.2"),
 }
+
+
+# Retired presets keep resolving, to the successor on the same provider.
+DEPRECATED_PRESETS: dict[tuple[str, str], str] = {
+    ("gemini", "gemini-3.1-pro"): "gemini-4-argon",
+    ("gemini", "gemini-3.5-flash"): "gemini-3.8-flash",
+    ("gemini", "gemini-3.1-flash-lite"): "gemini-3.5-flash-lite",
+    ("openrouter", "gemini-3.1-pro"): "gemini-4-argon",
+    ("openrouter", "gemini-3.5-flash"): "gemini-3.8-flash",
+    ("openrouter", "gemini-3.1-flash-lite"): "gemini-3.5-flash-lite",
+    **{("google-antigravity", old): new for old, new in AGY_DEPRECATED.items()},
+}
+
+
+def resolve_deprecated(name: str, provider: str = "") -> list[tuple[str, str]]:
+    """Map a retired preset name to its successors, on one or every provider."""
+    return [
+        (prov, successor)
+        for (prov, old), successor in DEPRECATED_PRESETS.items()
+        if old == name and (not provider or prov == provider)
+    ]

@@ -318,10 +318,10 @@ LLM 可输出的内嵌指令，可替换工具调用。它们会直接与框架�
 
 命名惯例 (2026-04 重构后)：
 
-- Direct / native-API 变体为主要名称 (`claude-opus-4.7`、`gemini-3.1-pro`、`mimo-v2-pro`)。
+- Direct / native-API 变体为主要名称 (`claude-opus-4.7`、`gemini-4-argon`、`mimo-v2-pro`)。
 - 走 OpenRouter 的变体用 `-or` 后缀 (`claude-opus-4.7-or`)。
 - OpenAI 是例外：`gpt-5.4` 仍绑到 **Codex OAuth** provider；OpenAI API 直连变体用 `-api`，OpenRouter 变体用 `-or`。
-- 旧名称 (`claude-opus-4.6-direct`、`or-gpt-5.4`、`gemini-3.1-pro-direct`、`mimo-v2-pro-direct`…) 作为别名保留，既有 config 继续可用。
+- 旧名称 (`claude-opus-4.6-direct`、`or-gpt-5.4`、`mimo-v2-pro-direct`…) 作为别名保留，既有 config 继续可用。
 
 ### OpenAI via Codex OAuth
 
@@ -373,16 +373,24 @@ LLM 可输出的内嵌指令，可替换工具调用。它们会直接与框架�
 
 ### Google Gemini Direct (OpenAI-compat)
 
-- `gemini-3.1-pro` (别名：`gemini`、`gemini-pro`；旧：`gemini-3.1-pro-direct`)
-- `gemini-3-flash` (`gemini-flash`；旧：`gemini-3-flash-direct`)
-- `gemini-3.1-flash-lite` (`gemini-lite`；旧：`gemini-3.1-flash-lite-direct`)
+- `gemini-4-argon` (别名：`gemini`、`gemini-pro`)
+- `gemini-3.8-flash` (`gemini-flash`)
+- `gemini-3.5-flash-lite` (`gemini-lite`)
 
 ### Google Gemini via OpenRouter (`-or` 后缀)
 
-- `gemini-3.1-pro-or`
-- `gemini-3-flash-or`
-- `gemini-3.1-flash-lite-or`
-- `nano-banana` (图像生成模型，OpenRouter)
+- `gemini-4-argon-or`
+- `gemini-3.8-flash-or`
+- `gemini-3.5-flash-lite-or`
+- `nano-banana` (Nano Banana 2.1 图像生成模型，OpenRouter)
+
+### 已弃用的预设
+
+已退役的预设仍可解析，会落到同一 provider 上的后继预设并记录警告：
+`gemini-3.1-pro` → `gemini-4-argon`、`gemini-3.5-flash` → `gemini-3.8-flash`、
+`gemini-3.1-flash-lite` → `gemini-3.5-flash-lite`（`gemini` 与 `openrouter`，
+含 `-direct` / `-or` 名称）。已退役的 Google Antigravity 预设同样映射，见
+[Antigravity](../guides/antigravity.md)。同名的用户预设优先。
 
 ### Google Gemma (OpenRouter)
 
@@ -521,18 +529,20 @@ Patch `extra_body.reasoning.effort`。`xhigh` 只有 Opus 4.7 会认。
 
 ### Google Gemini：Direct
 
-Patch `extra_body.google.thinking_config.thinking_level`。
+Patch `extra_body.extra_body.google.thinking_config.thinking_level`：Gemini
+OpenAI-compat 端点只在请求体层级的 `extra_body` 对象中读取 `google`。
 
 | Preset | Group | Options |
 |---|---|---|
-| `gemini-3.1-pro` | `thinking` | `low`、`medium`、`high` |
-| `gemini-3-flash`、`gemini-3.1-flash-lite` | `thinking` | `minimal`、`low`、`medium`、`high` |
+| `gemini-4-argon` (默认 `high`)、`gemini-3.8-flash` (默认 `high`) | `thinking` | `low`、`medium`、`high` |
+| `gemini-3.5-flash-lite` (默认 `medium`) | `thinking` | `minimal`、`low`、`medium`、`high` |
 
 ### Google Gemini：OpenRouter
 
 | Preset | Group | Options |
 |---|---|---|
-| `gemini-3.1-pro-or`、`gemini-3-flash-or`、`gemini-3.1-flash-lite-or` | `reasoning` | `minimal`、`low`、`medium`、`high` |
+| `gemini-4-argon-or`、`gemini-3.8-flash-or` | `reasoning` | `low`、`medium`、`high` |
+| `gemini-3.5-flash-lite-or` | `reasoning` | `minimal`、`low`、`medium`、`high` |
 
 ### Gemma / Qwen / Kimi / MiMo / GLM：OpenRouter
 

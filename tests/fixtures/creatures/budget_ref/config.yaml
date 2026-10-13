@@ -3,7 +3,7 @@ version: "1.0"
 
 controller:
   # LLM is resolved from: --llm flag > default model (kt model default) > inline config
-  # Set a default: kt model default gemini-3.1-pro
+  # Set a default: kt model default gemini-4-argon
   reasoning_effort: "${REASONING:medium}"
 
 system_prompt_file: prompts/system.md

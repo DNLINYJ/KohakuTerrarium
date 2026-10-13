@@ -377,15 +377,15 @@ Shipped in `src/kohakuterrarium/llm/presets.py`. Use them as `llm:` or
 Naming convention (post-2026-04 refactor):
 
 - Direct / native-API variants are the primary name
-  (`claude-opus-4.7`, `gemini-3.1-pro`, `mimo-v2-pro`).
+  (`claude-opus-4.7`, `gemini-4-argon`, `mimo-v2-pro`).
 - OpenRouter-routed variants use the `-or` suffix
   (`claude-opus-4.7-or`).
 - OpenAI is an exception: `gpt-5.4` stays bound to the **Codex OAuth**
   provider; the direct OpenAI API variant uses `-api`, OpenRouter uses
   `-or`.
 - Legacy names (`claude-opus-4.6-direct`, `or-gpt-5.4`,
-  `gemini-3.1-pro-direct`, `mimo-v2-pro-direct`, …) survive as aliases
-  so existing configs keep working.
+  `mimo-v2-pro-direct`, …) survive as aliases so existing configs keep
+  working.
 
 ### OpenAI via Codex OAuth
 
@@ -439,16 +439,26 @@ Routed through the native Anthropic-compatible Messages API. Effort via
 
 ### Google Gemini Direct (OpenAI-compat)
 
-- `gemini-3.1-pro` (aliases: `gemini`, `gemini-pro`; legacy: `gemini-3.1-pro-direct`)
-- `gemini-3-flash` (`gemini-flash`; legacy: `gemini-3-flash-direct`)
-- `gemini-3.1-flash-lite` (`gemini-lite`; legacy: `gemini-3.1-flash-lite-direct`)
+- `gemini-4-argon` (aliases: `gemini`, `gemini-pro`)
+- `gemini-3.8-flash` (`gemini-flash`)
+- `gemini-3.5-flash-lite` (`gemini-lite`)
 
 ### Google Gemini via OpenRouter (`-or` suffix)
 
-- `gemini-3.1-pro-or`
-- `gemini-3-flash-or`
-- `gemini-3.1-flash-lite-or`
-- `nano-banana` (image-generation model, OpenRouter)
+- `gemini-4-argon-or`
+- `gemini-3.8-flash-or`
+- `gemini-3.5-flash-lite-or`
+- `nano-banana` (Nano Banana 2.1 image-generation model, OpenRouter)
+
+### Deprecated presets
+
+Retired presets keep resolving to their successor on the same provider, with a
+logged warning: `gemini-3.1-pro` → `gemini-4-argon`, `gemini-3.5-flash` →
+`gemini-3.8-flash`, `gemini-3.1-flash-lite` → `gemini-3.5-flash-lite` (on
+`gemini` and `openrouter`, including the `-direct` / `-or` names). The retired
+Google Antigravity presets map the same way; see
+[Antigravity](../guides/antigravity.md). A user preset with the same name takes
+precedence.
 
 ### Google Gemma (OpenRouter)
 
@@ -614,18 +624,21 @@ Opus 4.7.
 
 ### Google Gemini: Direct
 
-Patches `extra_body.google.thinking_config.thinking_level`.
+Patches `extra_body.extra_body.google.thinking_config.thinking_level`: the
+Gemini OpenAI-compat endpoint reads `google` only inside a body-level
+`extra_body` object.
 
 | Preset | Group | Options |
 |---|---|---|
-| `gemini-3.1-pro` | `thinking` | `low`, `medium`, `high` |
-| `gemini-3-flash`, `gemini-3.1-flash-lite` | `thinking` | `minimal`, `low`, `medium`, `high` |
+| `gemini-4-argon` (default `high`), `gemini-3.8-flash` (default `high`) | `thinking` | `low`, `medium`, `high` |
+| `gemini-3.5-flash-lite` (default `medium`) | `thinking` | `minimal`, `low`, `medium`, `high` |
 
 ### Google Gemini: OpenRouter
 
 | Preset | Group | Options |
 |---|---|---|
-| `gemini-3.1-pro-or`, `gemini-3-flash-or`, `gemini-3.1-flash-lite-or` | `reasoning` | `minimal`, `low`, `medium`, `high` |
+| `gemini-4-argon-or`, `gemini-3.8-flash-or` | `reasoning` | `low`, `medium`, `high` |
+| `gemini-3.5-flash-lite-or` | `reasoning` | `minimal`, `low`, `medium`, `high` |
 
 ### Gemma / Qwen / Kimi / MiMo / GLM: OpenRouter
 
