@@ -59,7 +59,7 @@ Run `kt config key set deepseek` or set `DEEPSEEK_API_KEY`, then select
 
 ```yaml
 controller:
-  llm: deepseek/deepseek-flash@reasoning=high
+  llm: deepseek/deepseek-flash@context=400k,reasoning=high
 ```
 
 Both presets use the OpenAI-compatible Chat Completions endpoint at
@@ -68,6 +68,13 @@ Both presets use the OpenAI-compatible Chat Completions endpoint at
 `low`, `high` (default), and `max`; `none` disables thinking. These variations
 set `extra_body.thinking.type` and `extra_body.reasoning_effort` together.
 KT preserves the returned reasoning content for subsequent tool-call turns.
+
+The `context` variation offers `272k`, `400k`, `700k`, and `1m`, like the GPT
+presets. It controls KT's operating context budget and auto-compaction
+threshold. The first three options use 272,000, 400,000, and 700,000 tokens;
+`1m` restores DeepSeek's full 1,048,576-token window, which remains the default
+when no context option is selected. Context and reasoning can be selected
+independently; the output limit is unchanged.
 
 `deepseek` and `deepseek-pro` select Pro. The legacy Flash names
 `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` resolve to

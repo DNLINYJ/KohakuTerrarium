@@ -192,6 +192,12 @@ class TestApiSettingsJourney:
             assert model["available"] is True
             assert model["max_context"] == 1048576
             assert model["max_output"] == 393216
+            assert model["variation_groups"]["context"] == {
+                "272k": {"max_context": 272000},
+                "400k": {"max_context": 400000},
+                "700k": {"max_context": 700000},
+                "1m": {"max_context": 1048576},
+            }
             assert set(model["variation_groups"]["reasoning"]) == {
                 "none",
                 "low",
