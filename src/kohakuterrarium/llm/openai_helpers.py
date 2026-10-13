@@ -7,6 +7,8 @@ from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+TOOL_CALL_EXTRA_KEY = "_kt_tool_call_extra"
+
 
 def extract_usage(usage: Any) -> dict[str, int]:
     """Extract KT's standard token-usage dict from SDK usage objects."""
@@ -141,7 +143,49 @@ def normalize_stateful_assistant_fields(
     return normalized if changed else messages
 
 
-def tool_call_from_pending(call: dict[str, str]) -> NativeToolCall:
+def is_gemini_endpoint(base_url: str | None) -> bool:
+    """True for Google's Gemini OpenAI-compatible endpoint."""
+    return "generativelanguage.googleapis.com" in (base_url or "")
+
+
+def tool_call_extra(tool_call: Any) -> dict[str, Any] | None:
+    """Return a tool call's provider ``extra_content`` (Gemini thought signatures)."""
+    value = delta_field(tool_call, "extra_content")
+    return value if isinstance(value, dict) and value else None
+
+
+def collect_tool_call_extra(calls: list[dict[str, Any]]) -> dict[str, Any]:
+    """Map tool-call id to its ``extra_content`` for the assistant's round-trip state."""
+    return {
+        call["id"]: call["extra_content"]
+        for call in calls
+        if call.get("id") and call.get("extra_content")
+    }
+
+
+def restore_tool_call_extra(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Put each recorded ``extra_content`` back on its assistant tool call."""
+    out: list[dict[str, Any]] = []
+    changed = False
+    for msg in messages:
+        extra = msg.get(TOOL_CALL_EXTRA_KEY)
+        if not isinstance(extra, dict) or not msg.get("tool_calls"):
+            out.append(msg)
+            continue
+        calls = [
+            (
+                {**call, "extra_content": extra[call.get("id")]}
+                if call.get("id") in extra
+                else call
+            )
+            for call in msg["tool_calls"]
+        ]
+        out.append({**msg, "tool_calls": calls})
+        changed = True
+    return out if changed else messages
+
+
+def tool_call_from_pending(call: dict[str, Any]) -> NativeToolCall:
     """Convert a streaming tool-call accumulator to a native call."""
     return NativeToolCall(
         id=call["id"],

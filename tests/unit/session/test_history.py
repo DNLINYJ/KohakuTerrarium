@@ -101,6 +101,22 @@ class TestReplayConversation:
         assert assistant["reasoning_content"] == "think"
         assert assistant["_kt_assistant_segments"][0]["text"] == "think"
 
+    def test_tool_call_signature_state_attaches_to_previous_assistant(self):
+        signature = {"call-1": {"google": {"thought_signature": "sig"}}}
+        events = [
+            {"type": "user_message", "content": "q", "event_id": 1},
+            {"type": "text_chunk", "content": "answer", "event_id": 2},
+            {
+                "type": "assistant_reasoning",
+                "event_id": 3,
+                "_kt_tool_call_extra": signature,
+            },
+        ]
+        assistant = next(
+            m for m in replay_conversation(events) if m["role"] == "assistant"
+        )
+        assert assistant["_kt_tool_call_extra"] == signature
+
     def test_user_message(self):
         events = [{"type": "user_message", "content": "hi", "event_id": 0}]
         out = replay_conversation(events)

@@ -177,6 +177,17 @@ _STANDARD_MESSAGE_KEYS = frozenset(
     {"role", "content", "name", "tool_call_id", "tool_calls"}
 )
 
+# Assistant fields carrying provider round-trip state through events and resume.
+ASSISTANT_STATE_KEYS = (
+    "reasoning_content",
+    "reasoning_summary",
+    "reasoning_details",
+    "reasoning",
+    "_kt_assistant_segments",
+    "_kt_antigravity_content",
+    "_kt_tool_call_extra",
+)
+
 
 @dataclass
 class Message:

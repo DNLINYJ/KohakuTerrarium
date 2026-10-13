@@ -11,6 +11,7 @@ from kohakuterrarium.core.compact_branch import (
 )
 from kohakuterrarium.core.job_label import canonical_tool_name, make_job_label
 from kohakuterrarium.llm.antigravity_format import replay_target
+from kohakuterrarium.llm.message import ASSISTANT_STATE_KEYS
 
 # Parent paths identify the selected branches of earlier turns. Legacy events
 # derive this ancestry from event order when no explicit path was persisted.
@@ -744,14 +745,7 @@ def replay_conversation(
             if state:
                 target = replay_target(messages, target, state)
             if target is not None:
-                for key in (
-                    "reasoning_content",
-                    "reasoning_summary",
-                    "reasoning_details",
-                    "reasoning",
-                    "_kt_assistant_segments",
-                    "_kt_antigravity_content",
-                ):
+                for key in ASSISTANT_STATE_KEYS:
                     value = evt.get(key)
                     if value not in (None, "", [], {}):
                         target[key] = value

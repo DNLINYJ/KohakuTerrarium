@@ -24,13 +24,18 @@ from kohakuterrarium.llm.base import (
 )
 from kohakuterrarium.llm.artifact_resolve import resolve_message_image_urls
 from kohakuterrarium.llm.openai_helpers import (
+    TOOL_CALL_EXTRA_KEY,
+    collect_tool_call_extra,
     delta_field,
     delta_field_present,
     extract_usage,
+    is_gemini_endpoint,
     log_token_usage,
     merge_reasoning_detail_stream,
     normalize_stateful_assistant_fields,
     pack_reasoning_fields,
+    restore_tool_call_extra,
+    tool_call_extra,
     tool_call_from_pending,
     tool_calls_from_message,
 )
@@ -264,6 +269,8 @@ class OpenAIProvider(BaseLLMProvider):
     def _prepare_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Resolve local images, strip internal fields, and add eligible cache markers."""
         messages = resolve_message_image_urls(messages)
+        if is_gemini_endpoint(self.base_url):
+            messages = restore_tool_call_extra(messages)
         messages = strip_internal_message_fields(messages)
         messages = strip_kt_extras(messages)
         messages = normalize_stateful_assistant_fields(messages)
@@ -444,7 +451,7 @@ class OpenAIProvider(BaseLLMProvider):
         )
 
         self._last_usage = {}
-        pending_calls: dict[int, dict[str, str]] = {}
+        pending_calls: dict[int, dict[str, Any]] = {}
         segments = TurnSegmentsBuilder()
         reasoning_text = ""
         reasoning_details: list[Any] = []
@@ -475,6 +482,9 @@ class OpenAIProvider(BaseLLMProvider):
                         pending_calls[idx] = {"id": "", "name": "", "arguments": ""}
                     if tc_delta.id:
                         pending_calls[idx]["id"] = tc_delta.id
+                    extra = tool_call_extra(tc_delta)
+                    if extra:
+                        pending_calls[idx]["extra_content"] = extra
                     if tc_delta.function:
                         if tc_delta.function.name:
                             pending_calls[idx]["name"] = tc_delta.function.name
@@ -553,6 +563,13 @@ class OpenAIProvider(BaseLLMProvider):
                 has_content=bool(reasoning_text),
                 details_count=len(reasoning_details),
             )
+
+        tool_extra = collect_tool_call_extra(list(pending_calls.values()))
+        if tool_extra:
+            self._last_assistant_extra_fields = {
+                **self._last_assistant_extra_fields,
+                TOOL_CALL_EXTRA_KEY: tool_extra,
+            }
 
         log_token_usage(self._last_usage)
 
@@ -638,6 +655,12 @@ class OpenAIProvider(BaseLLMProvider):
         choice = response.choices[0]
         message = choice.message
 
+        tool_extra = collect_tool_call_extra(
+            [
+                {"id": tc.id, "extra_content": tool_call_extra(tc)}
+                for tc in message.tool_calls or []
+            ]
+        )
         if message.tool_calls:
             self._last_tool_calls = tool_calls_from_message(message.tool_calls)
             logger.debug(
@@ -683,6 +706,11 @@ class OpenAIProvider(BaseLLMProvider):
             self._last_assistant_extra_fields = segments.inject_into(
                 self._last_assistant_extra_fields
             )
+        if tool_extra:
+            self._last_assistant_extra_fields = {
+                **self._last_assistant_extra_fields,
+                TOOL_CALL_EXTRA_KEY: tool_extra,
+            }
 
         if response.usage:
             self._last_usage = extract_usage(response.usage)

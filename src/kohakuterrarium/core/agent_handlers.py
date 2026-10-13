@@ -26,6 +26,7 @@ from kohakuterrarium.core.events import (
     create_tool_complete_event,
 )
 from kohakuterrarium.core.pending_input import stamp_pending_id
+from kohakuterrarium.llm.message import ASSISTANT_STATE_KEYS
 from kohakuterrarium.modules.output.event import OutputEvent
 from kohakuterrarium.modules.tool.base import ExecutionMode
 from kohakuterrarium.parsing import (
@@ -687,14 +688,7 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
             or {}
         )
         reasoning_metadata = {}
-        for key in (
-            "reasoning_content",
-            "reasoning_summary",
-            "reasoning_details",
-            "reasoning",
-            "_kt_assistant_segments",
-            "_kt_antigravity_content",
-        ):
+        for key in ASSISTANT_STATE_KEYS:
             value = fields.get(key)
             if value not in (None, "", [], {}):
                 reasoning_metadata[key] = value

@@ -9,6 +9,7 @@ import json
 from typing import Any
 
 from kohakuterrarium.core.job_label import canonical_tool_name, make_job_label
+from kohakuterrarium.llm.message import ASSISTANT_STATE_KEYS
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -64,14 +65,7 @@ class SessionActivityMixin:
         self, name: str, detail: str, metadata: dict
     ) -> None:
         payload = {}
-        for key in (
-            "reasoning_content",
-            "reasoning_summary",
-            "reasoning_details",
-            "reasoning",
-            "_kt_assistant_segments",
-            "_kt_antigravity_content",
-        ):
+        for key in ASSISTANT_STATE_KEYS:
             value = metadata.get(key)
             if value not in (None, "", [], {}):
                 payload[key] = value
