@@ -46,6 +46,39 @@ function seedInstance(chat, tab = "main") {
   chat.branchViewByTab = {}
 }
 
+function branchedEvents() {
+  const events = []
+  const appendTurn = (turn, branch, content, response, parents) => {
+    for (const [type, text] of [
+      ["user_input", content],
+      ["user_message", content],
+      ["processing_start", ""],
+      ["text_chunk", response],
+      ["processing_end", ""],
+    ]) {
+      events.push({
+        type,
+        content: text,
+        event_id: events.length + 1,
+        turn_index: turn,
+        branch_id: branch,
+        parent_branch_path: parents,
+      })
+    }
+  }
+  appendTurn(1, 1, "first input", "first response", [])
+  appendTurn(1, 2, "second input", "second response", [])
+  appendTurn(1, 3, "third input", "original response", [])
+  appendTurn(2, 2, "continue", "older continuation", [[1, 3]])
+  appendTurn(2, 3, "continue", "selected continuation", [[1, 3]])
+  appendTurn(3, 3, "continue again", "old descendant", [
+    [1, 3],
+    [2, 3],
+  ])
+  appendTurn(1, 4, "third input", "regenerated response", [])
+  return events
+}
+
 describe("chat store — branch op owner/lifetime guards", () => {
   it("does not POST to a new instance when reset lands during the awaited import", async () => {
     const chat = useChatStore()
@@ -398,6 +431,192 @@ describe("chat store — branch error classification (mayHaveRun)", () => {
     chat.branchViewByTab = { alice: { 1: 1, 2: 1 } }
     chat._adoptAuthoritativeBranchView("alice", { 1: 2 })
     expect(chat.branchViewByTab.alice).toEqual({ 1: 2 })
+  })
+
+  it.each(["explicit", "legacy"])(
+    "prunes old descendants before continuing a regenerated response (%s ancestry)",
+    async (ancestry) => {
+      const chat = useChatStore()
+      seedInstance(chat, "alice")
+      const events = branchedEvents()
+      if (ancestry === "legacy") {
+        for (const event of events) delete event.parent_branch_path
+      }
+      chat.eventsByTab.alice = events
+      chat.branchViewByTab = { alice: { 1: 3, 2: 3, 3: 3 }, bob: { 1: 1, 2: 1 } }
+      chat._rebuildMessages("alice")
+      expect(chat.messagesByTab.alice.map((message) => message.turnIndex)).toEqual([
+        1, 1, 2, 2, 3, 3,
+      ])
+
+      expect(chat.selectBranch(1, 4, "alice")).toBe(true)
+      expect(chat.branchViewByTab.alice).toEqual({ 1: 4 })
+      expect(chat.branchViewByTab.bob).toEqual({ 1: 1, 2: 1 })
+      expect(chat.messagesByTab.alice.map((message) => message.turnIndex)).toEqual([1, 1])
+      expect(chat.messagesByTab.alice[0]).toMatchObject({
+        userGroupCount: 3,
+        currentUserGroupIdx: 2,
+      })
+      expect(chat.messagesByTab.alice[1]).toMatchObject({
+        assistantBranches: [3, 4],
+        currentAssistantIdx: 1,
+      })
+
+      const send = vi.fn()
+      chat._ws = { readyState: WebSocket.OPEN, send }
+      await chat.send("continue the regeneration")
+      expect(JSON.parse(send.mock.calls[0][0])).toMatchObject({
+        type: "input",
+        target: "alice",
+        branch_view: { 1: 4 },
+      })
+      chat.processingByTab.alice = false
+
+      expect(chat.selectBranch(1, 3, "alice")).toBe(true)
+      expect(chat.messagesByTab.alice.map((message) => message.turnIndex)).toEqual([
+        1, 1, 2, 2, 3, 3,
+      ])
+      expect(JSON.stringify(chat.messagesByTab.alice)).toContain("old descendant")
+      await chat.send("continue the original")
+      expect(JSON.parse(send.mock.calls[1][0]).branch_view).toEqual({ 1: 3 })
+      chat._clearBranchResyncTimers()
+    },
+  )
+
+  it.each([
+    ["explicit", 3, 3],
+    ["legacy", 3, 3],
+    ["explicit", 4, 3],
+    ["legacy", 4, 3],
+    ["explicit", 4, 2],
+    ["legacy", 4, 2],
+  ])(
+    "isolates a descendant stream after its ancestor selection changes (%s ancestry, branch %i, middle %i)",
+    (ancestry, streamingBranch, middleBranch) => {
+      const chat = useChatStore()
+      seedInstance(chat, "alice")
+      const events = branchedEvents()
+      if (ancestry === "legacy") {
+        for (const event of events) delete event.parent_branch_path
+      }
+      chat.eventsByTab.alice = events
+      chat.branchViewByTab.alice = { 1: 3, 2: middleBranch, 3: streamingBranch }
+      chat.processingByTab.alice = true
+      chat._streamingBranchByTab.alice = { turnIndex: 3, branchId: streamingBranch }
+      chat._scheduleBranchResync = vi.fn()
+
+      expect(chat.selectBranch(1, 4, "alice")).toBe(true)
+      expect(chat.branchViewByTab.alice).toEqual({ 1: 4 })
+      const beforeChunk = JSON.stringify(chat.messagesByTab.alice)
+      chat._onMessage({
+        type: "processing_start",
+        source: "alice",
+        turn_index: 3,
+        branch_id: streamingBranch,
+      })
+      chat._onMessage({
+        type: "text",
+        source: "alice",
+        content: "off-subtree chunk",
+        turn_index: 3,
+        branch_id: streamingBranch,
+      })
+      expect(JSON.stringify(chat.messagesByTab.alice)).toBe(beforeChunk)
+      expect(chat.viewingRunningBranch).toBe(false)
+      expect(chat.processingByTab.alice).toBe(true)
+
+      expect(chat.selectBranch(1, 3, "alice")).toBe(true)
+      expect(chat.viewingRunningBranch).toBe(middleBranch === 3)
+      if (middleBranch !== 3) {
+        const beforeWrongMiddleChunk = JSON.stringify(chat.messagesByTab.alice)
+        chat._onMessage({
+          type: "text",
+          source: "alice",
+          content: "wrong-middle chunk",
+          turn_index: 3,
+          branch_id: streamingBranch,
+        })
+        expect(JSON.stringify(chat.messagesByTab.alice)).toBe(beforeWrongMiddleChunk)
+        expect(chat.selectBranch(2, middleBranch, "alice")).toBe(true)
+        expect(chat.viewingRunningBranch).toBe(true)
+      }
+      chat._onMessage({
+        type: "text",
+        source: "alice",
+        content: "on-subtree chunk",
+        turn_index: 3,
+        branch_id: streamingBranch,
+      })
+      expect(JSON.stringify(chat.messagesByTab.alice)).toContain("on-subtree chunk")
+      if (streamingBranch === 4) {
+        expect(JSON.stringify(chat.messagesByTab.alice)).not.toContain("old descendant")
+        expect(chat.branchViewByTab.alice[3]).toBe(4)
+        expect(chat.selectBranch(1, 3, "alice")).toBe(true)
+        expect(chat.branchViewByTab.alice[3]).toBe(4)
+        expect(JSON.stringify(chat.messagesByTab.alice)).not.toContain("old descendant")
+        if (middleBranch === 3) {
+          expect(chat.selectBranch(3, 3, "alice")).toBe(true)
+          expect(chat.selectBranch(1, 3, "alice")).toBe(true)
+          expect(chat.branchViewByTab.alice[3]).toBe(3)
+          expect(chat.viewingRunningBranch).toBe(false)
+          const beforeSiblingChunk = JSON.stringify(chat.messagesByTab.alice)
+          chat._onMessage({
+            type: "text",
+            source: "alice",
+            content: "wrong-sibling chunk",
+            turn_index: 3,
+            branch_id: streamingBranch,
+          })
+          expect(JSON.stringify(chat.messagesByTab.alice)).toBe(beforeSiblingChunk)
+        }
+      }
+      chat._clearBranchResyncTimers()
+    },
+  )
+
+  it("preserves earlier selections and resets descendants when switching a middle turn", () => {
+    const chat = useChatStore()
+    seedInstance(chat, "alice")
+    chat.eventsByTab.alice = branchedEvents()
+    chat.branchViewByTab.alice = { 1: 3, 2: 3, 3: 3 }
+
+    expect(chat.selectBranch(2, 2, "alice")).toBe(true)
+    expect(chat.branchViewByTab.alice).toEqual({ 1: 3, 2: 2 })
+    expect(chat.messagesByTab.alice.map((message) => message.turnIndex)).toEqual([1, 1, 2, 2])
+    expect(JSON.stringify(chat.messagesByTab.alice)).toContain("older continuation")
+    expect(JSON.stringify(chat.messagesByTab.alice)).not.toContain("old descendant")
+    chat._clearBranchResyncTimers()
+  })
+
+  it("prunes descendants of the cached sibling when restoring an uncached middle stream", async () => {
+    const chat = useChatStore()
+    seedInstance(chat, "alice")
+    chat.eventsByTab.alice = branchedEvents()
+    chat.branchViewByTab.alice = { 1: 3, 3: 3 }
+    chat._streamingBranchByTab.alice = { turnIndex: 2, branchId: 4 }
+    chat._scheduleBranchResync = vi.fn()
+
+    expect(chat.selectBranch(1, 3, "alice")).toBe(true)
+    expect(chat.branchViewByTab.alice).toEqual({ 1: 3, 2: 4 })
+    expect(JSON.stringify(chat.messagesByTab.alice)).not.toContain("old descendant")
+    const send = vi.fn()
+    chat._ws = { readyState: WebSocket.OPEN, send }
+    await chat.send("continue the live middle response")
+    expect(JSON.parse(send.mock.calls[0][0]).branch_view).toEqual({ 1: 3, 2: 4 })
+    chat._clearBranchResyncTimers()
+  })
+
+  it("keeps compatible descendant choices when selecting the same early branch", () => {
+    const chat = useChatStore()
+    seedInstance(chat, "alice")
+    chat.eventsByTab.alice = branchedEvents()
+    chat.branchViewByTab.alice = { 1: 3, 2: 2 }
+
+    expect(chat.selectBranch(1, 3, "alice")).toBe(true)
+    expect(chat.branchViewByTab.alice).toEqual({ 1: 3, 2: 2 })
+    expect(JSON.stringify(chat.messagesByTab.alice)).toContain("older continuation")
+    expect(JSON.stringify(chat.messagesByTab.alice)).not.toContain("selected continuation")
+    chat._clearBranchResyncTimers()
   })
 
   it("clears browsed markers when unbinding so a later same-name tab can restore", () => {
