@@ -44,6 +44,7 @@ import pytest
 from kohakuterrarium.errors import (
     InvalidRequestError,
     NotFoundError,
+    SessionError,
     SessionNotFoundError,
 )
 from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
@@ -1640,7 +1641,7 @@ class TestStudioIntegration:
             assert "general" in {e.name for e in scanned}
 
     async def test_search_memory_releases_file_handle(
-        self, scripted_llm, isolated_paths
+        self, scripted_llm, deterministic_embedder, isolated_paths, monkeypatch
     ):
         """A search over a saved session must not leave the .kohakutr
         locked — deleting it right after the search should succeed.
@@ -1673,6 +1674,20 @@ class TestStudioIntegration:
         saved_stem = saved_path.name.split(".kohakutr")[0]
 
         async with Studio() as studio:
+
+            def fail_encode(self, texts):
+                raise RuntimeError("embedding unavailable during indexing")
+
+            with monkeypatch.context() as fault:
+                fault.setattr(_HashEmbedder, "encode", fail_encode)
+                with pytest.raises(SessionError, match="embedding unavailable"):
+                    await studio.sessions.search_memory(
+                        saved_stem, "index", mode="auto"
+                    )
+            released_path = saved_path.with_suffix(".released")
+            saved_path.rename(released_path)
+            released_path.rename(saved_path)
+
             mem = await studio.sessions.search_memory(
                 saved_stem,
                 "index",

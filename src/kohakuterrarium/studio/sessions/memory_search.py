@@ -9,6 +9,7 @@ run as a worker-thread open/search/close unit.
 """
 
 import asyncio
+from contextlib import ExitStack
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -108,49 +109,50 @@ def _search_session_sync(
     saved sessions; every blocking step here stays off the event loop.
     """
     try:
-        # Reuse the live store and its agent configuration when the session is running.
-        if live_store:
-            store = live_store
-            store.flush()
-        else:
-            store = SessionStore(path)
+        with ExitStack() as stack:
+            # Reuse the live store and its agent configuration when the session is running.
+            if live_store:
+                store = live_store
+                store.flush()
+            else:
+                store = SessionStore(path)
+                # Close owned SQLite handles promptly so Windows can delete stopped sessions;
+                # a live creature retains ownership of its shared SessionStore.
+                stack.callback(store.close, update_status=False)
 
-        # FTS does not need an embedder, avoiding unnecessary model downloads.
-        if mode == "fts":
-            embedder = None
-        else:
-            embed_config = _resolve_embed_config(store, live_agent)
-            try:
-                embedder = create_embedder(embed_config)
-            except Exception as e:
-                _ = e  # Search can fall back to FTS when embedding is unavailable.
+            # FTS does not need an embedder, avoiding unnecessary model downloads.
+            if mode == "fts":
                 embedder = None
+            else:
+                embed_config = _resolve_embed_config(store, live_agent)
+                try:
+                    embedder = create_embedder(embed_config)
+                except Exception as e:
+                    _ = e  # Search can fall back to FTS when embedding is unavailable.
+                    embedder = None
 
-        memory = SessionMemory(str(path), embedder=embedder)
+            memory = SessionMemory(str(path), embedder=embedder)
+            stack.callback(memory.close)
 
-        # Incremental indexing skips events already represented in memory.
-        meta = store.load_meta()
-        for agent_name in meta.get("agents", []):
-            events = store.get_events(agent_name)
-            if events:
-                memory.index_events(agent_name, events)
+            # Incremental indexing skips events already represented in memory.
+            meta = store.load_meta()
+            for agent_name in meta.get("agents", []):
+                events = store.get_events(agent_name)
+                if events:
+                    memory.index_events(agent_name, events)
 
-        # Preserve the adapter contract by degrading unsupported semantic requests to FTS.
-        effective_mode = mode
-        if effective_mode not in ("auto", "fts", "semantic", "hybrid"):
-            logger.warning("Unknown search mode, falling back to FTS", requested=mode)
-            effective_mode = "fts"
-        elif effective_mode == "semantic" and not memory.has_vectors:
-            logger.warning("No embedding model, falling back to FTS")
-            effective_mode = "fts"
+            # Preserve the adapter contract by degrading unsupported semantic requests to FTS.
+            effective_mode = mode
+            if effective_mode not in ("auto", "fts", "semantic", "hybrid"):
+                logger.warning(
+                    "Unknown search mode, falling back to FTS", requested=mode
+                )
+                effective_mode = "fts"
+            elif effective_mode == "semantic" and not memory.has_vectors:
+                logger.warning("No embedding model, falling back to FTS")
+                effective_mode = "fts"
 
-        results = memory.search(query=q, mode=effective_mode, k=k, agent=agent)
-
-        # Close owned SQLite handles promptly so Windows can delete stopped sessions;
-        # a live creature retains ownership of its shared SessionStore.
-        memory.close()
-        if not live_store:
-            store.close(update_status=False)
+            results = memory.search(query=q, mode=effective_mode, k=k, agent=agent)
     except Exception as e:
         # Callers receive a concise typed error while logs retain the traceback.
         logger.exception(
