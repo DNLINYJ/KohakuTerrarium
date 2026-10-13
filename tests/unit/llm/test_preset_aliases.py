@@ -30,6 +30,14 @@ class TestCanonicalNames:
 
 
 class TestAliases:
+    def test_deepseek_aliases_target_current_models(self):
+        assert ALIASES["deepseek"] == ("deepseek", "deepseek-v4-pro")
+        assert ALIASES["deepseek-pro"] == ("deepseek", "deepseek-v4-pro")
+        for alias in ("deepseek-v4-flash", "deepseek-v4-flash-vision-exp"):
+            assert ALIASES[alias] == ("deepseek", "deepseek-flash")
+        assert "deepseek-chat" not in ALIASES
+        assert "deepseek-reasoner" not in ALIASES
+
     def test_every_alias_target_is_provider_name_pair(self):
         for alias, target in ALIASES.items():
             assert (

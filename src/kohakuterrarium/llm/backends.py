@@ -36,6 +36,7 @@ _BUILTIN_PROVIDER_NAMES: set[str] = {
     "openrouter",
     "anthropic",
     "gemini",
+    "deepseek",
     "mimo",
     "kimi-code",
     "glm-coding",
@@ -117,6 +118,12 @@ def _built_in_providers() -> dict[str, LLMBackend]:
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
             api_key_env="GEMINI_API_KEY",
         ),
+        "deepseek": LLMBackend(
+            name="deepseek",
+            backend_type="openai",
+            base_url="https://api.deepseek.com",
+            api_key_env="DEEPSEEK_API_KEY",
+        ),
         "mimo": LLMBackend(
             name="mimo",
             backend_type="openai",
@@ -159,6 +166,8 @@ def legacy_provider_from_data(data: dict[str, Any]) -> str:
         return "gemini"
     if "api.openai.com" in base_url:
         return "openai"
+    if "api.deepseek.com" in base_url:
+        return "deepseek"
     if "mimo" in base_url:
         return "mimo"
     if "api.kimi.com/coding" in base_url:
@@ -172,6 +181,7 @@ def legacy_provider_from_data(data: dict[str, Any]) -> str:
         "OPENROUTER_API_KEY",
         "ANTHROPIC_API_KEY",
         "GEMINI_API_KEY",
+        "DEEPSEEK_API_KEY",
         "MIMO_API_KEY",
         "KIMI_CODE_API_KEY",
         "GLM_CODING_API_KEY",

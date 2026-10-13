@@ -71,6 +71,10 @@ class TestLoadBackends:
         )
         assert backends["codex"].backend_type == "codex"
         assert backends["grok-subscription"].backend_type == "grok-subscription"
+        assert backends["deepseek"].backend_type == "openai"
+        assert backends["deepseek"].base_url == "https://api.deepseek.com"
+        assert backends["deepseek"].api_key_env == "DEEPSEEK_API_KEY"
+        assert backends["deepseek"].provider_native_tools == []
 
     def test_codex_builtin_advertises_image_gen_native_tool(self):
         assert _built_in_providers()["codex"].provider_native_tools == ["image_gen"]
@@ -135,6 +139,17 @@ class TestLoadBackends:
 
 
 class TestLegacyProviderFromData:
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {"provider": "deepseek"},
+            {"provider": "openai", "base_url": "https://api.deepseek.com/v1"},
+            {"api_key_env": "DEEPSEEK_API_KEY"},
+        ],
+    )
+    def test_deepseek_provider_inference(self, data):
+        assert legacy_provider_from_data(data) == "deepseek"
+
     def test_explicit_non_legacy_provider_returned_as_is(self):
         assert legacy_provider_from_data({"provider": "openrouter"}) == "openrouter"
 

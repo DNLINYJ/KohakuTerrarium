@@ -25,6 +25,7 @@ _BUILT_IN_BACKEND_NAMES = {
     "openrouter",
     "anthropic",
     "gemini",
+    "deepseek",
     "mimo",
     "kimi-code",
     "glm-coding",

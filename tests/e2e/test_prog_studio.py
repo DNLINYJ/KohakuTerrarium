@@ -684,6 +684,7 @@ class TestProgStudioJourney:
                 "mimo",
                 "kimi-code",
                 "glm-coding",
+                "deepseek",
             }
             studio.identity.llm.save_backend(
                 "acme",

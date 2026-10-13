@@ -51,6 +51,32 @@ Or override at the command line for one run:
 kt run path/to/creature --llm gpt-5.4
 ```
 
+### DeepSeek direct API
+
+Run `kt config key set deepseek` or set `DEEPSEEK_API_KEY`, then select
+`deepseek/deepseek-flash` (DeepSeek-V4.1-Flash) or
+`deepseek/deepseek-v4-pro`:
+
+```yaml
+controller:
+  llm: deepseek/deepseek-flash@reasoning=high
+```
+
+Both presets use the OpenAI-compatible Chat Completions endpoint at
+`https://api.deepseek.com`, with a 1,048,576-token context and a
+393,216-token maximum output. The `reasoning` variation supports `none`,
+`low`, `high` (default), and `max`; `none` disables thinking. These variations
+set `extra_body.thinking.type` and `extra_body.reasoning_effort` together.
+KT preserves the returned reasoning content for subsequent tool-call turns.
+
+`deepseek` and `deepseek-pro` select Pro. The legacy Flash names
+`deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` resolve to
+`deepseek-flash`. Flash supports image input; Pro is text-only.
+
+Metadata follows the official [model catalog](https://api-docs.deepseek.com/api/list-models/),
+[model details](https://api-docs.deepseek.com/quick_start/pricing/), and
+[thinking-mode guide](https://api-docs.deepseek.com/guides/thinking_mode/).
+
 ### GPT-6 through Codex OAuth
 
 After `kt login codex`, select `codex/gpt-6.1-sol`, `codex/gpt-6-sol`,
