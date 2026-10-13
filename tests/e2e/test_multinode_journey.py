@@ -32,12 +32,14 @@ do NOT add more test functions.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import traceback
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from tests.e2e._lab_harness import (
@@ -47,12 +49,27 @@ from tests.e2e._lab_harness import (
     install_scripted_llm,
 )
 from kohakuterrarium.api.deps import get_service_legacy as get_service
-from kohakuterrarium.studio.sessions import cluster_fold
+from kohakuterrarium.session.embedding import BaseEmbedder
+from kohakuterrarium.studio.sessions import cluster_fold, memory_search
 from kohakuterrarium.terrarium.drive.models import ActorRef
 from kohakuterrarium.terrarium.drive.requests import CreateDriveRequest
 from kohakuterrarium.testing.llm import ScriptEntry
 
 pytestmark = pytest.mark.timeout(900)
+
+
+class _OfflineEmbedder(BaseEmbedder):
+    """Deterministic token vectors for the journey's real search indexes."""
+
+    dimensions = 64
+
+    def encode(self, texts: list[str]) -> np.ndarray:
+        rows = np.full((len(texts), self.dimensions), 0.01, dtype=np.float32)
+        for row, text in zip(rows, texts):
+            for token in text.lower().split():
+                row[hashlib.sha256(token.encode()).digest()[0] % self.dimensions] += 1
+            row /= np.linalg.norm(row)
+        return rows
 
 
 def _write_creature_config(
@@ -198,7 +215,7 @@ class _BugLog:
 
 class TestMultinodeJourney:
     """ONE fat journey covering every multi-node feature through the
-    public HTTP/WS interface.  No internal seams except the LLM.
+    public HTTP/WS interface, with deterministic LLM and embedding providers.
     """
 
     async def test_full_creature_session_on_inprocess_workers(
@@ -206,6 +223,9 @@ class TestMultinodeJourney:
     ):
         # ?�?� 0. environment & identity store ?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�?�
         monkeypatch.setenv("KT_SESSION_DIR", str(tmp_path / "host-sessions"))
+        monkeypatch.setattr(
+            memory_search, "create_embedder", lambda _: _OfflineEmbedder()
+        )
         # Multi-script holder ??one shared list across host + every
         # worker's in-process scripted LLM.  Most entries are plain
         # strings; the *match-gated* entries fire the LLM-driven
@@ -1728,6 +1748,43 @@ async def _drive_journey(
                 "(alpha+bravo)",
                 "alpha" in sources and "bravo" in sources,
                 f"agents in hits={sources!r}; hits={hits!r}",
+            )
+
+    async with bugs.step("22a semantic search across worker conversations"):
+        vector_query = "vectoronlyquerywithoutlexicalmatches"
+        lexical = await asyncio.wait_for(
+            host.http.get(
+                f"/api/sessions/{graph_a}/memory/search",
+                params={"q": vector_query, "k": 20, "mode": "fts"},
+            ),
+            timeout=OP_TIMEOUT,
+        )
+        bugs.check(
+            "22a lexical control succeeds", lexical.status_code == 200, lexical.text
+        )
+        if lexical.status_code == 200:
+            bugs.check(
+                "22a vector query has no FTS hits",
+                lexical.json()["results"] == [],
+                lexical.text,
+            )
+        semantic = await asyncio.wait_for(
+            host.http.get(
+                f"/api/sessions/{graph_a}/memory/search",
+                params={"q": vector_query, "k": 20, "mode": "semantic"},
+            ),
+            timeout=OP_TIMEOUT,
+        )
+        bugs.check(
+            "22a semantic search succeeds", semantic.status_code == 200, semantic.text
+        )
+        if semantic.status_code == 200:
+            hits = semantic.json()["results"]
+            sources = {hit["agent"] for hit in hits}
+            bugs.check(
+                "22a semantic results include both workers",
+                {"alpha", "bravo"}.issubset(sources),
+                f"agents={sources!r}; hits={hits!r}",
             )
 
     # === 22a-bis. CF-5 viewer follow-up — cluster fan-out for /turns
