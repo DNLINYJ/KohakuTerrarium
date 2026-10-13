@@ -6,6 +6,7 @@ Supports multimodal input (images from attachments, stickers, emojis).
 """
 
 import asyncio
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -17,13 +18,14 @@ from kohakuterrarium.llm.message import ContentPart, ImagePart, TextPart
 from kohakuterrarium.modules.input import BaseInputModule
 from kohakuterrarium.utils.logging import get_logger
 
-from discord_client import (
+from .client import (
     DiscordClient,
     DiscordMessage,
     register_client,
     short_id,
 )
-from image_utils import process_multiple_images
+from .images import process_multiple_images
+from .paths import AGENT_ROOT
 
 logger = get_logger("kohakuterrarium.custom.discord_input")
 
@@ -83,8 +85,6 @@ class DiscordInputModule(BaseInputModule):
             gif_sample_frames: Which frames to sample from GIFs
                               Default: ["first", "middle", "last"]
         """
-        import os
-
         super().__init__()
 
         self.token = token or os.environ.get(token_env, "")
@@ -154,9 +154,7 @@ class DiscordInputModule(BaseInputModule):
         path = Path(file_path)
         if path.is_absolute():
             return path
-        # Custom modules live one directory below the agent root.
-        module_dir = Path(__file__).parent.parent
-        return module_dir / file_path
+        return AGENT_ROOT / file_path
 
     def _load_context_template(self, template_path: str) -> None:
         """Load an optional str.format context template from the agent folder."""
@@ -343,7 +341,6 @@ class DiscordInputModule(BaseInputModule):
         """Render non-empty context sections in a stable default order."""
         sections = [
             ("Instant Memory", "instant_memory"),
-            ("Tool History", "tool_history"),
             ("History", "history"),
             ("Recent", "recent"),
             ("Rules", "rules"),
@@ -485,14 +482,20 @@ class DiscordInputModule(BaseInputModule):
 
             await asyncio.sleep(0.5)
 
+            # One batch covers one channel; other channels wait for the next batch.
             messages: list[DiscordMessage] = [first_msg]
-
+            deferred: list[DiscordMessage] = []
             while True:
                 try:
                     extra_msg = self.client._message_queue.get_nowait()
-                    messages.append(extra_msg)
                 except asyncio.QueueEmpty:
                     break
+                if extra_msg.channel_id == first_msg.channel_id:
+                    messages.append(extra_msg)
+                else:
+                    deferred.append(extra_msg)
+            for msg in deferred:
+                self.client._message_queue.put_nowait(msg)
 
             logger.info(
                 "Messages consumed from queue",
@@ -551,7 +554,6 @@ class DiscordInputModule(BaseInputModule):
                 "recent": recent_text,
                 "new_messages": self._build_new_messages_text(messages, is_readonly),
                 "location": self._build_location(last_msg),
-                "tool_history": "",
             }
 
             # Named context fragments map directly to custom template variables.

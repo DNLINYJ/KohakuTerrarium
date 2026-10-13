@@ -1,33 +1,29 @@
-"""Expose the Discord bot's shared I/O, triggers, and emoji tools.
+"""Expose the Discord bot's shared I/O, feed, triggers, and emoji tools.
 
 This package provides:
-- DiscordInputModule: Receives messages from Discord
-- DiscordOutputModule: Sends messages to Discord
-- DiscordPingTrigger: Fires when bot is mentioned
-- DiscordIdleTrigger: Fires after chat inactivity
-- EmojiSearchTool: Search guild emojis by keyword/description
-- EmojiListTool: List available emojis
-- EmojiGetTool: Get emoji by name or ID
+- DiscordChannelPlugin: Binds one creature to one channel (incremental feed)
+- DiscordFeedTrigger: Delivers that channel's activity as turns
+- DiscordInputModule / DiscordOutputModule: Batch-snapshot I/O (ephemeral mode)
+- DiscordPingTrigger / DiscordIdleTrigger: Mention and inactivity triggers
+- EmojiSearchTool / EmojiListTool / EmojiGetTool: Guild emoji lookup
 
-The input module registers a Discord client to a shared registry,
-which allows the output module and triggers to access the same
-connection without needing to be explicitly linked.
-
-Individual modules use bare imports for sibling files (e.g. ``from discord_client import ...``)
-because the framework's ModuleLoader temporarily adds this directory to sys.path when
-loading custom modules.  For the package-import pathway (``from custom import ...``),
-this __init__ adds the same directory so the bare imports resolve identically.
+Config files load the entry modules in this folder through ModuleLoader,
+which temporarily puts this directory on sys.path so ``botcore`` resolves.
+For the package-import pathway (``from custom import ...``) this __init__
+adds the same directory.
 """
 
 import sys
 from pathlib import Path
 
-# Mirror ModuleLoader's path setup so sibling bare imports also work through
-# the package-import pathway.
+# Mirror ModuleLoader's path setup so ``botcore`` also resolves through the
+# package-import pathway.
 _CUSTOM_DIR = str(Path(__file__).parent)
 if _CUSTOM_DIR not in sys.path:
     sys.path.insert(0, _CUSTOM_DIR)
 
+from botcore.emoji_db import EmojiDatabase, EmojiRecord, get_emoji_db, save_emoji_db
+from discord_feed import DiscordChannelPlugin, DiscordFeedTrigger
 from discord_io import (
     DiscordClient,
     DiscordInputModule,
@@ -40,7 +36,6 @@ from discord_trigger import (
     DiscordIdleTrigger,
     DiscordPingTrigger,
 )
-from emoji_db import EmojiDatabase, EmojiRecord, get_emoji_db, save_emoji_db
 from emoji_search import (
     EmojiGetTool,
     EmojiListTool,
@@ -49,6 +44,8 @@ from emoji_search import (
 )
 
 __all__ = [
+    "DiscordChannelPlugin",
+    "DiscordFeedTrigger",
     "DiscordClient",
     "DiscordInputModule",
     "DiscordOutputModule",

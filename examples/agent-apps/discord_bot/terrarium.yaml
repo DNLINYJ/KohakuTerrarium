@@ -1,0 +1,97 @@
+# Discord bot, one creature per channel (incremental feed mode)
+#
+# Every creature inherits config.yaml (model, tools, memory) and becomes a
+# persistent, non-ephemeral agent bound to ONE channel by the
+# discord_channel plugin. All creatures share a single Discord connection.
+#
+# What each creature sees:
+#   - first delivery of a session: <discord_backfill> (recent history) plus
+#     the <discord_update> that woke it
+#   - every later delivery: only new messages, edits, and deletions
+#   - after a resume: the messages missed while offline, then live updates
+#
+# Run:  kt serve, then start this terrarium; or `kt run` on this folder.
+# The ephemeral snapshot bot is still available via config.yaml alone.
+#
+# To add a channel, copy a creature entry and change name + channel_id.
+
+x-feed-options: &feed_options
+  token_env: DISCORD_BOT_TOKEN
+  # timezone: Asia/Taipei
+  backfill_limit: 100          # messages read on the first delivery of a session
+  backfill_media_limit: 16     # newest backfill messages whose images are attached
+  resync_limit: 200            # max messages fetched after a resume / reconnect
+  batch_delay: 0.5             # seconds to wait so a burst lands in one delivery
+  typing_indicator: true
+  hold_on_new_messages: true   # send_discord shows unseen chat once before sending
+  include_images: true
+  image_detail: auto
+  max_images_per_message: 4
+  max_total_images: 8
+
+x-channel-creature: &channel_creature
+  base_config: .
+  no_inherit: [input, output]
+  prompt_mode: replace
+  system_prompt_file: prompts/system_feed.md
+  prompt_context_files:
+    character: prompts/character.md
+    rules: prompts/rules.md
+    instant_memory: memory/context.md
+  input:
+    type: none
+  output:
+    type: stdout
+  controller:
+    ephemeral: false
+    max_messages: 0
+  compact:
+    max_tokens: 1000000
+
+terrarium:
+  name: discord_bot
+
+  creatures:
+    - <<: *channel_creature
+      name: ch-0576
+      plugins:
+        - name: discord_channel
+          type: custom
+          module: ./custom/discord_feed.py
+          class: DiscordChannelPlugin
+          options:
+            <<: *feed_options
+            channel_id: 775002061456408576
+
+    - <<: *channel_creature
+      name: ch-1118
+      plugins:
+        - name: discord_channel
+          type: custom
+          module: ./custom/discord_feed.py
+          class: DiscordChannelPlugin
+          options:
+            <<: *feed_options
+            channel_id: 1463611251585450118
+
+    - <<: *channel_creature
+      name: ch-2462
+      plugins:
+        - name: discord_channel
+          type: custom
+          module: ./custom/discord_feed.py
+          class: DiscordChannelPlugin
+          options:
+            <<: *feed_options
+            channel_id: 1463109951055462527
+
+    - <<: *channel_creature
+      name: ch-2747
+      plugins:
+        - name: discord_channel
+          type: custom
+          module: ./custom/discord_feed.py
+          class: DiscordChannelPlugin
+          options:
+            <<: *feed_options
+            channel_id: 1463507270326554747

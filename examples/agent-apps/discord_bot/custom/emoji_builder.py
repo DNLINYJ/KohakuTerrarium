@@ -22,16 +22,12 @@ import discord
 import httpx
 import yaml
 
-# Standalone execution must mirror ModuleLoader's sibling-import path setup.
-if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).parent))
-
 from kohakuterrarium.llm.message import ImagePart, Message, TextPart
 from kohakuterrarium.llm.openai import OpenAIProvider
 from kohakuterrarium.utils.logging import get_logger
 
-from emoji_db import DEFAULT_DB_PATH, EmojiDatabase, EmojiRecord, save_emoji_db
-from image_utils import (
+from botcore.emoji_db import DEFAULT_DB_PATH, EmojiDatabase, EmojiRecord, save_emoji_db
+from botcore.images import (
     convert_image_to_jpeg,
     extract_animated_frames,
     image_to_data_url,

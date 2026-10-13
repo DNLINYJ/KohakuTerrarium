@@ -1,7 +1,3 @@
-### Tool History
-
-{tool_history}
-
 ### History
 
 {history}

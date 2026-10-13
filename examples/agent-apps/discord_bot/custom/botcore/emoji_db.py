@@ -12,6 +12,8 @@ from pathlib import Path
 
 from kohakuterrarium.utils.logging import get_logger
 
+from .paths import AGENT_ROOT
+
 logger = get_logger("kohakuterrarium.custom.emoji_db")
 
 
@@ -195,7 +197,7 @@ class EmojiDatabase:
 
 
 # Keep generated emoji memory inside the example agent's memory tree.
-DEFAULT_DB_PATH = Path(__file__).parent.parent / "memory" / "emojis" / "emoji_db.json"
+DEFAULT_DB_PATH = AGENT_ROOT / "memory" / "emojis" / "emoji_db.json"
 
 
 def get_emoji_db(path: Path | str | None = None) -> EmojiDatabase:

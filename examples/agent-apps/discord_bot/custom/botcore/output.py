@@ -1,28 +1,61 @@
 """Filter, deduplicate, and send controller output through Discord.
 
-Uses the shared DiscordClient from input module to send messages.
-Supports reply markers, mentions, keyword filtering, and deduplication.
+Uses the shared DiscordClient to send messages. Supports reply markers,
+mentions, keyword filtering, and deduplication. ``send`` reports exactly
+what happened so callers never mistake a filtered message for a sent one.
 """
 
 import asyncio
+import random
 import re
 from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import discord
 
 from kohakuterrarium.modules.output import BaseOutputModule
 from kohakuterrarium.utils.logging import get_logger
 
-from discord_client import DiscordClient, get_client
+from .client import DiscordClient, get_client
+from .input import DiscordInputModule
+from .paths import AGENT_ROOT
+from .records import msg_tag
 
 logger = get_logger("kohakuterrarium.custom.discord_output")
+
+# Whole-message role words and leading protocol fragments are generation artifacts.
+ARTIFACT_EXACT = {"user", "assistant", "---", "```"}
+ARTIFACT_PREFIXES = ("[tool", "background job", "<discord_update", "<discord_backfill")
+
+
+@dataclass
+class SendResult:
+    """Outcome of one send attempt, phrased for a model to read."""
+
+    sent: bool
+    reason: str = ""
+    message_id: int | None = None
+    notes: list[str] = field(default_factory=list)
+
+    def describe(self) -> str:
+        """Return a one-line report: what was sent, or why it was not."""
+        if self.sent and self.message_id is not None:
+            head = f"Sent as {msg_tag(self.message_id)}"
+        elif self.sent:
+            head = "Sent"
+        else:
+            head = f"NOT SENT: {self.reason}"
+        if self.notes:
+            head += " (" + "; ".join(self.notes) + ")"
+        return head
 
 
 class DiscordOutputModule(BaseOutputModule):
     """Send guarded output through the Discord client shared by input.
 
     Supports special markers in output:
-    - [reply:Username] or [reply:#N] - reply to a message
+    - [reply:Username], [reply:m123456] or [reply:#N] - reply to a message
     - [@Username] - mention a user
 
     Supports keyword filtering and consecutive message deduplication.
@@ -50,7 +83,7 @@ class DiscordOutputModule(BaseOutputModule):
             client_name: Name to look up in shared client registry
             filtered_keywords: Keywords to replace with [filtered]
             keywords_file: Path to keywords file (one per line)
-            drop_base_chance: Base chance to drop when messages pending
+            drop_base_chance: Base chance to drop when batch input is pending
             drop_increment: Additional chance per extra pending message
             drop_max_chance: Maximum drop chance cap
             dedup_threshold: Similarity threshold for deduplication (0.0-1.0)
@@ -93,15 +126,19 @@ class DiscordOutputModule(BaseOutputModule):
         )
 
     def _load_keywords_file(self, filepath: str) -> None:
-        """Load one case-insensitive filtered keyword per non-comment line."""
-        import os
+        """Load one case-insensitive filtered keyword per non-comment line.
 
-        if not os.path.exists(filepath):
-            logger.warning("Keywords file not found", extra={"path": filepath})
+        Relative paths resolve against the bot folder, not the process cwd.
+        """
+        path = Path(filepath)
+        if not path.is_absolute():
+            path = AGENT_ROOT / path
+        if not path.exists():
+            logger.warning("Keywords file not found", extra={"path": str(path)})
             return
 
         try:
-            with open(filepath, encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if line and not line.startswith("#"):
@@ -109,17 +146,15 @@ class DiscordOutputModule(BaseOutputModule):
         except OSError as e:
             logger.warning("Failed to load keywords file", extra={"error": str(e)})
 
-    def _filter_keywords(self, content: str) -> str:
-        """Redact configured keywords without regard to case."""
-        if not self._filtered_keywords:
-            return content
-
+    def _filter_keywords(self, content: str) -> tuple[str, int]:
+        """Redact configured keywords without regard to case; return the hit count."""
+        hits = 0
         result = content
         for keyword in self._filtered_keywords:
             pattern = re.compile(re.escape(keyword), re.IGNORECASE)
-            result = pattern.sub("[filtered]", result)
-
-        return result
+            result, n = pattern.subn("[filtered]", result)
+            hits += n
+        return result, hits
 
     def _similarity(self, a: str, b: str) -> float:
         """Estimate normalized character overlap between two messages."""
@@ -148,21 +183,9 @@ class DiscordOutputModule(BaseOutputModule):
 
     def _is_duplicate(self, content: str) -> bool:
         """Return whether content is too similar to a recent sent message."""
-        if not self._recent_outputs:
-            return False
-
         for recent in self._recent_outputs:
-            sim = self._similarity(content, recent)
-            if sim >= self.dedup_threshold:
-                logger.debug(
-                    "Duplicate detected",
-                    extra={
-                        "similarity": f"{sim:.2%}",
-                        "threshold": f"{self.dedup_threshold:.2%}",
-                    },
-                )
+            if self._similarity(content, recent) >= self.dedup_threshold:
                 return True
-
         return False
 
     def _ensure_client(self) -> DiscordClient | None:
@@ -202,14 +225,8 @@ class DiscordOutputModule(BaseOutputModule):
         if client.is_readonly_channel(channel_id):
             return
 
-        channel = client.get_channel(channel_id)
-        if not channel:
-            try:
-                channel = await client.fetch_channel(channel_id)
-            except discord.DiscordException:
-                return
-
-        if isinstance(channel, (discord.TextChannel, discord.Thread)):
+        channel = await client.resolve_text_channel(channel_id)
+        if channel is not None:
             self._typing_task = asyncio.create_task(self._typing_loop(channel))
             logger.debug("Started typing indicator")
 
@@ -225,7 +242,7 @@ class DiscordOutputModule(BaseOutputModule):
             logger.debug("Stopped typing indicator")
 
     def _parse_markers(
-        self, content: str, channel_id: int
+        self, content: str, channel_id: int, notes: list[str]
     ) -> tuple[str, int | None, list[int]]:
         """Resolve reply and mention markers, then remove them from content."""
         client = self._ensure_client()
@@ -239,6 +256,8 @@ class DiscordOutputModule(BaseOutputModule):
         if reply_match:
             ref = reply_match.group(1).strip()
             reply_to_id = client.find_message_id(ref, channel_id)
+            if reply_to_id is None:
+                notes.append(f"reply target {ref!r} not found, sent without reply")
             content = self.REPLY_PATTERN.sub("", content)
 
         for match in self.MENTION_PATTERN.finditer(content):
@@ -246,89 +265,97 @@ class DiscordOutputModule(BaseOutputModule):
             user_id = client.find_user_id(name)
             if user_id:
                 mention_ids.append(user_id)
+            else:
+                notes.append(f"unknown user @{name}, mention dropped")
 
         content = self.MENTION_PATTERN.sub("", content)
 
         return content.strip(), reply_to_id, mention_ids
 
-    async def write(self, content: str) -> None:
-        """Apply output policy and send one complete Discord message."""
+    def _artifact_reason(self, content: str) -> str | None:
+        """Return why ``content`` looks like a generation artifact, else None."""
+        lower = content.lower().strip()
+        if lower in ARTIFACT_EXACT or lower.startswith(ARTIFACT_PREFIXES):
+            return "looks like protocol/markup, not a chat message"
+        stripped = content.replace(" ", "").replace("\n", "")
+        if len(stripped) <= 3 and not any(c.isalnum() for c in stripped):
+            return "punctuation-only fragment"
+        if len(set(stripped)) <= 2 and len(stripped) > 1:
+            return "repetitive low-entropy text"
+        return None
+
+    async def send(
+        self,
+        content: str,
+        channel_id: int | None = None,
+        *,
+        allow_drop: bool = True,
+    ) -> SendResult:
+        """Apply output policy and send one message, reporting the outcome.
+
+        ``allow_drop`` enables the random load-shedding used by batch input,
+        where pending messages mean the reply is probably stale.
+        """
         client = self._ensure_client()
         if not client:
-            return
+            return SendResult(False, "Discord client is not connected")
 
-        # Shed stale responses increasingly aggressively as new input accumulates.
-        import random
-
-        pending_count = client.pending_message_count()
-        if pending_count > 0:
-            drop_chance = min(
-                self.drop_max_chance,
-                self.drop_base_chance + (pending_count - 1) * self.drop_increment,
-            )
-            if random.random() < drop_chance:
-                logger.info(
-                    "Dropping response - new messages pending",
-                    extra={"pending_count": pending_count},
+        if allow_drop:
+            pending_count = client.pending_message_count()
+            if pending_count > 0:
+                drop_chance = min(
+                    self.drop_max_chance,
+                    self.drop_base_chance + (pending_count - 1) * self.drop_increment,
                 )
-                return
+                if random.random() < drop_chance:
+                    logger.info(
+                        "Dropping response - new messages pending",
+                        extra={"pending_count": pending_count},
+                    )
+                    return SendResult(False, "newer messages are pending (load shed)")
 
         clean_content = content.strip()
         if not clean_content:
-            return
-
+            return SendResult(False, "empty message")
         if self._is_duplicate(clean_content):
-            logger.info("Filtering duplicate response")
-            return
+            return SendResult(False, "near-duplicate of a message you just sent")
+        artifact = self._artifact_reason(clean_content)
+        if artifact:
+            return SendResult(False, artifact)
 
-        # Reject controller/protocol fragments that are not user-facing messages.
-        garbage_patterns = [
-            "user",
-            "assistant",
-            "[tool",
-            "## ",
-            "background job",
-            "```",
-            "---",
-        ]
-        lower_content = clean_content.lower()
-        for pattern in garbage_patterns:
-            if lower_content.strip() == pattern or lower_content.startswith(pattern):
-                logger.debug("Filtering garbage output")
-                return
+        target = channel_id or client._current_channel_id
+        if not target:
+            return SendResult(False, "no target channel")
+        if client.is_readonly_channel(target):
+            return SendResult(False, "channel is read-only")
 
-        # Preserve short words, but reject punctuation-only fragments.
-        stripped = clean_content.replace(" ", "").replace("\n", "")
-        if len(stripped) <= 3:
-            if not any(c.isalnum() for c in stripped):
-                return
-
-        # Repetitive low-entropy output is usually a generation artifact.
-        unique_chars = set(stripped)
-        if len(unique_chars) <= 2 and len(stripped) > 1:
-            return
-
-        channel_id = client._current_channel_id
-        if not channel_id:
-            return
-
+        notes: list[str] = []
         final_content, reply_to_id, mention_ids = self._parse_markers(
-            clean_content, channel_id
+            clean_content, target, notes
         )
-
         if not final_content:
-            return
+            return SendResult(False, "nothing left after removing markers", notes=notes)
 
-        final_content = self._filter_keywords(final_content)
+        final_content, hits = self._filter_keywords(final_content)
+        if hits:
+            notes.append(f"{hits} filtered keyword(s) replaced")
 
         sent = await client.send_message(
             final_content,
+            channel_id=target,
             reply_to_id=reply_to_id,
             mentions=mention_ids,
         )
+        if sent is None:
+            return SendResult(False, "Discord rejected the send", notes=notes)
+        self._recent_outputs.append(final_content)
+        return SendResult(True, message_id=sent.id, notes=notes)
 
-        if sent:
-            self._recent_outputs.append(final_content)
+    async def write(self, content: str) -> None:
+        """Send one complete message through the output policy."""
+        result = await self.send(content)
+        if not result.sent:
+            logger.info("Output not sent", extra={"reason": result.reason})
 
     async def write_stream(self, chunk: str) -> None:
         """Buffer a streaming chunk until the turn is flushed."""
@@ -352,8 +379,6 @@ def create_discord_io(
     keywords_file: str | None = None,
 ):
     """Create paired modules that share one Discord client."""
-    from discord_input import DiscordInputModule
-
     input_module = DiscordInputModule(
         token=token,
         token_env=token_env,

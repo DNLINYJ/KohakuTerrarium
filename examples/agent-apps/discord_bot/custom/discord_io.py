@@ -1,6 +1,6 @@
-"""Preserve the original Discord I/O import surface after module splitting."""
+"""Entry module: batch-snapshot Discord input and guarded output."""
 
-from discord_client import (
+from botcore.client import (
     DiscordClient,
     DiscordMessage,
     RecentMessage,
@@ -8,8 +8,8 @@ from discord_client import (
     register_client,
     short_id,
 )
-from discord_input import DiscordInputModule
-from discord_output import DiscordOutputModule, create_discord_io
+from botcore.input import DiscordInputModule
+from botcore.output import DiscordOutputModule, SendResult, create_discord_io
 
 __all__ = [
     "DiscordClient",
@@ -17,6 +17,7 @@ __all__ = [
     "RecentMessage",
     "DiscordInputModule",
     "DiscordOutputModule",
+    "SendResult",
     "create_discord_io",
     "get_client",
     "register_client",
