@@ -750,6 +750,25 @@ class TestLlmIntegration:
             assert profile.max_context == 1048576
             assert profile.max_output == 393216
             assert profile.extra_body["reasoning_effort"] == "high"
+            for context, limit in (
+                ("272k", 272000),
+                ("400k", 400000),
+                ("700k", 700000),
+                ("1m", 1048576),
+            ):
+                selected = resolve_controller_llm(
+                    {}, llm=f"{selector}@context={context},reasoning=max"
+                )
+                assert selected.max_context == limit
+                assert selected.extra_body["reasoning_effort"] == "max"
+                restored = resolve_controller_llm(
+                    {}, llm=profile_to_identifier(selected)
+                )
+                assert restored.max_context == limit
+                assert restored.selected_variations == {
+                    "context": context,
+                    "reasoning": "max",
+                }
             for effort in ("none", "low", "high", "max"):
                 selected = resolve_controller_llm(
                     {}, llm=f"{selector}@reasoning={effort}"
@@ -1700,9 +1719,10 @@ class TestLlmIntegration:
         for model in ("deepseek-flash", "deepseek-v4-pro"):
             for effort in ("none", "low", "high", "max"):
                 profile = resolve_controller_llm(
-                    {}, llm=f"deepseek/{model}@reasoning={effort}"
+                    {}, llm=f"deepseek/{model}@context=400k,reasoning={effort}"
                 )
                 deepseek_provider = _create_from_profile(profile)
+                assert deepseek_provider._profile_max_context == 400000
                 initial_client = deepseek_provider._client
                 deepseek_provider._client = initial_client.with_options(
                     http_client=httpx.AsyncClient(
