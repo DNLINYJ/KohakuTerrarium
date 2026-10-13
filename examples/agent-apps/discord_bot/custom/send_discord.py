@@ -28,6 +28,8 @@ class SendDiscordTool(BaseTool):
     - [@Username] - mention a user
     """
 
+    is_concurrency_safe = False
+
     def __init__(
         self,
         client_name: str = "default",

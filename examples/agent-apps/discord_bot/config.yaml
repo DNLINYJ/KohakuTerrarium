@@ -6,11 +6,15 @@ version: "1.0"
 
 # LLM Configuration - Controller (orchestration)
 controller:
-  model: "${OPENROUTER_MODEL:google/gemini-4-argon}"
-  temperature: 1
+  model: "google/gemini-4-argon"
   api_key_env: OPENROUTER_API_KEY
   base_url: https://openrouter.ai/api/v1
   tool_format: native
+  temperature: 1.0
+  extra_body:
+    reasoning:
+      enabled: true
+      effort: low
 
   # Ephemeral mode - clear conversation after each interaction
   ephemeral: true
@@ -40,9 +44,9 @@ input:
   # Read-only channels: observe to learn, but cannot respond
   readonly_channel_ids: []
   # History: older messages for background context
-  history_limit: 256
+  history_limit: 128
   # Recent: newer messages shown with numbering (respond to these)
-  recent_limit: 32
+  recent_limit: 16
   # Instant memory - auto-injected into every prompt
   instant_memory_file: ./memory/context.md
   # Context format template (str.format) - controls message structure
@@ -89,22 +93,27 @@ output:
 tools:
   - name: tree
     type: builtin
+    notify_controller_on_background_complete: false
   - name: read
     type: builtin
+    notify_controller_on_background_complete: false
   - name: write
     type: builtin
+    notify_controller_on_background_complete: false
   - name: edit
     type: builtin
+    notify_controller_on_background_complete: false
   - name: glob
     type: builtin
+    notify_controller_on_background_complete: false
   - name: grep
     type: builtin
-  - name: think
-    type: builtin
-
+    notify_controller_on_background_complete: false
+ 
   # Discord output - sends messages to the channel
   - name: send_discord
     type: custom
+    #notify_controller_on_background_complete: false
     module: ./custom/send_discord.py
     class: SendDiscordTool
     keywords_file: ./filtered_keywords.txt
@@ -115,16 +124,19 @@ tools:
   # Emoji tools - search guild emojis
   - name: emoji_search
     type: custom
+    #notify_controller_on_background_complete: false
     module: ./custom/emoji_search.py
     class: EmojiSearchTool
 
   - name: emoji_list
     type: custom
+    #notify_controller_on_background_complete: false
     module: ./custom/emoji_search.py
     class: EmojiListTool
 
   - name: emoji_get
     type: custom
+    #notify_controller_on_background_complete: false
     module: ./custom/emoji_search.py
     class: EmojiGetTool
 
@@ -133,10 +145,12 @@ subagents:
   # Memory read - retrieve context and facts
   - name: memory_read
     type: builtin
+    #notify_controller_on_background_complete: false
 
   # Memory write - save new information
   - name: memory_write
     type: builtin
+    notify_controller_on_background_complete: false
 
 # Memory configuration
 memory:
