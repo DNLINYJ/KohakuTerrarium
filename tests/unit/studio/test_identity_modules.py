@@ -20,6 +20,17 @@ from kohakuterrarium.studio.identity import (
 
 
 class TestLlmBackends:
+    def test_deepseek_is_a_builtin_backend(self):
+        backend = next(
+            b for b in backends_mod.list_backends() if b["name"] == "deepseek"
+        )
+        assert backend["built_in"] is True
+        assert backend["base_url"] == "https://api.deepseek.com"
+        assert backend["api_key_env"] == "DEEPSEEK_API_KEY"
+        assert backend["available"] is False
+        with pytest.raises(ValueError, match="Cannot delete built-in provider"):
+            backends_mod.remove_backend("deepseek")
+
     def test_list_backends(self, monkeypatch):
         from kohakuterrarium.llm.profiles import LLMBackend
 

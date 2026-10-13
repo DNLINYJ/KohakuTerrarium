@@ -168,6 +168,7 @@ _PROVIDER_DEFAULT_MODELS: list[tuple[str, str]] = [
     ("mimo", "mimo-v2.5-pro"),
     ("kimi-code", "kimi-for-coding"),
     ("glm-coding", "glm-5.3"),
+    ("deepseek", "deepseek-v4-pro"),
 ]
 
 

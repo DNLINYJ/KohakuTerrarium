@@ -11,6 +11,7 @@ from typing import Any
 
 from kohakuterrarium.llm.antigravity_presets import PRESETS as AGY_PRESETS
 from kohakuterrarium.llm.codex_presets import PRESETS as GPT6_CODEX_PRESETS
+from kohakuterrarium.llm.deepseek_presets import PRESETS as DEEPSEEK_PRESETS
 
 from kohakuterrarium.llm.preset_aliases import _CANONICAL_NAMES, ALIASES
 from kohakuterrarium.llm.preset_groups import (
@@ -50,6 +51,7 @@ __all__ = [
 logger = get_logger(__name__)
 
 PRESETS: dict[str, dict[str, Any]] = {
+    **DEEPSEEK_PRESETS,
     # ═══════════════════════════════════════════════════════
     #  OpenAI via Codex OAuth (ChatGPT subscription auth)
     #  reasoning_effort is a top-level field consumed directly

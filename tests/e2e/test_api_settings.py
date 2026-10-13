@@ -169,12 +169,37 @@ class TestApiSettingsJourney:
             "mimo",
             "kimi-code",
             "glm-coding",
+            "deepseek",
             "google-antigravity",
         }
         grok = next(b for b in baseline if b["name"] == "grok-subscription")
         assert grok["backend_type"] == "grok-subscription"
         assert grok["provider_native_tools"] == ["grok_image_gen", "video_gen"]
         assert "acme" not in baseline_names
+        deepseek = next(b for b in baseline if b["name"] == "deepseek")
+        assert deepseek["built_in"] is True
+        assert deepseek["base_url"] == "https://api.deepseek.com"
+        resp = client.post(
+            "/api/settings/keys",
+            json={"provider": "deepseek", "key": "test-deepseek-key"},
+        )
+        assert resp.status_code == 200
+        resp = client.get("/api/configs/models")
+        assert resp.status_code == 200
+        ds_models = {m["name"]: m for m in resp.json() if m["provider"] == "deepseek"}
+        assert set(ds_models) == {"deepseek-flash", "deepseek-v4-pro"}
+        for model in ds_models.values():
+            assert model["available"] is True
+            assert model["max_context"] == 1048576
+            assert model["max_output"] == 393216
+            assert set(model["variation_groups"]["reasoning"]) == {
+                "none",
+                "low",
+                "high",
+                "max",
+            }
+        resp = client.delete("/api/settings/keys/deepseek")
+        assert resp.status_code == 200
 
         # Create a custom backend (frontend: settingsAPI.saveBackend).
         resp = client.post(

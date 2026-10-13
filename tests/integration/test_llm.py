@@ -739,6 +739,40 @@ class TestLlmIntegration:
         assert daybreak_provider.reasoning_effort == "medium"
         assert daybreak_provider._websocket_mode is False
 
+        ak.save_api_key("deepseek", "test-deepseek-key")
+        for model in ("deepseek-flash", "deepseek-v4-pro"):
+            selector = f"deepseek/{model}"
+            profile = resolve_controller_llm({}, llm=selector)
+            assert profile.model == model
+            assert profile.backend_type == "openai"
+            assert profile.base_url == "https://api.deepseek.com"
+            assert profile.api_key_env == "DEEPSEEK_API_KEY"
+            assert profile.max_context == 1048576
+            assert profile.max_output == 393216
+            assert profile.extra_body["reasoning_effort"] == "high"
+            for effort in ("none", "low", "high", "max"):
+                selected = resolve_controller_llm(
+                    {}, llm=f"{selector}@reasoning={effort}"
+                )
+                assert (
+                    profile_to_identifier(selected) == f"{selector}@reasoning={effort}"
+                )
+                assert selected.extra_body == {
+                    "thinking": {"type": "disabled" if effort == "none" else "enabled"},
+                    "reasoning_effort": effort,
+                }
+            entry = next(
+                e
+                for e in list_all()
+                if e["provider"] == "deepseek" and e["name"] == model
+            )
+            assert entry["available"] is True
+            assert entry["model"] == model
+            with pytest.raises(ValueError, match="medium"):
+                resolve_controller_llm({}, llm=f"{selector}@reasoning=medium")
+        for alias in ("deepseek-v4-flash", "deepseek-v4-flash-vision-exp"):
+            assert resolve_controller_llm({}, llm=alias).model == "deepseek-flash"
+
         # 5. A built-in anthropic preset resolves to the anthropic backend.
         claude_profile = resolve_controller_llm({}, llm="anthropic/claude-opus-4.7")
         assert claude_profile is not None
@@ -1638,6 +1672,89 @@ class TestLlmIntegration:
         )
         monkeypatch.setattr(GrokTokens, "load_candidates", lambda: [subscription_token])
         subscription_requests = []
+
+        deepseek_requests = []
+
+        def deepseek_response(request):
+            body = json.loads(request.content)
+            deepseek_requests.append(body)
+            assert str(request.url) == "https://api.deepseek.com/chat/completions"
+            assert request.headers["authorization"] == "Bearer test-deepseek-key"
+            assert body["max_tokens"] == 393216
+            assert "reasoning" not in body
+            assert body["tools"][0]["function"]["name"] == "check"
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text=(
+                    'data: {"choices":[{"index":0,"delta":'
+                    '{"reasoning_content":"Check complete."}}]}\n\n'
+                    if body["thinking"]["type"] == "enabled"
+                    else ""
+                )
+                + 'data: {"choices":[{"index":0,"delta":{"content":"Checked."}}]}\n\n'
+                + "data: [DONE]\n\n",
+            )
+
+        ak.save_api_key("deepseek", "test-deepseek-key")
+        for model in ("deepseek-flash", "deepseek-v4-pro"):
+            for effort in ("none", "low", "high", "max"):
+                profile = resolve_controller_llm(
+                    {}, llm=f"deepseek/{model}@reasoning={effort}"
+                )
+                deepseek_provider = _create_from_profile(profile)
+                initial_client = deepseek_provider._client
+                deepseek_provider._client = initial_client.with_options(
+                    http_client=httpx.AsyncClient(
+                        transport=httpx.MockTransport(deepseek_response)
+                    )
+                )
+                await initial_client.close()
+                try:
+                    history = [UserMessage("Check this.")]
+                    schema = ToolSchema(
+                        name="check", description="Check", parameters={}
+                    )
+                    reply = "".join(
+                        [
+                            chunk
+                            async for chunk in deepseek_provider.chat(
+                                history, tools=[schema]
+                            )
+                        ]
+                    )
+                    assert reply == "Checked."
+                    sent = deepseek_requests[-1]
+                    assert sent["model"] == model
+                    assert sent["reasoning_effort"] == effort
+                    assert sent["thinking"] == {
+                        "type": "disabled" if effort == "none" else "enabled"
+                    }
+                    if effort != "none":
+                        history.append(
+                            AssistantMessage(
+                                reply,
+                                extra_fields=deepseek_provider.last_assistant_extra_fields,
+                            )
+                        )
+                        history.append(UserMessage("Check again."))
+                        followup = "".join(
+                            [
+                                chunk
+                                async for chunk in deepseek_provider.chat(
+                                    history, tools=[schema]
+                                )
+                            ]
+                        )
+                        assert followup == "Checked."
+                        assert deepseek_requests[-1]["messages"][1][
+                            "reasoning_content"
+                        ] == ("Check complete.")
+                finally:
+                    await deepseek_provider.close()
+        ak.save_api_key("deepseek", "")
+        with pytest.raises(ValueError, match="API key not found"):
+            _create_from_profile(resolve_controller_llm({}, llm="deepseek-flash"))
 
         def subscription_response(request):
             body = json.loads(request.content)

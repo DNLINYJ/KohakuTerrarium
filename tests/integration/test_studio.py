@@ -1468,7 +1468,26 @@ class TestStudioIntegration:
                 "mimo",
                 "kimi-code",
                 "glm-coding",
+                "deepseek",
             }
+            deepseek = baseline_backends["deepseek"]
+            assert deepseek["built_in"] is True
+            assert deepseek["backend_type"] == "openai"
+            assert deepseek["base_url"] == "https://api.deepseek.com"
+            assert deepseek["available"] is False
+            studio.identity.keys.set("deepseek", "test-deepseek-key")
+            deepseek = next(
+                b
+                for b in studio.identity.llm.list_backends()
+                if b["name"] == "deepseek"
+            )
+            assert deepseek["available"] is True
+            assert deepseek["has_token"] is True
+            for model in ("deepseek-flash", "deepseek-v4-pro"):
+                resolved = studio.identity.llm.get_profile(f"deepseek/{model}")
+                assert resolved.model == model
+                assert resolved.extra_body["reasoning_effort"] == "high"
+            studio.identity.keys.delete("deepseek")
             assert (
                 baseline_backends["google-antigravity"]["backend_type"]
                 == "google-antigravity"

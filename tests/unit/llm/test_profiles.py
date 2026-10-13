@@ -401,6 +401,19 @@ class TestFindProfileByModel:
 
 
 class TestDefaultModel:
+    def test_deepseek_default_requires_its_own_credentials(self):
+        assert get_default_model() == ""
+        assert _is_available("deepseek") is False
+        ak.save_api_key("deepseek", "test-deepseek-key")
+        assert _is_available("deepseek") is True
+        assert get_default_model() == "deepseek/deepseek-v4-pro"
+        ak.save_api_key("openai", "test-openai-key")
+        assert get_default_model() == "openai/gpt-5.6-sol"
+
+    def test_deepseek_builtin_provider_cannot_be_deleted(self):
+        with pytest.raises(ValueError, match="Cannot delete built-in provider"):
+            delete_backend("deepseek")
+
     def test_no_default_no_creds_returns_empty(self):
         assert get_default_model() == ""
 
