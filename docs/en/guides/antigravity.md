@@ -9,7 +9,7 @@ kt login google-antigravity
 kt config antigravity status
 kt config antigravity refresh
 kt config antigravity models
-kt run ./my-creature --llm google-antigravity/gemini-3.8-flash@reasoning=medium
+kt run ./my-creature --llm google-antigravity/gemini-4-argon@reasoning=medium
 ```
 
 `status` is offline. `refresh` asks agy to renew an expired access token when
@@ -26,36 +26,44 @@ share the built-in model catalog and its reasoning variation selector. No preset
 
 ## Models and reasoning
 
-Limits below match the agy 1.2.9 model catalog discovered on 2026-09-24. They
-are token limits, not account quota; future server metadata can change.
+The presets mirror the agent model list of the agy 1.3.4 CLI (2026-10-14). The
+server chooses that list by the client User-Agent, which KT sends in agy's
+`antigravity/cli/<version> (...)` shape; any other shape gets a smaller catalog
+and a 404 for models outside it. Limits are token limits, not account quota.
 
-| Preset under `google-antigravity/` | Context | Output | Reasoning choices |
-| --- | ---: | ---: | --- |
-| `gemini-3.6-flash` | 1,048,576 | 65,536 | low, medium, high |
-| `gemini-3.7-flash` | 1,048,576 | 65,536 | low, medium, high |
-| `gemini-3.8-flash` | 1,048,576 | 65,536 | low, medium, high |
-| `gemini-3.1-pro` | 1,048,576 | 65,535 | low, high |
-| `claude-sonnet-4-6` | 250,000 | 64,000 | Fixed Thinking |
-| `claude-opus-4-6-thinking` | 250,000 | 64,000 | Fixed Thinking |
+| Preset under `google-antigravity/` | Context choices | Output | Reasoning | Thinking sent |
+| --- | --- | ---: | --- | --- |
+| `gemini-4-argon` | 256k (default), 512k, 900k | 65,536 | low, medium, high | `thinkingLevel` |
+| `gemini-3.8-flash` | 256k (default), 1048k | 65,536 | low, medium, high | `thinkingBudget` 1,000 / 4,000 / dynamic |
+| `claude-opus-5-5` | 256k (default), 840k | 128,000 | low, medium, high | `thinkingLevel` |
+| `claude-sonnet-5-5` | 256k (default), 840k | 128,000 | low, medium, high | `thinkingLevel` |
+| `gpt-oss-120b` | 80k (default), 131k | 32,768 | medium only | `thinkingBudget` 8,192 |
 
-Use `@reasoning=low`, `@reasoning=medium`, or `@reasoning=high` where supported,
-or select the same variation in the existing CLI/Web model picker. Gemini
-presets default to **high** in KT. Flash 3.6 routes to the matching `-low`,
-`-medium`, or `-high` model. Flash 3.7/3.8 use the discovered `-tiered` route.
-All Flash variants send the selected `thinkingLevel`. Pro low routes to
-`gemini-3.1-pro-low` and high to `gemini-pro-agent`, with budgets 1,001/10,001.
-Explicit tier selectors (including `gemini-3.1-pro-high`) are also accepted;
-an effort that conflicts with the ID fails before authentication.
+Each effort is its own wire model, `<preset>-<effort>` (for example
+`gemini-4-argon-high`), with the thinking setting the catalog lists for it. The
+default effort is **medium**, as in agy. Select with `@reasoning=low|medium|high`
+or the CLI/Web model picker; explicit IDs such as `claude-opus-5-5-low` are
+accepted too, and an effort that conflicts with the ID fails before
+authentication. Gemini 4 Argon requires a Google AI Ultra (or eligible
+Enterprise) account. The catalog marks GPT-OSS for removal on 2026-11-02.
 
-agy 1.2.9 rejects `--effort` on both Claude models and rejects medium for Pro.
-KT exposes the same choices. Claude sends the catalog's default thinking budget
-of 1,024; it does not expose Anthropic direct-API effort controls. Unsupported
-choices fail explicitly. Smaller profile output limits are retained; values above the
-catalog cap, or at/below a numeric thinking budget, are rejected.
+The `context` variation sets the profile's `max_context`, the history budget KT
+compacts against. The defaults are agy's own compaction limits; the larger
+choices are agy's Argon context picker (512k / 900k), agy's Claude long-context
+limit (840k), and the catalog maximum (Flash 1048k, GPT-OSS 131k). The choice is
+not sent upstream; a larger window costs more quota per turn only because each
+request carries more input. Groups combine, for example
+`google-antigravity/gemini-4-argon@reasoning=medium,context=512k`.
 
-The retired `gemini-3-flash` is no longer included in the built-in Antigravity
-presets. Choose a current Flash preset above for configurations that used it.
-Custom model IDs remain supported without inferred effort controls.
+Retired presets resolve to their successor with a logged warning:
+`gemini-3.6-flash`, `gemini-3.7-flash`, `gemini-3-flash` → `gemini-3.8-flash`;
+`gemini-3.1-pro` → `gemini-4-argon`; `claude-sonnet-4-6` → `claude-sonnet-5-5`;
+`claude-opus-4-6-thinking` → `claude-opus-5-5`. Raw retired wire IDs in an inline
+config (`gemini-3.7-flash-tiered`, `gemini-pro-agent`, `gemini-3.1-pro-high`, …)
+fail before authentication with `deprecated_model, use <successor>`. Unsupported
+choices fail explicitly. Smaller profile output limits are retained; values above
+the catalog cap, or at/below a positive thinking budget, are rejected. Custom model
+IDs remain supported without inferred effort controls.
 
 ## Ownership and request behavior
 
@@ -68,7 +76,7 @@ lock serializes refreshes across KT processes, and concurrent callers share one
 refresh within a process.
 
 The transport is pinned to `https://daily-cloudcode-pa.googleapis.com`, using the
-agy 1.2.9 header profile used for the latest metadata discovery. Redirects are rejected.
+agy 1.3.4 header profile. Redirects are rejected.
 Each request rereads credentials. Project discovery is checked against the token
 used so that an account switch cannot silently combine a new token and an old
 project. Errors omit raw upstream bodies and credential material. A 401 permits
@@ -84,12 +92,10 @@ text/thinking blocks with their final signatures and removes empty placeholders;
 Gemini retains its original parts. Editing a message invalidates its
 old parts. Text history can be reused across models; tool history with missing or
 incompatible signatures requires a new or compacted session and fails explicitly
-instead of inventing a signature. Changing effort on Flash 3.6 or Pro changes
-the wire model and requires a new or compacted session for signed tool history.
-Flash 3.7/3.8 share the same tiered route across efforts and retain the same
-history binding. A family selector and an explicit tier ID for the same wire
-model can reuse signed history. Switching to OpenAI strips the internal Google
-state from requests.
+instead of inventing a signature. Changing effort changes the wire model and
+requires a new or compacted session for signed tool history. A family selector
+and an explicit tier ID for the same wire model can reuse signed history.
+Switching to OpenAI strips the internal Google state from requests.
 
 This first implementation supports local Windows CLI/Web operation only.
 Remote workers, multiple accounts, macOS/Linux credential stores, arbitrary
@@ -104,9 +110,9 @@ and restrictions. There is no compatibility or account-availability guarantee.
 ## Output limits and tool results
 
 Per-call `max_tokens` overrides (including compaction summaries) leave the saved
-profile unchanged and retain the total output cap. If a numeric thinking budget
-cannot fit, that request uses half the output cap, floored at 128 for Gemini Pro
-or 1,024 for Claude. Caps that cannot exceed that minimum are rejected. Normal
+profile unchanged and retain the total output cap. If a positive thinking budget
+cannot fit, that request uses half the output cap, floored at 128; a dynamic
+budget is sent unchanged. Caps that cannot exceed that minimum are rejected. Normal
 requests retain the configured effort budget; unknown generation options still fail.
 Tool results echo upstream function-call IDs when present. Locally generated IDs
 for no-ID calls are used only for KT pairing and are not sent as upstream IDs.

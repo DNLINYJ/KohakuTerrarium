@@ -112,7 +112,7 @@ async def _fetch_usage(transport) -> dict:
         project, _, token = await load_project(client, RetryPolicy(max_retries=0))
         response = await client.post(
             BASE_URL + "retrieveUserQuotaSummary",
-            headers=headers(token, "retrieveUserQuotaSummary"),
+            headers=headers(token),
             json={"project": project},
         )
         if response.status_code in (401, 403):

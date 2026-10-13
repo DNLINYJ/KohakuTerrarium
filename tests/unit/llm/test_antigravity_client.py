@@ -27,6 +27,9 @@ async def test_discovery_uses_empty_body_and_one_401_refresh(monkeypatch, tmp_pa
         requests.append(request)
         assert json.loads(request.content) == {}
         assert request.url.path.endswith("fetchAvailableModels")
+        assert request.headers["user-agent"].startswith("antigravity/cli/1.3.4 (")
+        assert "auth_method=consumer" in request.headers["user-agent"]
+        assert "client-metadata" not in request.headers
         if len(requests) == 1:
             return httpx.Response(401, text="old secret")
         assert request.headers["authorization"] == "Bearer new"

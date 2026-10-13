@@ -2479,7 +2479,35 @@ class TestLlmIntegration:
                     await provider.close()
 
         # A real agent executes a signed Google tool round and resumes its history.
-        for is_claude in (False, True):
+        for selector, wire, context, is_claude, output, thinking, summary in (
+            (
+                "google-antigravity/gemini-3.8-flash@reasoning=medium",
+                "gemini-3.8-flash-medium",
+                256000,
+                False,
+                65536,
+                {"thinkingBudget": 4000},
+                (4000, {"thinkingBudget": 2000}),
+            ),
+            (
+                "google-antigravity/gemini-4-argon@reasoning=medium,context=512k",
+                "gemini-4-argon-medium",
+                512000,
+                False,
+                65536,
+                {"thinkingLevel": "MEDIUM"},
+                (4096, {"thinkingLevel": "MEDIUM"}),
+            ),
+            (
+                "google-antigravity/claude-sonnet-5-5",
+                "claude-sonnet-5-5-medium",
+                256000,
+                True,
+                128000,
+                {"thinkingLevel": "MEDIUM"},
+                (4000, {"thinkingLevel": "MEDIUM"}),
+            ),
+        ):
             with monkeypatch.context() as agy_patch:
                 agy_patch.setattr(
                     agy_auth,
@@ -2499,23 +2527,13 @@ class TestLlmIntegration:
                         )
                     body = json.loads(request.content)
                     submissions.append(body)
-                    assert body["model"] == (
-                        "claude-sonnet-4-6" if is_claude else "gemini-3.8-flash-tiered"
+                    assert body["model"] == wire
+                    limit, config = (
+                        summary if len(submissions) == 4 else (output, thinking)
                     )
                     assert body["request"]["generationConfig"] == {
-                        "maxOutputTokens": (
-                            (3906 if is_claude else 4096)
-                            if len(submissions) == 4
-                            else (64000 if is_claude else 65536)
-                        ),
-                        "thinkingConfig": {
-                            "includeThoughts": True,
-                            **(
-                                {"thinkingBudget": 1024}
-                                if is_claude
-                                else {"thinkingLevel": "MEDIUM"}
-                            ),
-                        },
+                        "maxOutputTokens": limit,
+                        "thinkingConfig": {"includeThoughts": True, **config},
                     }
                     if len(submissions) == 1:
                         parts = [
@@ -2593,21 +2611,15 @@ class TestLlmIntegration:
                         200, text="data: " + json.dumps(data) + "\n\n"
                     )
 
-                agy = _create_from_profile(
-                    get_profile(
-                        "google-antigravity/claude-sonnet-4-6"
-                        if is_claude
-                        else "google-antigravity/gemini-3.8-flash@reasoning=medium"
-                    )
-                )
+                agy = _create_from_profile(get_profile(selector))
                 agy._transport = httpx.MockTransport(agy_http)
-                assert agy._profile_max_context == (250000 if is_claude else 1048576)
+                assert agy._profile_max_context == context
                 config = tmp_path / "agy.yaml"
                 config.write_text(
                     "name: agy_probe\nsystem_prompt: offline\ninput: {type: none}\noutput: {type: stdout}\ntools: [{name: scratchpad, type: builtin}]\n"
                 )
                 async with Terrarium(
-                    session_dir=tmp_path / f"agy-sessions-{is_claude}"
+                    session_dir=tmp_path / f"agy-sessions-{wire}"
                 ) as engine:
                     creature = await engine.add_creature(
                         str(config), llm=agy, io="headless", start=True

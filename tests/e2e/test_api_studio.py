@@ -318,24 +318,28 @@ class TestApiStudioJourney:
             for entry in models
             if entry["provider"] == "google-antigravity"
         }
-        for model in ("gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash"):
+        assert set(agy_models) == {
+            "gemini-4-argon",
+            "gemini-3.8-flash",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "gpt-oss-120b",
+        }
+        for model, output, contexts in (
+            ("gemini-4-argon", 65536, ["256k", "512k", "900k"]),
+            ("gemini-3.8-flash", 65536, ["256k", "1048k"]),
+            ("claude-opus-5-5", 128000, ["256k", "840k"]),
+            ("claude-sonnet-5-5", 128000, ["256k", "840k"]),
+        ):
             entry = agy_models[model]
-            assert (entry["max_context"], entry["max_output"]) == (1048576, 65536)
+            assert (entry["max_context"], entry["max_output"]) == (256000, output)
             assert list(entry["variation_groups"]["reasoning"]) == [
                 "low",
                 "medium",
                 "high",
             ]
-        assert list(agy_models["gemini-3.1-pro"]["variation_groups"]["reasoning"]) == [
-            "low",
-            "high",
-        ]
-        for model in ("claude-sonnet-4-6", "claude-opus-4-6-thinking"):
-            assert agy_models[model]["variation_groups"] == {}
-            assert (
-                agy_models[model]["max_context"],
-                agy_models[model]["max_output"],
-            ) == (250000, 64000)
+            assert list(entry["variation_groups"]["context"]) == contexts
+        assert list(agy_models["gpt-oss-120b"]["variation_groups"]) == ["context"]
 
         # Embedding presets + plugin-hook catalog round out the catalog.
         resp = client.get("/api/studio/catalog/embedding_presets")

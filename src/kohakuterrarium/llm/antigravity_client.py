@@ -8,6 +8,13 @@ import httpx
 from kohakuterrarium.llm.antigravity_auth import AgyCredentials, AntigravityError
 from kohakuterrarium.llm.recovery import ErrorClass, RetryPolicy
 
+AGY_VERSION = "1.3.4"
+AGY_CHANGELIST = "998275202"
+# The server selects the agy CLI model catalog by this User-Agent shape.
+USER_AGENT = (
+    f"antigravity/cli/{AGY_VERSION} (aidev_client; os_type=windows; arch=amd64; "
+    f"cl={AGY_CHANGELIST}; auth_method=consumer)"
+)
 BASE_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:"
 METADATA = {
     "ideType": "ANTIGRAVITY",
@@ -22,13 +29,12 @@ class RequestError(AntigravityError):
         super().__init__("http_" + str(status))
 
 
-def headers(token, operation: str) -> dict:
+def headers(token) -> dict:
     return {
         "Authorization": "Bearer " + token.access_token,
         "Content-Type": "application/json",
-        "User-Agent": f"antigravity-cli/1.2.9/{operation} (windows; x86_64)",
+        "User-Agent": USER_AGENT,
         "X-Goog-Api-Client": "google-api-go-client/0.5",
-        "Client-Metadata": "ideType=ANTIGRAVITY,platform=WINDOWS_AMD64,pluginType=GEMINI",
     }
 
 
@@ -79,7 +85,7 @@ async def post_json(
         rejected = None
         try:
             response = await client.post(
-                url(operation), headers=headers(token, operation), json=payload
+                url(operation), headers=headers(token), json=payload
             )
             check_status(response)
             if len(response.content) > 4_194_304:

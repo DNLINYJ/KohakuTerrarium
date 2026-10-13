@@ -43,7 +43,7 @@ class AntigravityProvider(BaseLLMProvider):
         extra_body=None,
         transport=None,
     ):
-        if not model or not model.startswith(("gemini-", "claude-")):
+        if not model or not model.startswith(("gemini-", "claude-", "gpt-oss-")):
             raise AntigravityError("unsupported_model")
         if extra_body:
             raise AntigravityError("extra_body_not_supported")
@@ -141,8 +141,8 @@ class AntigravityProvider(BaseLLMProvider):
             ).max_output
             if type(limit) is not int or not 0 < limit <= ceiling:
                 raise AntigravityError("invalid_max_output_tokens")
-            budget = thinking.get("thinkingBudget")
-            if budget is not None and limit <= budget:
+            budget = thinking.get("thinkingBudget", 0)
+            if 0 < budget and limit <= budget:
                 minimum = (
                     1024 if self._settings.wire_model.startswith("claude-") else 128
                 )
@@ -186,7 +186,7 @@ class AntigravityProvider(BaseLLMProvider):
                     "request": request,
                 }
                 turn = Turn()
-                request_headers = headers(token, self._settings.wire_model)
+                request_headers = headers(token)
                 if (
                     self._settings.wire_model.startswith("claude-")
                     and self._settings.thinking_config

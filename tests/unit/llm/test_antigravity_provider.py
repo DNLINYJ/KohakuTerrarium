@@ -10,6 +10,11 @@ from kohakuterrarium.llm.antigravity_auth import AntigravityError, BorrowedCrede
 from kohakuterrarium.llm.antigravity_provider import AntigravityProvider
 from kohakuterrarium.llm.base import ToolSchema
 
+AGY_CLI_USER_AGENT = (
+    "antigravity/cli/1.3.4 (aidev_client; os_type=windows; arch=amd64; "
+    "cl=998275202; auth_method=consumer)"
+)
+
 
 def frame(parts, reason="STOP"):
     return (
@@ -80,7 +85,7 @@ async def test_complete_and_streaming_tool_roundtrip_and_signed_history(upstream
         return httpx.Response(200, text=frame([{"text": "ok"}]))
 
     provider = AntigravityProvider(
-        "gemini-3-flash", transport=httpx.MockTransport(respond)
+        "gemini-3.8-flash", transport=httpx.MockTransport(respond)
     )
     messages = [{"role": "user", "content": "echo"}]
     assert [
@@ -112,7 +117,7 @@ async def test_complete_and_streaming_tool_roundtrip_and_signed_history(upstream
     )
     assert (await provider.chat_complete(messages)).content == "ok"
     assert provider.last_tool_calls == []
-    assert provider.with_model("claude-sonnet-4-6").config.model == "claude-sonnet-4-6"
+    assert provider.with_model("claude-sonnet-5-5").config.model == "claude-sonnet-5-5"
 
 
 @pytest.mark.asyncio
@@ -130,7 +135,7 @@ async def test_retry_before_output_but_never_after_thinking():
         )
 
     provider = AntigravityProvider(
-        "gemini-3-flash",
+        "gemini-3.8-flash",
         retry_policy={"base_delay": 0},
         transport=httpx.MockTransport(respond),
     )
@@ -144,7 +149,7 @@ async def test_retry_before_output_but_never_after_thinking():
 async def test_redirects_and_forbidden_errors_are_redacted():
     for status in (302, 403):
         provider = AntigravityProvider(
-            "gemini-3-flash",
+            "gemini-3.8-flash",
             transport=httpx.MockTransport(
                 lambda req: httpx.Response(
                     status,
@@ -179,7 +184,7 @@ async def test_account_change_during_project_discovery_never_uses_old_project(
         return httpx.Response(200, text=frame([{"text": "ok"}]))
 
     provider = AntigravityProvider(
-        "gemini-3-flash", transport=httpx.MockTransport(respond)
+        "gemini-3.8-flash", transport=httpx.MockTransport(respond)
     )
     assert (
         await provider.chat_complete([{"role": "user", "content": "test"}])
@@ -187,62 +192,74 @@ async def test_account_change_during_project_discovery_never_uses_old_project(
     assert projects == ["project-b"]
 
 
+# The agy 1.3.4 CLI agent catalog: every wire ID KT may request.
+AGY_AGENT_MODELS = {
+    *(f"gemini-4-argon-{effort}" for effort in ("low", "medium", "high")),
+    *(f"gemini-3.8-flash-{effort}" for effort in ("low", "medium", "high")),
+    *(f"claude-opus-5-5-{effort}" for effort in ("low", "medium", "high")),
+    *(f"claude-sonnet-5-5-{effort}" for effort in ("low", "medium", "high")),
+    "gpt-oss-120b-medium",
+}
+FLASH_BUDGETS = {"low": 1000, "medium": 4000, "high": -1}
+
+
 @pytest.mark.parametrize(
     "model,effort,wire,thinking,limit",
     [
         (
-            f"gemini-{version}-flash",
+            family,
             effort,
-            (
-                f"gemini-{version}-flash-{effort}"
-                if version == "3.6"
-                else f"gemini-{version}-flash-tiered"
-            ),
-            {"includeThoughts": True, "thinkingLevel": effort.upper()},
-            65536,
+            f"{family}-{effort or 'medium'}",
+            {"includeThoughts": True, "thinkingLevel": (effort or "medium").upper()},
+            limit,
         )
-        for version in ("3.6", "3.7", "3.8")
-        for effort in ("low", "medium", "high")
+        for family, limit in (
+            ("gemini-4-argon", 65536),
+            ("claude-opus-5-5", 128000),
+            ("claude-sonnet-5-5", 128000),
+        )
+        for effort in ("", "low", "medium", "high")
     ]
     + [
         (
-            "gemini-3.1-pro",
-            "low",
-            "gemini-3.1-pro-low",
-            {"includeThoughts": True, "thinkingBudget": 1001},
-            65535,
-        ),
+            "gemini-3.8-flash",
+            effort,
+            f"gemini-3.8-flash-{effort or 'medium'}",
+            {
+                "includeThoughts": True,
+                "thinkingBudget": FLASH_BUDGETS[effort or "medium"],
+            },
+            65536,
+        )
+        for effort in ("", "low", "medium", "high")
+    ]
+    + [
         (
-            "gemini-3.1-pro",
-            "high",
-            "gemini-pro-agent",
-            {"includeThoughts": True, "thinkingBudget": 10001},
-            65535,
-        ),
-        (
-            "claude-sonnet-4-6",
+            "gpt-oss-120b",
             "",
-            "claude-sonnet-4-6",
-            {"includeThoughts": True, "thinkingBudget": 1024},
-            64000,
+            "gpt-oss-120b-medium",
+            {"includeThoughts": True, "thinkingBudget": 8192},
+            32768,
         ),
         (
-            "claude-opus-4-6-thinking",
+            "gemini-4-argon-high",
             "",
-            "claude-opus-4-6-thinking",
-            {"includeThoughts": True, "thinkingBudget": 1024},
-            64000,
+            "gemini-4-argon-high",
+            {"includeThoughts": True, "thinkingLevel": "HIGH"},
+            65536,
         ),
     ],
 )
 async def test_agy_effort_reaches_wire_request(model, effort, wire, thinking, limit):
+    assert wire in AGY_AGENT_MODELS
     requests = []
 
     def respond(request):
         if request.url.path.endswith("loadCodeAssist"):
             return httpx.Response(200, json={"cloudaicompanionProject": "test-project"})
         requests.append(json.loads(request.content))
-        assert request.headers["user-agent"].startswith("antigravity-cli/1.2.9/")
+        assert request.headers["user-agent"] == AGY_CLI_USER_AGENT
+        assert "client-metadata" not in request.headers
         if model.startswith("claude-"):
             assert (
                 request.headers["anthropic-beta"] == "interleaved-thinking-2025-05-14"
@@ -270,12 +287,14 @@ async def test_agy_effort_reaches_wire_request(model, effort, wire, thinking, li
 @pytest.mark.parametrize(
     "model,effort",
     [
-        ("gemini-3.1-pro", "medium"),
-        ("gemini-3.8-flash", "xhigh"),
+        ("gemini-4-argon", "minimal"),
+        ("gemini-4-argon", "xhigh"),
         ("gemini-3.8-flash", "none"),
         ("gemini-3.8-flash-low", "high"),
-        ("claude-sonnet-4-6", "high"),
-        ("claude-opus-4-6-thinking", "low"),
+        ("claude-sonnet-5-5", "max"),
+        ("claude-opus-5-5-low", "medium"),
+        ("gpt-oss-120b", "high"),
+        ("gemini-4-argon-tiered", ""),
         ("gemini-unknown", "high"),
     ],
 )
@@ -288,11 +307,31 @@ def test_invalid_effort_fails_before_authentication(model, effort):
 
 
 @pytest.mark.parametrize(
+    "model,replacement",
+    [
+        ("gemini-3-flash", "gemini-3.8-flash"),
+        ("gemini-3.6-flash-low", "gemini-3.8-flash"),
+        ("gemini-3.7-flash", "gemini-3.8-flash"),
+        ("gemini-3.8-flash-tiered", "gemini-3.8-flash"),
+        ("gemini-3.1-pro-high", "gemini-4-argon"),
+        ("gemini-pro-agent", "gemini-4-argon"),
+        ("claude-sonnet-4-6", "claude-sonnet-5-5"),
+        ("claude-opus-4-6-thinking", "claude-opus-5-5"),
+    ],
+)
+def test_retired_models_fail_before_authentication_naming_successor(model, replacement):
+    with pytest.raises(AntigravityError) as caught:
+        AntigravityProvider(model)
+    assert caught.value.code == f"deprecated_model, use {replacement}"
+
+
+@pytest.mark.parametrize(
     "model,limit",
     [
         ("gemini-3.8-flash", 65537),
-        ("gemini-3.1-pro", 65536),
-        ("claude-sonnet-4-6", 64001),
+        ("gemini-4-argon", 65537),
+        ("claude-sonnet-5-5", 128001),
+        ("gpt-oss-120b", 32769),
         ("gemini-3.8-flash", 0),
         ("gemini-3.8-flash", -1),
         ("gemini-3.8-flash", True),
@@ -305,25 +344,27 @@ def test_invalid_output_limit_fails_before_authentication(model, limit):
 
 def test_explicit_sku_defaults_and_with_model_effort():
     messages = [{"role": "user", "content": "test"}]
-    low = AntigravityProvider("gemini-3.8-flash-low")
-    assert (
-        low._request(messages, "scope", None, None, {})["generationConfig"][
+
+    def thinking(provider):
+        return provider._request(messages, "scope", None, None, {})["generationConfig"][
             "thinkingConfig"
-        ]["thinkingLevel"]
-        == "LOW"
-    )
+        ]
+
+    assert thinking(AntigravityProvider("gemini-3.8-flash-low")) == {
+        "includeThoughts": True,
+        "thinkingBudget": 1000,
+    }
     provider = AntigravityProvider("gemini-3.8-flash", reasoning_effort="low")
-    sibling = provider.with_model("gemini-3.7-flash")
-    assert (
-        sibling._request(messages, "scope", None, None, {})["generationConfig"][
-            "thinkingConfig"
-        ]["thinkingLevel"]
-        == "LOW"
-    )
+    sibling = provider.with_model("gemini-4-argon")
+    assert thinking(sibling) == {"includeThoughts": True, "thinkingLevel": "LOW"}
+    assert sibling._settings.wire_model == "gemini-4-argon-low"
     assert sibling.config.max_tokens == 65536
-    claude = provider.with_model("claude-sonnet-4-6")
-    assert claude.config.max_tokens == 64000
-    assert claude._profile_max_context == 250000
+    claude = provider.with_model("claude-sonnet-5-5")
+    assert claude.config.max_tokens == 65536
+    assert claude._profile_max_context == 256000
+    gpt = provider.with_model("gpt-oss-120b")
+    assert gpt.reasoning_effort == "medium"
+    assert gpt._profile_max_context == 80000
     assert provider.with_model(provider.config.model) is provider
 
 
@@ -376,74 +417,87 @@ async def test_signed_round_requires_matching_wire_model():
     ]
     same_wire = AntigravityProvider("gemini-3.8-flash-high", transport=transport)
     assert (await same_wire.chat_complete(messages)).content == "ok"
-    low = AntigravityProvider(
-        "gemini-3.8-flash", reasoning_effort="low", transport=transport
-    )
-    assert (await low.chat_complete(messages)).content == "ok"
-    other_model = AntigravityProvider("gemini-3.7-flash", transport=transport)
-    with pytest.raises(AntigravityError, match="history_requires_new_session"):
-        await other_model.chat_complete(messages)
-    assert len(requests) == 3
+    for other in ("gemini-3.8-flash-low", "gemini-4-argon-high"):
+        with pytest.raises(AntigravityError, match="history_requires_new_session"):
+            await AntigravityProvider(other, transport=transport).chat_complete(
+                messages
+            )
+    assert len(requests) == 2
 
 
 @pytest.mark.parametrize(
-    "target", ["gemini-3.8-flash-low", "gemini-3.7-flash-tiered", "gemini-unknown"]
+    "target,context",
+    [
+        ("gemini-3.8-flash-low", 256000),
+        ("gemini-4-argon-high", 256000),
+        ("claude-opus-5-5", 256000),
+        ("gemini-unknown", 120000),
+    ],
 )
-def test_with_model_preserves_explicit_output_limit(target):
+def test_with_model_preserves_explicit_output_limit(target, context):
     provider = AntigravityProvider("gemini-3.8-flash", max_tokens=4096)
     sibling = provider.with_model(target)
     assert sibling.config.max_tokens == 4096
-    assert sibling._profile_max_context == (
-        120000 if target == "gemini-unknown" else 1048576
-    )
+    assert sibling._profile_max_context == context
 
 
-@pytest.mark.parametrize("version", ["3.7", "3.8"])
+def test_with_model_rejects_a_kept_limit_below_the_target_thinking_budget():
+    provider = AntigravityProvider("gemini-3.8-flash", max_tokens=4096)
+    with pytest.raises(
+        AntigravityError, match="max_output_tokens_must_exceed_thinking_budget"
+    ):
+        provider.with_model("gpt-oss-120b")
+    roomy = AntigravityProvider("gemini-3.8-flash", max_tokens=16384)
+    assert roomy.with_model("gpt-oss-120b")._profile_max_context == 80000
+
+
+@pytest.mark.parametrize(
+    "family", ["gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "gpt-oss-120b"]
+)
 @pytest.mark.parametrize("effort", ["", "low", "medium", "high"])
-async def test_tiered_only_catalog_routes_do_not_request_missing_effort_skus(
-    version, effort
-):
+async def test_only_advertised_catalog_skus_are_requested(family, effort):
     requests = []
-    available = {"gemini-3.7-flash-tiered", "gemini-3.8-flash-tiered"}
 
     def respond(request):
         if request.url.path.endswith("loadCodeAssist"):
             return httpx.Response(200, json={"cloudaicompanionProject": "test-project"})
         body = json.loads(request.content)
         requests.append(body)
-        if body["model"] not in available:
+        if body["model"] not in AGY_AGENT_MODELS:
             return httpx.Response(404)
         return httpx.Response(200, text=frame([{"text": "OK"}]))
 
-    provider = AntigravityProvider(
-        f"gemini-{version}-flash",
-        reasoning_effort=effort,
-        transport=httpx.MockTransport(respond),
-        retry_policy={"max_retries": 0},
-    )
+    try:
+        provider = AntigravityProvider(
+            family,
+            reasoning_effort=effort,
+            transport=httpx.MockTransport(respond),
+            retry_policy={"max_retries": 0},
+        )
+    except AntigravityError as exc:
+        assert exc.code == "unsupported_reasoning_effort"
+        assert family == "gpt-oss-120b" and effort in ("low", "high")
+        return
     assert (
         await provider.chat_complete([{"role": "user", "content": "Reply exactly OK."}])
     ).content == "OK"
-    assert len(requests) == 1
-    assert (
-        requests[0]["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"]
-        == (effort or "high").upper()
-    )
+    assert [body["model"] for body in requests] == [provider._settings.wire_model]
 
 
 @pytest.mark.parametrize(
-    "model",
+    "model,summary_limit,summary_budget",
     [
-        "gemini-3.6-flash",
-        "gemini-3.7-flash",
-        "gemini-3.8-flash",
-        "gemini-3.1-pro",
-        "gemini-3.1-pro-low",
-        "claude-sonnet-4-6",
-        "claude-opus-4-6-thinking",
+        ("gemini-4-argon", 4000, None),
+        ("gemini-3.8-flash", 4000, 2000),
+        ("gemini-3.8-flash-low", 4000, 1000),
+        ("gemini-3.8-flash-high", 4000, -1),
+        ("claude-sonnet-5-5", 4000, None),
+        ("gpt-oss-120b", 1250, 625),
     ],
 )
-async def test_compact_summary_uses_per_call_limit_without_mutating_profile(model):
+async def test_compact_summary_uses_per_call_limit_without_mutating_profile(
+    model, summary_limit, summary_budget
+):
     submitted = []
 
     def respond(request):
@@ -463,14 +517,8 @@ async def test_compact_summary_uses_per_call_limit_without_mutating_profile(mode
         await manager._summarize("User: test. Assistant: done.") == "Summary retained."
     )
     assert manager._last_summary_error == ""
-    assert submitted[0]["maxOutputTokens"] == (
-        3906 if model.startswith("claude-") else 4096
-    )
-    budget = submitted[0]["thinkingConfig"].get("thinkingBudget")
-    if model == "gemini-3.1-pro":
-        assert budget == 2048
-    elif budget is not None:
-        assert budget == (1001 if model.endswith("pro-low") else 1024)
+    assert submitted[0]["maxOutputTokens"] == summary_limit
+    assert submitted[0]["thinkingConfig"].get("thinkingBudget") == summary_budget
     await provider.chat_complete([{"role": "user", "content": "test"}])
     assert submitted[1] == original
 
@@ -489,7 +537,7 @@ def test_invalid_per_call_limit_is_rejected(limit):
 
 
 @pytest.mark.parametrize(
-    "model,limit", [("gemini-3.1-pro", 128), ("claude-sonnet-4-6", 1024)]
+    "model,limit", [("gemini-3.8-flash-low", 128), ("gpt-oss-120b", 128)]
 )
 def test_per_call_limit_must_fit_minimum_thinking_budget(model, limit):
     provider = AntigravityProvider(model)
@@ -506,7 +554,7 @@ def test_per_call_limit_must_fit_minimum_thinking_budget(model, limit):
 
 
 def test_none_override_and_unknown_generation_options():
-    provider = AntigravityProvider("gemini-3.1-pro")
+    provider = AntigravityProvider("gemini-4-argon")
     args = ([{"role": "user", "content": "test"}], "scope", None, None)
     assert provider._request(*args, {"max_tokens": None}) == provider._request(
         *args, {}
@@ -516,10 +564,10 @@ def test_none_override_and_unknown_generation_options():
 
 
 @pytest.mark.parametrize(
-    "limit,budget", [(512, 256), (129, 128), (10001, 5000), (12000, 10001)]
+    "limit,budget", [(512, 256), (129, 128), (8192, 4096), (9000, 8192)]
 )
 def test_per_call_numeric_budget_respects_output_cap_and_minimum(limit, budget):
-    provider = AntigravityProvider("gemini-3.1-pro")
+    provider = AntigravityProvider("gpt-oss-120b")
     request = provider._request(
         [{"role": "user", "content": "test"}],
         "scope",
@@ -531,7 +579,18 @@ def test_per_call_numeric_budget_respects_output_cap_and_minimum(limit, budget):
         "maxOutputTokens": limit,
         "thinkingConfig": {"includeThoughts": True, "thinkingBudget": budget},
     }
-    assert provider._settings.thinking_config["thinkingBudget"] == 10001
+    assert provider._settings.thinking_config["thinkingBudget"] == 8192
+
+
+def test_dynamic_thinking_budget_is_never_shrunk_by_a_small_limit():
+    provider = AntigravityProvider("gemini-3.8-flash-high")
+    request = provider._request(
+        [{"role": "user", "content": "test"}], "scope", None, None, {"max_tokens": 64}
+    )
+    assert request["generationConfig"] == {
+        "maxOutputTokens": 64,
+        "thinkingConfig": {"includeThoughts": True, "thinkingBudget": -1},
+    }
 
 
 @pytest.mark.asyncio
