@@ -1,9 +1,14 @@
 """Unit tests for :mod:`kohakuterrarium.studio.persistence.viewer.summary`."""
 
+import weakref
+from collections import Counter
+
 import pytest
 from kohakuterrarium.errors import NotFoundError
 
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.studio.persistence.viewer import rollups as rollups_mod
+from kohakuterrarium.studio.persistence.viewer import summary as summary_mod
 from kohakuterrarium.studio.persistence.viewer.summary import (
     _agents_for_summary,
     _aggregate_rollups,
@@ -380,3 +385,324 @@ class TestBuildSummaryPayload:
             assert hot[0]["tokens_in"] == 60
         finally:
             s.close()
+
+
+@pytest.fixture
+def overview_store(tmp_path):
+    store = _store(tmp_path)
+    store.init_meta("synthetic", "terrarium", "", "", ["alice", "empty"])
+    store.meta["viewer_default_agent"] = "bob"
+    store.meta["forked_children"] = ["child"]
+    for _ in range(2):
+        store.append_event("alice", "tool_call", {"name": "read"}, turn_index=1)
+    for _ in range(2):
+        store.append_event(
+            "alice",
+            "token_usage",
+            {"prompt_tokens": 100, "completion_tokens": 20},
+            turn_index=1,
+        )
+    store.append_event(
+        "alice",
+        "turn_token_usage",
+        {"prompt_tokens": 10, "completion_tokens": 3, "cached_tokens": 2},
+        turn_index=1,
+    )
+    store.append_event(
+        "alice", "token_usage", {"prompt_tokens": 7, "completion_tokens": 2}
+    )
+    store.append_event(
+        "alice",
+        "subagent_token_usage",
+        {
+            "job_id": "job1",
+            "name": "explore",
+            "prompt_tokens": 5,
+            "completion_tokens": 1,
+            "cost_usd": 0.1,
+        },
+        turn_index=1,
+    )
+    store.append_event(
+        "alice",
+        "subagent_token_usage",
+        {
+            "job_id": "job1",
+            "name": "explore",
+            "prompt_tokens": 8,
+            "completion_tokens": 2,
+        },
+        turn_index=2,
+    )
+    store.append_event(
+        "alice",
+        "subagent_result",
+        {
+            "job_id": "job1",
+            "name": "explore",
+            "prompt_tokens": 9,
+            "completion_tokens": 3,
+            "cost_usd": 0.2,
+            "success": True,
+        },
+        turn_index=2,
+    )
+    store.append_event(
+        "alice",
+        "subagent_result",
+        {"prompt_tokens": 2, "completion_tokens": 1, "success": False},
+        turn_index=3,
+    )
+    store.append_event("alice", "compact_complete", {}, turn_index=2)
+    store.append_event("alice", "tool_result", {"exit_code": 1}, turn_index=1)
+    store.save_turn_rollup(
+        "alice",
+        1,
+        {
+            "tokens_in": 50,
+            "tokens_out": 6,
+            "tokens_cached": 4,
+            "cost_usd": 0.4,
+            "tool_calls": 0,
+        },
+    )
+    store.save_turn_rollup(
+        "alice", 4, {"tokens_in": 2, "tokens_out": 1, "cost_usd": None}
+    )
+    store.append_event(
+        "bob",
+        "turn_token_usage",
+        {"prompt_tokens": 4, "completion_tokens": 1},
+        turn_index=1,
+    )
+    store.append_event(
+        "alice:attached:review:0",
+        "token_usage",
+        {"prompt_tokens": 3, "completion_tokens": 2},
+        turn_index=1,
+    )
+    store.flush()
+    try:
+        yield store
+    finally:
+        store.close(update_status=False)
+
+
+def _count_summary_reads(monkeypatch, store):
+    reads, values, dedupes = Counter(), Counter(), []
+    original_read = SessionStore.get_events
+    original_dedupe = rollups_mod.dedupe_adjacent_duplicate_events
+    vault_type = type(store.events)
+
+    def read(owner, name, *args, **kwargs):
+        if owner is store:
+            reads[name] += 1
+        return original_read(owner, name, *args, **kwargs)
+
+    def value_reader(original):
+        def value(vault, key, *args, **kwargs):
+            if vault is store.events:
+                text = key.decode() if isinstance(key, bytes) else key
+                values[text.rsplit(":e", 1)[0]] += 1
+            return original(vault, key, *args, **kwargs)
+
+        return value
+
+    def dedupe(events):
+        dedupes.append(len(events))
+        return original_dedupe(events)
+
+    monkeypatch.setattr(SessionStore, "get_events", read)
+    monkeypatch.setattr(vault_type, "__getitem__", value_reader(vault_type.__getitem__))
+    monkeypatch.setattr(vault_type, "get", value_reader(vault_type.get))
+    monkeypatch.setattr(rollups_mod, "dedupe_adjacent_duplicate_events", dedupe)
+    monkeypatch.setattr(
+        summary_mod, "dedupe_adjacent_duplicate_events", dedupe, raising=False
+    )
+    return reads, values, dedupes
+
+
+class TestSummaryReadReuse:
+    @pytest.mark.parametrize(
+        "agent", [None, "alice", "empty", "bob", "alice:attached:review:0"]
+    )
+    def test_one_read_and_dedupe_per_namespace(
+        self, overview_store, monkeypatch, agent
+    ):
+        store = overview_store
+        names = (
+            [name for name, _ in rollups_mod.list_agent_namespaces(store)]
+            if agent is None
+            else [agent]
+        )
+        event_counts = {name: len(store.get_events(name)) for name in names}
+        reads, values, dedupes = _count_summary_reads(monkeypatch, store)
+        payload = build_summary_payload(store, "sample", agent)
+        assert reads == Counter({name: 1 for name in names})
+        assert values == Counter(event_counts)
+        assert len(dedupes) == len(names)
+        assert set(payload["agents"]) == set(names)
+        assert (
+            payload["totals"]["tokens"]["prompt"]
+            == {
+                None: 35,
+                "alice": 63,
+                "empty": 0,
+                "bob": 4,
+                "alice:attached:review:0": 3,
+            }[agent]
+        )
+
+    @pytest.mark.parametrize("agent", [None, "alice"])
+    def test_complete_summary_contract(self, overview_store, agent):
+        store = overview_store
+        meta = store.load_meta()
+        graph = agent is None
+        expected = {
+            key: meta.get(key)
+            for key in (
+                "format_version",
+                "status",
+                "created_at",
+                "last_active",
+                "config_type",
+                "config_path",
+            )
+        }
+        expected.update(
+            session_name="sample",
+            session_id="synthetic",
+            lineage={},
+            agents=(
+                ["bob", "alice", "empty", "alice:attached:review:0"]
+                if graph
+                else ["alice"]
+            ),
+            totals={
+                "turns": 6 if graph else 4,
+                "tokens": {
+                    "prompt": 35 if graph else 63,
+                    "completion": 12 if graph else 11,
+                    "cached": 2 if graph else 4,
+                },
+                "cost_usd": 0.6000000000000001,
+                "tool_calls": 2,
+                "errors": 2,
+                "compacts": 1,
+                "forks": 1,
+                "attached_agents": 1,
+            },
+            error_turns=[1, 3],
+            compact_turns=[2],
+            hot_turns=[
+                {
+                    "agent": agent,
+                    "turn_index": turn,
+                    "cost_usd": cost,
+                    "tokens_in": tin,
+                    "tokens_out": tout,
+                }
+                for turn, cost, tin, tout in [
+                    (3, None, 2, 1),
+                    (4, None, 2, 1),
+                    (1, 0.4, 57 if graph else 50, 9 if graph else 6),
+                    (2, 0.2, 9, 3),
+                ]
+            ],
+        )
+        assert build_summary_payload(store, "sample", agent) == expected
+
+    @pytest.mark.parametrize("name", ["", 7, [], {}])
+    def test_diagnostic_only_metadata_namespace(self, tmp_path, monkeypatch, name):
+        store = _store(tmp_path)
+        try:
+            store.init_meta("odd", "agent", "", "", [name])
+            store.append_event(str(name), "tool_call", {"name": "read"}, turn_index=1)
+            store.append_event(str(name), "tool_result", {"exit_code": 1}, turn_index=1)
+            reads, _, _ = _count_summary_reads(monkeypatch, store)
+            result = build_summary_payload(store, "sample", None)
+            assert result["agents"][0] == name
+            assert result["totals"]["tool_calls"] == len(result["agents"])
+            assert result["error_turns"] == [1]
+            assert reads == Counter({str(agent): 1 for agent in result["agents"]})
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize("name", ["", [], {}])
+    def test_empty_metadata_namespace_without_events(self, tmp_path, name):
+        store = _store(tmp_path)
+        try:
+            store.init_meta("odd", "agent", "", "", [name])
+            result = build_summary_payload(store, "sample", None)
+            assert result["agents"] == [name]
+            assert result["totals"]["tool_calls"] == 0
+            assert result["totals"]["turns"] == 0
+        finally:
+            store.close()
+
+    def test_payload_counter_detects_hidden_scan(self, overview_store, monkeypatch):
+        store = overview_store
+        names = [name for name, _ in rollups_mod.list_agent_namespaces(store)]
+        budget = sum(len(store.get_events(name)) for name in names)
+        _, values, _ = _count_summary_reads(monkeypatch, store)
+        original_scan = summary_mod._scan_events_for_summary
+
+        def hidden_scan(events):
+            next(store.events.values())
+            return original_scan(events)
+
+        monkeypatch.setattr(summary_mod, "_scan_events_for_summary", hidden_scan)
+        build_summary_payload(store, "sample", None)
+        with pytest.raises(AssertionError):
+            assert sum(values.values()) == budget
+        assert sum(values.values()) > budget
+
+    def test_append_after_read_is_visible_only_on_next_request(
+        self, overview_store, monkeypatch
+    ):
+        store = overview_store
+        expected = build_summary_payload(store, "sample", None)
+        original = SessionStore.get_events
+        appended = False
+
+        def read(owner, name, *args, **kwargs):
+            nonlocal appended
+            events = original(owner, name, *args, **kwargs)
+            if owner is store and name == "alice" and not appended:
+                appended = True
+                store.append_event("alice", "tool_call", {"name": "late"}, turn_index=1)
+                store.append_event("alice", "token_usage", {"prompt_tokens": 11})
+            return events
+
+        monkeypatch.setattr(SessionStore, "get_events", read)
+        assert build_summary_payload(store, "sample", None) == expected
+        later = build_summary_payload(store, "sample", None)
+        assert later["totals"]["tool_calls"] == expected["totals"]["tool_calls"] + 1
+        assert (
+            later["totals"]["tokens"]["prompt"]
+            == expected["totals"]["tokens"]["prompt"] + 11
+        )
+
+    def test_previous_namespace_payloads_are_released(
+        self, overview_store, monkeypatch
+    ):
+        store = overview_store
+        original = SessionStore.get_events
+        previous = []
+
+        class Event(dict):
+            pass
+
+        def read(owner, name, *args, **kwargs):
+            if owner is not store:
+                return original(owner, name, *args, **kwargs)
+            assert all(ref() is None for ref in previous)
+            previous.clear()
+            events = [Event(event) for event in original(owner, name, *args, **kwargs)]
+            previous.extend(weakref.ref(event) for event in events)
+            return events
+
+        monkeypatch.setattr(SessionStore, "get_events", read)
+        result = build_summary_payload(store, "sample", None)
+        assert all(ref() is None for ref in previous)
+        assert result["totals"]["tool_calls"] == 2
