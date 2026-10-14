@@ -49,10 +49,12 @@ class MemoryResources:
     def close(self) -> None:
         """Close index state and drop native references, retaining uncertain occupancy."""
         with self._lock:
-            if self._released:
+            if self._released and not self._handles:
                 return
             try:
-                for table, attr in self._handles:
+                index = 0
+                while index < len(self._handles):
+                    table, attr = self._handles[index]
                     if attr == "_inner":
                         daemon = getattr(table, "_daemon_thread", None)
                         try:
@@ -65,16 +67,18 @@ class MemoryResources:
                     try:
                         delattr(table, attr)
                     except AttributeError:
-                        continue
+                        pass
                     except Exception:
                         self._certain = False
                         logger.warning(
                             "Memory native handle drop failed", exc_info=True
                         )
+                        index += 1
+                        continue
+                    self._handles.pop(index)
             except BaseException:
                 self._certain = False
                 raise
             finally:
                 self._released = True
                 self._lease.finish(source_released=self._certain)
-                self._handles.clear()

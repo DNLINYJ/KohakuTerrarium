@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import kohakuterrarium.terrarium.wiring as wiring
-from kohakuterrarium.session.file_family import acquire_family, family_identities
+from kohakuterrarium.session.file_family import acquire_family
 from kohakuterrarium.session.file_mutation import await_mutation, run_admitted_mutation
 from kohakuterrarium.terrarium import graph_checkpoint
 from kohakuterrarium.terrarium.channels import remove_channel_trigger
+from kohakuterrarium.utils.fs_path import coerce_fs_path
 from kohakuterrarium.utils.logging import get_logger
 
 if TYPE_CHECKING:
@@ -96,9 +98,9 @@ async def discard_recipe_graph(
     family = _recipe_session_family(session_path)
 
     def mutate():
-        identity = family_identities([session_path])
+        identity = _primary_identity(session_path)
         if any(
-            family_identities([item.path]) == identity
+            _primary_identity(item.path) == identity
             for item in engine._session_stores.values()
         ):
             raise ValueError("recipe discard refuses an active session store")
@@ -133,6 +135,11 @@ async def _close_store(store) -> None:
         result = store.close()
     if inspect.isawaitable(result):
         await result
+
+
+def _primary_identity(path: str | Path) -> str:
+    """Normalized resolved primary path; family sets are not equality."""
+    return os.path.normcase(str(coerce_fs_path(path).expanduser().resolve()))
 
 
 def _recipe_session_family(path: Path) -> list[Path]:

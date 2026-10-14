@@ -27,7 +27,10 @@ async def await_mutation(
             if (failure := task.exception()) is not None:
                 raise cancelled from failure
             if on_success is not None:
-                on_success()
+                try:
+                    on_success()
+                except BaseException as failure:
+                    raise cancelled from failure
         raise
     if on_success is not None:
         on_success()

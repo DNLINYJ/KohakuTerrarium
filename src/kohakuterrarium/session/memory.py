@@ -80,8 +80,17 @@ class SessionMemory:
         self._resources = MemoryResources(db_path)
         try:
             self._open_indexes(db_path)
-        except BaseException:
-            self._resources.close()
+        except BaseException as primary:
+            try:
+                self._resources.close()
+            except BaseException as cleanup:
+                tail = primary
+                seen = {id(primary)}
+                while tail.__cause__ is not None and id(tail.__cause__) not in seen:
+                    tail = tail.__cause__
+                    seen.add(id(tail))
+                tail.__cause__ = cleanup
+                raise primary
             raise
 
     def _open_indexes(self, db_path: str) -> None:
