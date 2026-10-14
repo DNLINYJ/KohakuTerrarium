@@ -8,6 +8,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  useChatStore()._clearBranchResyncTimers()
   vi.restoreAllMocks()
 })
 
@@ -44,6 +45,84 @@ function seedInstance(chat, tab = "main") {
   chat.eventsByTab = { [tab]: events }
   chat.messagesByTab = { [tab]: messages }
   chat.branchViewByTab = {}
+}
+
+function branchedEvents() {
+  const events = []
+  const appendTurn = (turn, branch, content, response, parents) => {
+    for (const [type, text] of [
+      ["user_input", content],
+      ["user_message", content],
+      ["processing_start", ""],
+      ["text_chunk", response],
+      ["processing_end", ""],
+    ]) {
+      events.push({
+        type,
+        content: text,
+        event_id: events.length + 1,
+        turn_index: turn,
+        branch_id: branch,
+        parent_branch_path: parents,
+      })
+    }
+  }
+  appendTurn(1, 1, "first input", "first response", [])
+  appendTurn(1, 2, "second input", "second response", [])
+  appendTurn(1, 3, "third input", "original response", [])
+  appendTurn(2, 2, "continue", "older continuation", [[1, 3]])
+  appendTurn(2, 3, "continue", "selected continuation", [[1, 3]])
+  appendTurn(3, 3, "continue again", "old descendant", [
+    [1, 3],
+    [2, 3],
+  ])
+  appendTurn(1, 4, "third input", "regenerated response", [])
+  return events
+}
+
+function seedBranchedStore(ancestry = "explicit") {
+  const chat = useChatStore()
+  seedInstance(chat, "alice")
+  const events = branchedEvents()
+  if (ancestry === "legacy") {
+    for (const event of events) delete event.parent_branch_path
+  }
+  chat.eventsByTab.alice = events
+  chat.branchViewByTab = { alice: { 1: 3, 2: 3, 3: 3 }, bob: { 1: 1, 2: 1 } }
+  chat._rebuildMessages("alice")
+  chat._scheduleBranchResync = vi.fn()
+  return { chat, events }
+}
+
+function wsFrame(type, turnIndex, branchId, extra = {}) {
+  const frame = { type, source: "alice", turn_index: turnIndex, branch_id: branchId, ...extra }
+  if (type === "model_recovery") {
+    Object.assign(frame, {
+      phase: "waiting",
+      request_id: extra.request_id || `recovery-${turnIndex}`,
+      sequence: 1,
+      request_started_at: extra.request_started_at ?? turnIndex,
+    })
+  }
+  return frame
+}
+
+function openSend(chat) {
+  const send = vi.fn()
+  chat._ws = { readyState: WebSocket.OPEN, send }
+  return send
+}
+
+function transcript(chat) {
+  return JSON.stringify(chat.messagesByTab.alice)
+}
+
+function turns(chat) {
+  return chat.messagesByTab.alice.map((message) => message.turnIndex)
+}
+
+function lastBranchView(send) {
+  return JSON.parse(send.mock.lastCall[0]).branch_view
 }
 
 describe("chat store — branch op owner/lifetime guards", () => {
@@ -399,11 +478,106 @@ describe("chat store — branch error classification (mayHaveRun)", () => {
     chat._adoptAuthoritativeBranchView("alice", { 1: 2 })
     expect(chat.branchViewByTab.alice).toEqual({ 1: 2 })
   })
+})
+
+describe("chat store — branch navigation with live descendants", () => {
+  it.each(["explicit", "legacy"])(
+    "prunes old descendants before continuing a regenerated response (%s ancestry)",
+    async (ancestry) => {
+      const { chat } = seedBranchedStore(ancestry)
+      expect(turns(chat)).toEqual([1, 1, 2, 2, 3, 3])
+
+      chat.selectBranch(1, 4, "alice")
+      expect(chat.branchViewByTab.alice).toEqual({ 1: 4 })
+      expect(chat.branchViewByTab.bob).toEqual({ 1: 1, 2: 1 })
+      expect(turns(chat)).toEqual([1, 1])
+
+      const send = openSend(chat)
+      await chat.send("continue the regeneration")
+      expect(lastBranchView(send)).toEqual({ 1: 4 })
+      chat.processingByTab.alice = false
+
+      chat.selectBranch(1, 3, "alice")
+      expect(turns(chat)).toEqual([1, 1, 2, 2, 3, 3])
+      expect(transcript(chat)).toContain("old descendant")
+      await chat.send("continue the original")
+      expect(lastBranchView(send)).toEqual({ 1: 3 })
+    },
+  )
+
+  it.each([
+    ["explicit", 3, 3],
+    ["legacy", 3, 3],
+    ["explicit", 4, 3],
+    ["explicit", 4, 2],
+  ])(
+    "isolates a descendant stream after its ancestor selection changes (%s ancestry, branch %i, middle %i)",
+    (ancestry, streamingBranch, middleBranch) => {
+      const { chat } = seedBranchedStore(ancestry)
+      chat.branchViewByTab.alice = { 1: 3, 2: middleBranch, 3: streamingBranch }
+      chat.processingByTab.alice = true
+      chat._streamingBranchByTab.alice = { turnIndex: 3, branchId: streamingBranch }
+
+      chat.selectBranch(1, 4, "alice")
+      expect(chat.branchViewByTab.alice).toEqual({ 1: 4 })
+      const beforeChunk = transcript(chat)
+      chat._onMessage(wsFrame("processing_start", 3, streamingBranch))
+      chat._onMessage(wsFrame("text", 3, streamingBranch, { content: "off-subtree chunk" }))
+      expect(transcript(chat)).toBe(beforeChunk)
+      expect(chat.viewingRunningBranch).toBe(false)
+
+      chat.selectBranch(1, 3, "alice")
+      if (middleBranch !== 3) {
+        const beforeWrongMiddleChunk = transcript(chat)
+        chat._onMessage(wsFrame("text", 3, streamingBranch, { content: "wrong-middle chunk" }))
+        expect(transcript(chat)).toBe(beforeWrongMiddleChunk)
+        chat.selectBranch(2, middleBranch, "alice")
+      }
+      chat._onMessage(wsFrame("text", 3, streamingBranch, { content: "on-subtree chunk" }))
+      expect(transcript(chat)).toContain("on-subtree chunk")
+      if (streamingBranch !== 4) return
+
+      expect(transcript(chat)).not.toContain("old descendant")
+      expect(chat.branchViewByTab.alice[3]).toBe(4)
+      chat.selectBranch(1, 3, "alice")
+      expect(chat.branchViewByTab.alice[3]).toBe(4)
+      if (middleBranch !== 3) return
+
+      chat.selectBranch(3, 3, "alice")
+      chat.selectBranch(1, 3, "alice")
+      expect(chat.branchViewByTab.alice[3]).toBe(3)
+      const beforeSiblingChunk = transcript(chat)
+      chat._onMessage(wsFrame("text", 3, streamingBranch, { content: "wrong-sibling chunk" }))
+      expect(transcript(chat)).toBe(beforeSiblingChunk)
+    },
+  )
+
+  it("preserves earlier selections, compatible descendants, and uncached middle streams", async () => {
+    const { chat } = seedBranchedStore()
+    chat.selectBranch(2, 2, "alice")
+    expect(chat.branchViewByTab.alice).toEqual({ 1: 3, 2: 2 })
+    expect(turns(chat)).toEqual([1, 1, 2, 2])
+    expect(transcript(chat)).toContain("older continuation")
+    expect(transcript(chat)).not.toContain("old descendant")
+
+    chat.selectBranch(1, 3, "alice")
+    expect(chat.branchViewByTab.alice).toEqual({ 1: 3, 2: 2 })
+    expect(transcript(chat)).not.toContain("selected continuation")
+
+    chat.branchViewByTab.alice = { 1: 3, 3: 3 }
+    chat._streamingBranchByTab.alice = { turnIndex: 2, branchId: 4 }
+    chat.selectBranch(1, 3, "alice")
+    expect(chat.branchViewByTab.alice).toEqual({ 1: 3, 2: 4 })
+    expect(transcript(chat)).not.toContain("old descendant")
+    const send = openSend(chat)
+    await chat.send("continue the live middle response")
+    expect(lastBranchView(send)).toEqual({ 1: 3, 2: 4 })
+  })
 
   it("clears browsed markers when unbinding so a later same-name tab can restore", () => {
     const chat = useChatStore()
     seedInstance(chat, "alice")
-    expect(chat.selectBranch(1, 1, "alice")).toBe(true)
+    chat.selectBranch(1, 1, "alice")
     chat.unbindFromInstance()
     expect(chat._browsedBranchByTab).toEqual({})
     chat.activeTab = "alice"
@@ -411,4 +585,119 @@ describe("chat store — branch error classification (mayHaveRun)", () => {
     chat._adoptAuthoritativeBranchView("alice", { 1: 2 })
     expect(chat.branchViewByTab.alice).toEqual({ 1: 2 })
   })
+})
+
+describe("chat store — send ancestry freeze until streaming coordinates arrive", () => {
+  it.each([
+    ["explicit", "processing_start"],
+    ["legacy", "processing_start"],
+    ["explicit", "model_recovery"],
+    ["paged-view", "processing_start"],
+    ["paged-path", "processing_start"],
+    ["retry", "processing_start"],
+    ["paged-retry", "model_recovery"],
+    ["queued", "processing_start"],
+  ])("captures send ancestry before delayed coordinates (%s, %s)", async (mode, startKind) => {
+    const { chat, events } = seedBranchedStore(mode === "legacy" ? "legacy" : "explicit")
+    const send = openSend(chat)
+    if (mode.startsWith("paged")) {
+      chat.eventsByTab.alice = events.filter((event) => event.turn_index > 1)
+      if (mode !== "paged-view") chat.branchViewByTab.alice = { 2: 3, 3: 3 }
+    }
+    if (mode.endsWith("retry")) {
+      await chat.send("failed attempt")
+      chat._onMessage(wsFrame(startKind, 4, 2))
+      if (mode === "paged-retry") {
+        chat.selectBranch(2, 3, "alice")
+        expect(chat.branchViewByTab.alice[4]).toBe(2)
+      }
+      chat._onMessage({ type: "error", source: "alice", content: "failed" })
+    }
+    const runningTurn = mode.endsWith("retry") ? 5 : 4
+    await chat.send("continue the original")
+    expect(lastBranchView(send)).toEqual(chat.branchViewByTab.alice)
+    chat.eventsByTab.alice = events
+    chat.selectBranch(1, 4, "alice")
+    if (mode === "queued") await chat.send("queued follow-up")
+    expect(transcript(chat)).not.toContain("old descendant")
+    const start = wsFrame(startKind, runningTurn, 1)
+    let before = transcript(chat)
+    chat._onMessage(start)
+    if (mode === "queued") before = transcript(chat)
+    chat._onMessage(wsFrame("text", runningTurn, 1, { content: "off-subtree chunk" }))
+    expect(transcript(chat)).toBe(before)
+    expect(chat.viewingRunningBranch).toBe(false)
+    chat._onMessage(start)
+    chat._onMessage(wsFrame("text", runningTurn, 1, { content: "off-subtree chunk" }))
+    expect(transcript(chat)).toBe(before)
+    chat.selectBranch(1, 3, "alice")
+    if (mode === "paged-retry") {
+      chat.selectBranch(2, 3, "alice")
+      chat.selectBranch(4, 1, "alice")
+      const beforeWrongTail = transcript(chat)
+      chat._onMessage(wsFrame("text", runningTurn, 1, { content: "wrong-tail chunk" }))
+      expect(transcript(chat)).toBe(beforeWrongTail)
+      chat.selectBranch(4, 2, "alice")
+    }
+    chat._onMessage(wsFrame("text", runningTurn, 1, { content: "on-subtree chunk" }))
+    expect(transcript(chat)).toContain("on-subtree chunk")
+  })
+
+  it.each([
+    ["sparse", { 1: 4 }, 2, 4],
+    ["middle", { 1: 3, 2: 2 }, 3, 4],
+  ])("snapshots %s send ancestry without stale descendants", async (label, view, turn, branch) => {
+    const { chat } = seedBranchedStore()
+    if (label === "middle") chat.selectBranch(2, 2, "alice")
+    else chat.selectBranch(1, 4, "alice")
+    expect(chat.branchViewByTab.alice).toEqual(view)
+    const send = openSend(chat)
+    await chat.send(label === "middle" ? "continue from middle 2" : "continue the regeneration")
+    expect(lastBranchView(send)).toEqual(view)
+    chat.selectBranch(1, label === "middle" ? 4 : 3, "alice")
+    const beforeWrong = transcript(chat)
+    chat._onMessage(wsFrame("processing_start", turn, branch))
+    chat._onMessage(wsFrame("text", turn, branch, { content: "wrong-middle chunk" }))
+    expect(transcript(chat)).toBe(beforeWrong)
+    expect(chat.viewingRunningBranch).toBe(false)
+    if (label === "middle") {
+      chat.selectBranch(1, 3, "alice")
+      const beforeDefaultMiddle = transcript(chat)
+      chat._onMessage(wsFrame("text", turn, branch, { content: "default-middle chunk" }))
+      expect(transcript(chat)).toBe(beforeDefaultMiddle)
+      chat.selectBranch(2, 2, "alice")
+    } else {
+      chat.selectBranch(1, 4, "alice")
+    }
+    chat._onMessage(wsFrame("text", turn, branch, { content: "on-path chunk" }))
+    expect(transcript(chat)).toContain("on-path chunk")
+    if (label === "sparse") expect(transcript(chat)).not.toContain("old descendant")
+  })
+
+  it("accepts a delayed start without a branch switch", async () => {
+    const { chat } = seedBranchedStore()
+    openSend(chat)
+    await chat.send("continue the original")
+    chat._onMessage(wsFrame("processing_start", 4, 1))
+    expect(chat.viewingRunningBranch).toBe(true)
+    chat._onMessage(wsFrame("text", 4, 1, { content: "control chunk" }))
+    expect(transcript(chat)).toContain("control chunk")
+  })
+
+  it.each(["processing_end", "idle", "error", "reset", "unbind", "close", "staleop"])(
+    "clears pending ancestry on %s",
+    async (action) => {
+      const { chat } = seedBranchedStore()
+      openSend(chat)
+      await chat.send("continue the original")
+      expect(chat._pendingBranchPathByTab.alice).toBeTruthy()
+      if (action === "reset") chat.resetForRouteSwitch()
+      else if (action === "unbind") chat.unbindFromInstance()
+      else if (action === "close") chat.closeTab("alice")
+      else if (action === "staleop")
+        chat._dropStaleBranchOp("alice", { expectedBranchByTurn: { 4: 1 } })
+      else chat._onMessage({ type: action, source: "alice", content: "failed" })
+      expect(chat._pendingBranchPathByTab.alice).toBeUndefined()
+    },
+  )
 })

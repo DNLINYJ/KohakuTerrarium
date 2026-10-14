@@ -525,7 +525,30 @@ function _pathMatches(path, selected, beforeTurn = Infinity) {
   return true
 }
 
-function _resolveSelectedBranches(events, parentPaths, branchView) {
+function _branchMatchesViewedAncestors(events, view, turnIndex, branchId, fallbackPath) {
+  const parentPaths = _indexParentPaths(events || [])
+  const selected = _resolveSelectedBranches(events || [], parentPaths, view)
+  const anchor = events?.find(
+    (event) => event?.turn_index === turnIndex && event?.branch_id === branchId,
+  )
+  const path = anchor
+    ? Array.isArray(anchor.parent_branch_path)
+      ? _coercePath(anchor.parent_branch_path)
+      : parentPaths.get(anchor.event_id) || []
+    : _coercePath(fallbackPath)
+  for (const [turn, branch] of Object.entries(view || {})) {
+    if (!selected.has(Number(turn))) selected.set(Number(turn), branch)
+  }
+  return _pathMatches(path, selected, turnIndex)
+}
+
+function _resolveSelectedBranches(
+  events,
+  parentPaths,
+  branchView,
+  retainUnmatchedOverrides = true,
+  liveBranch = null,
+) {
   const branchesByTurn = new Map()
   for (const evt of events) {
     const ti = evt?.turn_index
@@ -540,6 +563,13 @@ function _resolveSelectedBranches(events, parentPaths, branchView) {
     }
     if (!bucket.some((entry) => entry.branch === bi)) {
       bucket.push({ path, branch: bi })
+    }
+  }
+  if (liveBranch) {
+    const bucket = branchesByTurn.get(liveBranch.turnIndex) || []
+    if (!bucket.some((entry) => entry.branch === liveBranch.branchId)) {
+      bucket.push({ path: _coercePath(liveBranch.parentBranchPath), branch: liveBranch.branchId })
+      branchesByTurn.set(liveBranch.turnIndex, bucket)
     }
   }
   const selected = new Map()
@@ -562,8 +592,10 @@ function _resolveSelectedBranches(events, parentPaths, branchView) {
       // Returning ``requested`` keeps the predicted branch sticky;
       // ``liveIds`` then renders empty for that (turn, branch) until
       // the real events land. The next resync rebuilds correctly.
-      selected.set(ti, requested)
-      continue
+      if (retainUnmatchedOverrides) {
+        selected.set(ti, requested)
+        continue
+      }
     }
     if (!candidates.length) continue
     selected.set(ti, Math.max(...candidates.map((entry) => entry.branch)))
@@ -2090,6 +2122,12 @@ const _chatStoreOptions = {
      * @type {Record<string, {turnIndex: number, branchId: number} | null>}
      */
     _streamingBranchByTab: {},
+    /**
+     * Complete selected path captured at the first idle-to-processing send,
+     * held until streaming coordinates arrive.
+     * @type {Record<string, Array<[number, number]>>}
+     */
+    _pendingBranchPathByTab: {},
 
     // ── Multi-chat-panel state (Option E) ───────────────────────
     //
@@ -2192,6 +2230,16 @@ const _chatStoreOptions = {
       const target = state._streamingBranchByTab[tab]
       if (!target) return true
       const view = state.branchViewByTab[tab]
+      if (
+        !_branchMatchesViewedAncestors(
+          state.eventsByTab[tab],
+          view,
+          target.turnIndex,
+          target.branchId,
+          target.parentBranchPath,
+        )
+      )
+        return false
       // No explicit override means "latest branch" — the latest branch
       // for the streaming turn IS the streaming branch, since the
       // backend always opens a fresh max_branch+1. So an unset view
@@ -2333,6 +2381,7 @@ const _chatStoreOptions = {
       this._recentUserInputs = {}
       this._branchResyncPendingByTab = {}
       this._streamingBranchByTab = {}
+      this._pendingBranchPathByTab = {}
       this.commandInventoryByTab = {}
       this.commandInventoryRevisionByTab = {}
       this._commandInventoryFetchedAtByTab = {}
@@ -2762,6 +2811,7 @@ const _chatStoreOptions = {
         const branchView = this.branchViewByTab[tab]
         if (branchView && Object.keys(branchView).length) payload.branch_view = { ...branchView }
         this._ws.send(JSON.stringify(payload))
+        this._capturePendingBranchPath(target, payload.branch_view)
         // Flip processing optimistically — the backend's
         // processing_start event will confirm it; this ensures the
         // indicator and interrupt button appear immediately on the
@@ -3223,6 +3273,7 @@ const _chatStoreOptions = {
         if (source) {
           this.processingByTab[source] = false
           this._failBranchOperation(source, data.content || "Branch operation failed")
+          delete this._pendingBranchPathByTab[source]
         }
       }
     },
@@ -4067,6 +4118,7 @@ const _chatStoreOptions = {
       }
       this.processingByTab[tab] = false
       delete this._branchResyncPendingByTab[tab]
+      delete this._pendingBranchPathByTab[tab]
       this._rebuildMessages(tab)
     },
 
@@ -4113,6 +4165,13 @@ const _chatStoreOptions = {
       const ft = data?.turn_index
       if (typeof fb !== "number" || typeof ft !== "number") return true
       const view = this.branchViewByTab[tab]
+      const streaming = this._streamingBranchByTab[tab]
+      const fallbackPath =
+        streaming?.turnIndex === ft && streaming?.branchId === fb
+          ? streaming.parentBranchPath
+          : null
+      if (!_branchMatchesViewedAncestors(this.eventsByTab[tab], view, ft, fb, fallbackPath))
+        return false
       if (view && Object.prototype.hasOwnProperty.call(view, ft)) {
         return view[ft] === fb
       }
@@ -4121,7 +4180,6 @@ const _chatStoreOptions = {
       // latest branch of its turn (the backend opens max+1 before
       // emitting any chunk), so an unset view aligns with "viewing
       // the running branch".
-      const streaming = this._streamingBranchByTab[tab]
       if (streaming && streaming.turnIndex === ft) {
         return streaming.branchId === fb
       }
@@ -4149,7 +4207,7 @@ const _chatStoreOptions = {
       if (next.phase) {
         this.processingByTab[tab] = true
         if (typeof next.turn_index === "number" && typeof next.branch_id === "number") {
-          this._streamingBranchByTab[tab] = { turnIndex: next.turn_index, branchId: next.branch_id }
+          this._promoteStreamingTarget(tab, next.turn_index, next.branch_id)
         }
       }
     },
@@ -4329,10 +4387,61 @@ const _chatStoreOptions = {
         expectedBranchByTurn[turnIndex] = branchId
         this._branchResyncPendingByTab[tab] = { ...pending, expectedBranchByTurn }
       }
-      this._streamingBranchByTab[tab] = { turnIndex, branchId }
+      this._promoteStreamingTarget(tab, turnIndex, branchId)
       if (operation)
         this.branchOperationByTab[tab] = { ...operation, phase: "accepted", turnIndex, branchId }
       return true
+    },
+
+    /** Snapshot the complete selected path for the first idle-to-processing send. */
+    _capturePendingBranchPath(tab, view = null) {
+      if (!tab || this.processingByTab[tab]) return
+      const events = this.eventsByTab[tab] || []
+      const parentPaths = _indexParentPaths(events)
+      const knownTurns = new Set(events.map((event) => event.turn_index))
+      const project = (selectedView) =>
+        _resolveSelectedBranches(
+          [
+            ...events,
+            ...Object.entries(selectedView)
+              .filter(([turn]) => !knownTurns.has(Number(turn)))
+              .map(([turn, branch]) => ({ turn_index: Number(turn), branch_id: branch })),
+          ],
+          parentPaths,
+          selectedView,
+        )
+      const selectedView = { ...(view || this.branchViewByTab[tab]) }
+      const selected = project(selectedView)
+      const anchor = [...selected]
+        .reverse()
+        .map(([turn, branch]) =>
+          events.find((event) => event.turn_index === turn && event.branch_id === branch),
+        )
+        .find(Boolean)
+      const path = parentPaths.get(anchor?.event_id) || _coercePath(anchor?.parent_branch_path)
+      for (const [turn, branch] of path) {
+        if (!selected.has(turn)) selectedView[turn] = branch
+      }
+      this._pendingBranchPathByTab[tab] = [...project(selectedView)]
+    },
+
+    /** Transfer captured send ancestry onto the live streaming target. */
+    _promoteStreamingTarget(tab, turnIndex, branchId) {
+      if (!tab || typeof turnIndex !== "number" || typeof branchId !== "number") return
+      const streaming = this._streamingBranchByTab[tab]
+      const pending = this._pendingBranchPathByTab[tab]
+      if (streaming?.turnIndex === turnIndex && streaming?.branchId === branchId) {
+        if (!streaming.parentBranchPath && pending) {
+          streaming.parentBranchPath = pending.filter(([turn]) => turn > 0 && turn < turnIndex)
+        }
+      } else {
+        const next = { turnIndex, branchId }
+        if (pending) {
+          next.parentBranchPath = pending.filter(([turn]) => turn > 0 && turn < turnIndex)
+        }
+        this._streamingBranchByTab[tab] = next
+      }
+      if (pending) delete this._pendingBranchPathByTab[tab]
     },
 
     _conversationUserPosition(tab, messageIdx) {
@@ -5123,8 +5232,38 @@ const _chatStoreOptions = {
     selectBranch(turnIndex, branchId, tabOverride = null) {
       const tab = tabOverride || this.activeTab
       if (!tab || this.branchOperationByTab[tab]) return false
-      if (!this.branchViewByTab[tab]) this.branchViewByTab[tab] = {}
-      this.branchViewByTab[tab][turnIndex] = branchId
+      const view = { ...(this.branchViewByTab[tab] || {}), [turnIndex]: branchId }
+      const events = this.eventsByTab[tab] || []
+      const parentPaths = _indexParentPaths(events)
+      const streaming = this._streamingBranchByTab[tab]
+      if (streaming && streaming.turnIndex > turnIndex && !streaming.parentBranchPath) {
+        const previous = _resolveSelectedBranches(
+          events,
+          parentPaths,
+          this.branchViewByTab[tab],
+          false,
+        )
+        streaming.parentBranchPath = [...previous].filter(
+          ([turn]) => turn > 0 && turn < streaming.turnIndex,
+        )
+      }
+      const selected = _resolveSelectedBranches(events, parentPaths, view, false, streaming)
+      for (const turn of Object.keys(view)) {
+        if (Number(turn) > turnIndex && selected.get(Number(turn)) !== view[turn]) delete view[turn]
+      }
+      if (
+        streaming &&
+        streaming.turnIndex > turnIndex &&
+        !Object.prototype.hasOwnProperty.call(view, streaming.turnIndex) &&
+        selected.get(streaming.turnIndex) === streaming.branchId &&
+        !events.some(
+          (event) =>
+            event?.turn_index === streaming.turnIndex && event?.branch_id === streaming.branchId,
+        )
+      ) {
+        view[streaming.turnIndex] = streaming.branchId
+      }
+      this.branchViewByTab[tab] = view
       this._browsedBranchByTab[tab] = true
       this._rebuildMessages(tab)
       // If a stream is still in flight on this tab, an off-branch
@@ -5551,6 +5690,7 @@ const _chatStoreOptions = {
       if (source && this._streamingBranchByTab[source]) {
         delete this._streamingBranchByTab[source]
       }
+      if (source) delete this._pendingBranchPathByTab[source]
       const msgs = this.messagesByTab[source]
       if (msgs) {
         const last = msgs[msgs.length - 1]
@@ -5741,6 +5881,7 @@ const _chatStoreOptions = {
       this._recentUserInputs = {}
       this._branchResyncPendingByTab = {}
       this._streamingBranchByTab = {}
+      this._pendingBranchPathByTab = {}
       this._historyRequestSeqByTab = {}
       this._appliedMaxEventIdByTab = {}
       this._branchRequestIdByTab = {}
@@ -5783,6 +5924,7 @@ const _chatStoreOptions = {
       this.branchOperationErrorByTab = {}
       this._branchResyncPendingByTab = {}
       this._streamingBranchByTab = {}
+      this._pendingBranchPathByTab = {}
       this._historyRequestSeqByTab = {}
       this._pendingCommandResultContextsByTab = {}
       this._appliedMaxEventIdByTab = {}
@@ -6421,6 +6563,7 @@ const _chatStoreOptions = {
       delete this.branchOperationByTab[tab]
       delete this.branchOperationErrorByTab[tab]
       delete this._branchResyncPendingByTab[tab]
+      delete this._pendingBranchPathByTab[tab]
     },
 
     /** Dispose the paged controller for ``tab`` (cached pages, in-flight fences). */
