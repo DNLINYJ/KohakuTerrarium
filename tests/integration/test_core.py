@@ -24,6 +24,8 @@ side effect (conversation contents, tool output text, engine state).
 """
 
 import asyncio
+import base64
+import copy
 import re
 import time
 from contextlib import closing
@@ -271,6 +273,51 @@ class _MultimodalTool(BaseTool):
             output=[
                 TextPart(text="caption-for-the-snapshot"),
                 ImagePart(url="data:image/png;base64,aGVsbG8td29ybGQ=", detail="low"),
+            ]
+        )
+
+
+class _VersionedMediaTool(BaseTool):
+    """Return ordered media blocks under one tool and source name."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    @property
+    def tool_name(self):
+        return "versioned_media"
+
+    @property
+    def description(self):
+        return "Generate a caption, image, and file for a supplied version."
+
+    @property
+    def execution_mode(self):
+        return ExecutionMode.DIRECT
+
+    async def _execute(self, args, **kwargs):
+        self.calls += 1
+        version = args["version"]
+        encoded = base64.b64encode(f"IMAGE_{version}".encode()).decode()
+        return ToolResult(
+            output=[
+                TextPart(text=f"caption_{version}"),
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{encoded}",
+                        "detail": "high",
+                        "provider_token": f"token_{version}",
+                    },
+                    "meta": {
+                        "source_name": "same.png",
+                        "source_type": "generated",
+                        "vendor": {"version": version},
+                    },
+                    "extension": {"payload": [version]},
+                },
+                FilePart(name="same.txt", content=f"FILE_{version}", is_inline=True),
             ]
         )
 
@@ -2673,6 +2720,148 @@ class TestCoreIntegration:
         finally:
             await cold_agent.stop()
             cold_store.close()
+
+        monkeypatch.setenv("KT_SESSION_DIR", str(tmp_path / "result-media"))
+        result_tool = _VersionedMediaTool()
+        result_llm = _HistoryReplayLLM(
+            True,
+            plan=[
+                [NativeToolCall("media_A", "versioned_media", '{"version":"A"}')],
+                "answer_A",
+                [NativeToolCall("media_B", "versioned_media", '{"version":"B"}')],
+                "answer_B",
+                "continued_B",
+                "continued_A",
+            ],
+        )
+
+        def assert_result_prefix(messages, version, call_id, prepared=False):
+            calls = [
+                call for message in messages for call in message.get("tool_calls", [])
+            ]
+            assert [
+                (call["id"], call["function"]["name"], call["function"]["arguments"])
+                for call in calls
+            ] == [(call_id, "versioned_media", f'{{"version":"{version}"}}')]
+            results = [message for message in messages if message["role"] == "tool"]
+            assert len(results) == 1
+            result = results[0]
+            assert result["tool_call_id"] == call_id
+            assert result["name"] == "versioned_media"
+            parts = result["content"]
+            assert parts[0]["text"] == f"caption_{version}"
+            assert parts[1]["image_url"]["detail"] == "high"
+            assert parts[1]["meta"]["source_name"] == "same.png"
+            assert parts[1]["meta"]["vendor"] == {"version": version}
+            assert parts[1]["image_url"]["provider_token"] == f"token_{version}"
+            assert parts[1]["extension"] == {"payload": [version]}
+            if prepared:
+                assert [part["type"] for part in parts] == [
+                    "text",
+                    "image_url",
+                    "text",
+                    "text",
+                ]
+                assert (
+                    base64.b64decode(
+                        resolve_artifact_url(parts[1]["image_url"]["url"]).split(
+                            ",", 1
+                        )[1]
+                    )
+                    == f"IMAGE_{version}".encode()
+                )
+                file_markers = [
+                    part["text"]
+                    for part in parts[2:]
+                    if part.get("text", "").startswith(
+                        "Attached file: same.txt\nPath: "
+                    )
+                ]
+                assert len(file_markers) == 1, parts
+                path = Path(file_markers[0].split("Path: ", 1)[1])
+                assert path.read_bytes() == f"FILE_{version}".encode()
+            else:
+                assert [part["type"] for part in parts] == ["text", "image_url", "file"]
+                assert parts[2]["file"]["content"] == f"FILE_{version}"
+            return parts
+
+        def assert_result_state(agent, llm, version, call_id, expected_parts=None):
+            assert_result_prefix(llm.last_messages, version, call_id, prepared=True)
+            parts = assert_result_prefix(
+                agent.controller.conversation.to_messages(), version, call_id
+            )
+            if expected_parts is not None:
+                assert parts == expected_parts
+            return copy.deepcopy(parts)
+
+        async with Terrarium(session_dir=tmp_path / "result-media") as engine:
+            result_creature = await engine.add_creature(
+                AgentConfig(
+                    name="resultmedia", system_prompt="plain", tool_format="native"
+                ),
+                llm=result_llm,
+                tools=[result_tool],
+                io="headless",
+                start=True,
+            )
+            result_agent = result_creature.agent
+            result_agent.controller.config.include_job_status = False
+            await result_creature.run("generate media")
+            first_parts = assert_result_state(result_agent, result_llm, "A", "media_A")
+            first_artifact = (
+                result_agent.session_store.artifacts_dir
+                / first_parts[1]["image_url"]["url"].split("/artifacts/", 1)[1]
+            )
+            assert first_artifact.read_bytes() == b"IMAGE_A"
+            result_original = dict(live_branch_path(result_agent))
+            await result_agent.regenerate_last_response(turn_index=1)
+            second_parts = assert_result_state(result_agent, result_llm, "B", "media_B")
+            second_artifact = (
+                result_agent.session_store.artifacts_dir
+                / second_parts[1]["image_url"]["url"].split("/artifacts/", 1)[1]
+            )
+            assert first_artifact != second_artifact
+            assert first_artifact.read_bytes() == b"IMAGE_A"
+            assert second_artifact.read_bytes() == b"IMAGE_B"
+            result_sibling = dict(live_branch_path(result_agent))
+            assert result_tool.calls == 2
+            await result_agent.inject_input(
+                "continue sibling", branch_view=result_sibling
+            )
+            assert_result_state(result_agent, result_llm, "B", "media_B", second_parts)
+            await result_agent.inject_input(
+                "continue original", branch_view=result_original
+            )
+            assert_result_state(result_agent, result_llm, "A", "media_A", first_parts)
+            assert result_tool.calls == 2
+            result_path = result_agent.session_store.path
+            saved_results = copy.deepcopy(
+                result_agent.session_store.get_events("resultmedia")
+            )
+
+        resumed_llm = ScriptedLLM(["cold sibling", "cold original"])
+        resumed, resumed_store = resume_agent(
+            result_path, io_mode="plain", llm=resumed_llm
+        )
+        replay_tool = _VersionedMediaTool()
+        resumed.add_tool(replay_tool)
+        try:
+            resumed.controller.config.include_job_status = False
+            await resumed.start()
+            await resumed.inject_input("cold sibling", branch_view=result_sibling)
+            assert_result_state(resumed, resumed_llm, "B", "media_B", second_parts)
+            await resumed.inject_input("cold original", branch_view=result_original)
+            assert_result_state(resumed, resumed_llm, "A", "media_A", first_parts)
+            assert replay_tool.calls == 0
+            assert first_artifact.read_bytes() == b"IMAGE_A"
+            assert second_artifact.read_bytes() == b"IMAGE_B"
+            assert (
+                resumed_store.get_events("resultmedia")[: len(saved_results)]
+                == saved_results
+            )
+        finally:
+            await resumed.stop()
+            resumed_store.close()
 
     async def test_inject_event_and_unified_trigger_model(self, make_creature):
         """The unified ``TriggerEvent`` model: a non-user-input event

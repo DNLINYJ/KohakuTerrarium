@@ -1,8 +1,11 @@
 """Unit tests for :mod:`kohakuterrarium.core.tool_output`."""
 
 import base64
+import hashlib
 import types
+from copy import deepcopy
 from pathlib import Path
+from urllib.parse import unquote
 
 from kohakuterrarium.core.tool_output import (
     NormalizedToolOutput,
@@ -19,9 +22,11 @@ from kohakuterrarium.llm.message import (
     FilePart,
     ImagePart,
     TextPart,
+    content_part_from_dict,
 )
 from kohakuterrarium.modules.tool.base import ToolResult
 from kohakuterrarium.modules.tool.media_policy import MediaPolicy
+from kohakuterrarium.session.store import SessionStore
 
 # ── helpers ──────────────────────────────────────────────────────
 
@@ -249,13 +254,17 @@ class TestNormalizeMultimodal:
         assert n.metadata.get("data_urls_materialized") == 1
         # New ImagePart kept; URL now points to served artifact.
         new_img = next(p for p in n.output if isinstance(p, ImagePart))
+        digest = hashlib.sha256(b"PNG-RAW-BYTES").hexdigest()
         assert new_img.url.startswith("/api/sessions/sess123/artifacts/")
-        # Artifact actually written to disk.
+        # Artifact actually written to disk under the content-addressed layout.
         assert any(
-            f.startswith("tool_outputs/") and store.written[f] == b"PNG-RAW-BYTES"
+            f.startswith(f"tool_outputs/{digest}/")
+            and store.written[f] == b"PNG-RAW-BYTES"
             for f in store.written
         )
-        assert n.metadata["artifacts"][0]["relative_path"].startswith("tool_outputs/")
+        assert n.metadata["artifacts"][0]["relative_path"].startswith(
+            f"tool_outputs/{digest}/"
+        )
 
     def test_reference_policy_keeps_inline_media_and_writes_nothing(self, tmp_path):
         store = _FakeArtifactStore(tmp_path)
@@ -340,10 +349,11 @@ class TestNormalizeMultimodal:
         )
 
         artifact = n.metadata["artifacts"][0]
+        digest = hashlib.sha256(b"GENERATED").hexdigest()
         assert artifact["kind"] == "image"
-        assert artifact["relative_path"].startswith("generated_images/")
+        assert artifact["relative_path"].startswith(f"generated_images/{digest}/")
         assert artifact["url"].startswith(
-            "/api/sessions/sess123/artifacts/generated_images/"
+            f"/api/sessions/sess123/artifacts/generated_images/{digest}/"
         )
 
     def test_artifact_url_uses_exact_retained_directory_namespace(self, tmp_path):
@@ -424,6 +434,162 @@ class TestMaterializeImagePart:
         assert isinstance(out, ImagePart)
         # No API URL → file:// URI from disk path.
         assert out.url.startswith("file:")
+
+
+def _artifact_relpath(url: str) -> str:
+    return unquote(url.split("/artifacts/", 1)[1])
+
+
+class TestMaterializeImagePartImmutable:
+    def test_same_name_different_bytes_keeps_prior_artifact(self, tmp_path):
+        store = SessionStore(str(tmp_path / "run.kohakutr"))
+        try:
+            first_bytes = b"PNG-FIRST-BYTES"
+            second_bytes = b"PNG-SECOND-BYTES"
+            first = materialize_image_part(
+                ImagePart(
+                    url=_png_data_url(first_bytes),
+                    detail="high",
+                    source_type="generated",
+                    source_name="scene.png",
+                ),
+                store,
+                subdir="generated_images",
+                stem_hint="scene",
+            )
+            second = materialize_image_part(
+                ImagePart(
+                    url=_png_data_url(second_bytes),
+                    detail="low",
+                    source_type="attachment",
+                    source_name="scene.png",
+                ),
+                store,
+                subdir="generated_images",
+                stem_hint="scene",
+            )
+            assert isinstance(first, ImagePart)
+            assert isinstance(second, ImagePart)
+            first_rel = first.artifact_relpath
+            second_rel = second.artifact_relpath
+            assert first_rel != second_rel
+            assert first.url != second.url
+            assert _artifact_relpath(first.url) == first_rel
+            assert _artifact_relpath(second.url) == second_rel
+            first_digest = hashlib.sha256(first_bytes).hexdigest()
+            second_digest = hashlib.sha256(second_bytes).hexdigest()
+            assert first_rel == f"generated_images/{first_digest}/scene.png"
+            assert second_rel == f"generated_images/{second_digest}/scene.png"
+            assert (store.artifacts_dir / first_rel).read_bytes() == first_bytes
+            assert (store.artifacts_dir / second_rel).read_bytes() == second_bytes
+            assert first.source_name == "scene.png"
+            assert first.detail == "high"
+            assert first.source_type == "generated"
+            assert second.source_name == "scene.png"
+            assert second.detail == "low"
+            assert second.source_type == "attachment"
+        finally:
+            store.close()
+
+    def test_identical_bytes_reuse_stable_ref_and_metadata_does_not_leak(
+        self, tmp_path
+    ):
+        store = SessionStore(str(tmp_path / "run.kohakutr"))
+        try:
+            payload = b"PNG-STABLE-BYTES"
+            first = materialize_image_part(
+                ImagePart(
+                    url=_png_data_url(payload),
+                    detail="auto",
+                    source_type="generated",
+                    source_name="out.png",
+                ),
+                store,
+                subdir="generated_images",
+                stem_hint="out",
+            )
+            first.revised_prompt = "first-prompt"
+            second = materialize_image_part(
+                ImagePart(
+                    url=_png_data_url(payload),
+                    detail="high",
+                    source_type="file",
+                    source_name="out.png",
+                ),
+                store,
+                subdir="generated_images",
+                stem_hint="out",
+            )
+            assert isinstance(first, ImagePart)
+            assert isinstance(second, ImagePart)
+            assert first.artifact_relpath == second.artifact_relpath
+            assert first.url == second.url
+            assert not hasattr(second, "revised_prompt")
+            assert second.detail == "high"
+            assert second.source_type == "file"
+            digest = hashlib.sha256(payload).hexdigest()
+            assert second.artifact_relpath == f"generated_images/{digest}/out.png"
+            assert (
+                store.artifacts_dir / first.artifact_relpath
+            ).read_bytes() == payload
+        finally:
+            store.close()
+
+    def test_materialization_preserves_wire_extensions_and_detaches_metadata(
+        self, tmp_path
+    ):
+        raw = {
+            "type": "image_url",
+            "image_url": {
+                "url": _png_data_url(),
+                "detail": "high",
+                "provider_extension": {"token": "keep"},
+            },
+            "meta": {"source_name": "same.png", "vendor": {"id": "original"}},
+            "extension": {"items": ["original"]},
+        }
+        original = deepcopy(raw)
+        part = content_part_from_dict(raw)
+        part.revised_prompt = "revised"
+        store = SessionStore(str(tmp_path / "extensions.kohakutr"))
+        try:
+            result = materialize_image_part(
+                part, store, subdir="generated_images", stem_hint="same"
+            )
+            expected = deepcopy(original)
+            expected["image_url"]["url"] = result.url
+            assert result.to_dict() == expected
+            assert result.revised_prompt == "revised"
+            result._persisted_fields["meta"]["vendor"]["id"] = "mutated"
+            assert part.to_dict() == original
+            assert raw == original
+        finally:
+            store.close()
+
+    def test_jpeg_extension_and_old_layout_remain_readable(self, tmp_path):
+        store = SessionStore(str(tmp_path / "run.kohakutr"))
+        try:
+            legacy_rel = "generated_images/scene.jpeg"
+            legacy_bytes = b"JPEG-LEGACY"
+            store.write_artifact(legacy_rel, legacy_bytes)
+            jpeg = materialize_image_part(
+                ImagePart(
+                    url=f"data:image/jpeg;base64,{base64.b64encode(b'JPEG-NEW').decode()}",
+                    source_name="scene.jpeg",
+                ),
+                store,
+                subdir="generated_images",
+                stem_hint="scene",
+            )
+            assert isinstance(jpeg, ImagePart)
+            digest = hashlib.sha256(b"JPEG-NEW").hexdigest()
+            assert jpeg.artifact_relpath == f"generated_images/{digest}/scene.jpeg"
+            assert (store.artifacts_dir / legacy_rel).read_bytes() == legacy_bytes
+            assert (
+                store.artifacts_dir / jpeg.artifact_relpath
+            ).read_bytes() == b"JPEG-NEW"
+        finally:
+            store.close()
 
 
 # ── dataclass shape ──────────────────────────────────────────────
@@ -560,17 +726,3 @@ class TestRenderImagePlaceholderNoURL:
         part = ImagePart(url="", source_type="emoji", source_name="smile")
         out = _render_image_placeholder(part)
         assert "emoji" in out and "smile" in out
-
-
-# ── _copy_dynamic_image_attrs round-trip (line 352) ─────────────
-
-
-class TestCopyDynamicImageAttrs:
-    def test_revised_prompt_copied(self):
-        from kohakuterrarium.core.tool_output import _copy_dynamic_image_attrs
-
-        src = ImagePart(url="https://x/a.png")
-        src.revised_prompt = "stylized"
-        dst = ImagePart(url="https://x/b.png")
-        _copy_dynamic_image_attrs(src, dst)
-        assert getattr(dst, "revised_prompt", None) == "stylized"

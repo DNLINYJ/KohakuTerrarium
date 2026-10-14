@@ -5,8 +5,10 @@ inline binary data is materialized to session artifacts or explicitly elided.
 """
 
 import base64
+import hashlib
 import re
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -351,7 +353,8 @@ def materialize_image_part(
         stem_hint or part.source_name or f"img_{int(time.time() * 1000)}"
     )
     safe_ext = re.sub(r"[^\w]", "", ext) or "png"
-    filename = f"{subdir}/{safe_stem}.{safe_ext}"
+    digest = hashlib.sha256(raw).hexdigest()
+    filename = f"{subdir}/{digest}/{safe_stem}.{safe_ext}"
     try:
         disk_path = artifact_store.write_artifact(filename, raw)
     except Exception as e:
@@ -365,14 +368,9 @@ def materialize_image_part(
 
     served = artifact_served_url(artifact_store, filename, disk_path)
 
-    new_part = ImagePart(
-        url=served,
-        detail=part.detail,
-        source_type=part.source_type,
-        source_name=part.source_name,
-    )
-    setattr(new_part, "artifact_relpath", filename)
-    _copy_dynamic_image_attrs(part, new_part)
+    new_part = deepcopy(part)
+    new_part.url = served
+    new_part.artifact_relpath = filename
     logger.info(
         "Image artifact persisted",
         artifact_path=str(disk_path),
@@ -511,9 +509,3 @@ def _artifact_stem(
 
 def _safe_name(value: str) -> str:
     return re.sub(r"[^\w.-]", "_", value.strip()) or "artifact"
-
-
-def _copy_dynamic_image_attrs(src: ImagePart, dst: ImagePart) -> None:
-    for attr in ("revised_prompt",):
-        if hasattr(src, attr):
-            setattr(dst, attr, getattr(src, attr))
