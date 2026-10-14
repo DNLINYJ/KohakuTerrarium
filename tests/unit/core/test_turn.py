@@ -12,6 +12,9 @@ Pins the headline contracts:
 """
 
 import asyncio
+import json
+
+import httpx
 
 import pytest
 
@@ -25,6 +28,9 @@ from kohakuterrarium.core.turn import (
     TextChunk,
     TurnEnded,
 )
+from kohakuterrarium.llm.message import ImagePart, TextPart
+from kohakuterrarium.llm.openai import OpenAIProvider
+from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
 
 
@@ -64,6 +70,64 @@ async def _build(tmp_path, llm, **kw):
 
 
 class TestRun:
+    async def test_accepted_missing_media_records_failed_turn_without_transport(
+        self, tmp_path
+    ):
+        requests = []
+
+        async def respond(request):
+            requests.append(json.loads(request.content))
+            chunk = {
+                "id": "reply",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "test",
+                "choices": [
+                    {"index": 0, "delta": {"content": "ok"}, "finish_reason": None}
+                ],
+            }
+            return httpx.Response(
+                200,
+                text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+                headers={"content-type": "text/event-stream"},
+            )
+
+        provider = OpenAIProvider(api_key="test", model="test")
+        previous = provider._client
+        provider._client = previous.with_options(
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        )
+        await previous.close()
+        agent = await _build(tmp_path, provider)
+        store = SessionStore(tmp_path / "media-error.kohakutr")
+        agent.attach_session_store(store)
+        parts = [
+            TextPart(text="inspect"),
+            ImagePart(url=(tmp_path / "invalid_image.png").as_uri()),
+        ]
+        try:
+            result = await agent.run_event(
+                TriggerEvent(type="user_input", content=parts), raise_on_error=False
+            )
+            assert result.status == "error"
+            assert "Required local media is unavailable" in result.error
+            assert requests == []
+            recorded = store.get_events(agent.config.name)
+            user = next(e for e in recorded if e["type"] == "user_message")
+            assert user["content"] == [p.to_dict() for p in parts]
+            assert any(e["type"] == "processing_error" for e in recorded)
+            assert not any(e["type"] == "text_chunk" for e in recorded)
+            assert agent.controller.conversation.get_messages()[-1].has_images()
+            await agent.rewind_to(1)
+            assert (await agent.run("valid after clear")).ok
+            assert len(requests) == 1
+            assert "invalid_image.png" not in json.dumps(requests[0])
+            assert store.get_events(agent.config.name)[: len(recorded)] == recorded
+        finally:
+            await agent.stop()
+            await provider.close()
+            store.close()
+
     async def test_ok_turn_returns_result(self, tmp_path):
         agent = await _build(tmp_path, ScriptedLLM(["The grade is 87."]))
         try:

@@ -1,6 +1,9 @@
 """Unit tests for :mod:`kohakuterrarium.core.conversation`."""
 
 import json
+from copy import deepcopy
+
+import pytest
 
 
 from kohakuterrarium.core.conversation import (
@@ -11,6 +14,7 @@ from kohakuterrarium.core.conversation import (
     _is_empty_content,
 )
 from kohakuterrarium.llm.message import (
+    FilePart,
     ImagePart,
     Message,
     TextPart,
@@ -45,6 +49,96 @@ def test_legacy_tool_labels_are_repaired_without_changing_snapshot_context():
     assert wire[2]["tool_call_id"] == "call_original"
     assert original_call["function"]["name"] == "web_search[abc123]"
     assert conv.snapshot_messages() == wire
+
+
+@pytest.mark.parametrize("role", ["user", "assistant", "tool"])
+def test_raw_parts_enter_runtime_with_order_and_identity(role):
+    parts = [
+        TextPart(text="before").to_dict(),
+        ImagePart(url="data:image/png;base64,QUJD", source_name="pic.png").to_dict(),
+        FilePart(
+            name="notes.bin",
+            data_base64="AQID",
+            mime="application/octet-stream",
+            encoding="base64",
+            is_inline=True,
+        ).to_dict(),
+        TextPart(text="after").to_dict(),
+    ]
+    original = deepcopy(parts)
+    metadata = {"event_id": 9, "turn_index": 2, "branch_id": 3}
+    extras = {"reasoning_content": "provider state"}
+    conv = Conversation(ConversationConfig(sanitize_orphan_tool_calls=False))
+    msg = conv.append(
+        role,
+        parts,
+        metadata=metadata,
+        extra_fields=extras,
+        **({"tool_call_id": "call_x"} if role == "tool" else {}),
+    )
+    assert msg.get_text_content() == "before\nafter"
+    assert msg.has_images()
+    assert [type(p) for p in msg.content] == [TextPart, ImagePart, FilePart, TextPart]
+    assert msg.content[2].data_base64 == "AQID"
+    assert conv.get_image_count() == 1
+    assert conv.get_context_length() == len("beforeafter")
+    saved = conv.snapshot_messages()[0]
+    assert saved["content"] == original
+    assert saved["metadata"] == metadata
+    assert saved["reasoning_content"] == "provider state"
+    assert "metadata" not in conv.to_messages()[0]
+    msg.content[0].text = "changed"
+    msg.content[1].url = "https://new.example/image"
+    msg.content[2].data_base64 = "BAUG"
+    assert parts == original
+
+
+def test_raw_part_extension_fields_survive_runtime_round_trip():
+    parts = [
+        {"type": "text", "text": "caption", "vendor": {"id": 7}},
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": "data:image/png;base64,QUJD",
+                "detail": "high",
+                "extension": {"v": 1},
+            },
+            "meta": {"source_name": "x.png", "custom": {"caption": "persist"}},
+            "vendor": "opaque",
+        },
+        {
+            "type": "file",
+            "file": {
+                **FilePart(name="x.txt", content="X").to_dict()["file"],
+                "extension": {"v": 2},
+            },
+            "meta": {"id": "file-origin"},
+        },
+    ]
+    original = deepcopy(parts)
+    conv = Conversation()
+    msg = conv.append("user", parts)
+    saved = conv.snapshot_messages()[0]["content"]
+    for expected, actual in zip(original, saved):
+        assert all(actual[k] == v for k, v in expected.items())
+    msg.content[1].url = "https://changed"
+    wire = conv.to_messages()[0]["content"]
+    assert wire[1]["image_url"]["url"] == "https://changed"
+    assert wire[1]["image_url"]["extension"] == {"v": 1}
+    assert wire[1]["meta"]["custom"] == {"caption": "persist"}
+    wire[1]["meta"]["custom"]["caption"] = "mutated"
+    assert conv.to_messages()[0]["content"][1]["meta"]["custom"]["caption"] == "persist"
+    assert parts == original
+
+
+def test_typed_parts_keep_object_identity():
+    parts = [
+        TextPart(text="caption"),
+        ImagePart(url="https://example/image"),
+        FilePart(name="a.txt", content="A"),
+    ]
+    msg = Conversation().append("user", parts)
+    assert all(actual is original for actual, original in zip(msg.content, parts))
 
 
 class TestGetContentTextLength:

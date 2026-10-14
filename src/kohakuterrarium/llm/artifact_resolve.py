@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from kohakuterrarium.errors import MediaReferenceError
 from kohakuterrarium.studio.persistence.artifacts import (
     resolve_artifact_file,
     resolve_artifacts_dir,
@@ -115,7 +116,7 @@ def _is_unresolved_local_media(url: str) -> bool:
 def resolve_message_image_urls(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Inline local image parts; omit refs that did not become a data URL."""
+    """Inline local images in an effective request or fail on unresolved media."""
     any_changed = False
     out: list[dict[str, Any]] = []
     for msg in messages:
@@ -135,12 +136,9 @@ def resolve_message_image_urls(
                 url = iu.get("url") if isinstance(iu, dict) else iu
                 resolved = resolve_artifact_url(url) if isinstance(url, str) else url
                 if isinstance(resolved, str) and _is_unresolved_local_media(resolved):
-                    logger.warning(
-                        "Media reference unresolved — omitting image part",
-                        url=url,
+                    raise MediaReferenceError(
+                        f"Required local media is unavailable: {url}"
                     )
-                    msg_changed = True
-                    continue
                 if resolved is not url and resolved != url:
                     image_url = (
                         {**iu, "url": resolved} if isinstance(iu, dict) else resolved

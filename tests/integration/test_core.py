@@ -2541,6 +2541,135 @@ class TestCoreIntegration:
             await retained.stop()
             retained_store.close()
 
+        media_path = tmp_path / "multimodal.kohakutr"
+        media_llm = ScriptedLLM(["original", "regen", "edited", "A next", "B next"])
+        original_parts = [
+            TextPart(text="inspect attachments"),
+            ImagePart(url="data:image/png;base64,QUJD", source_name="pic.png"),
+            FilePart(
+                name="same.txt", content="FILE_A", mime="text/plain", is_inline=True
+            ),
+            TextPart(text="between files"),
+            FilePart(
+                name="same.txt", content="FILE_B", mime="text/plain", is_inline=True
+            ),
+            TextPart(text="after files"),
+        ]
+        raw_original = [part.to_dict() for part in original_parts]
+        replacement = [part.to_dict() for part in original_parts]
+        replacement[4]["file"]["content"] = "FILE_C"
+
+        def assert_media_request(provider, expected_second):
+            content = next(
+                m["content"]
+                for m in provider.last_messages
+                if m["role"] == "user" and isinstance(m["content"], list)
+            )
+            assert [p["type"] for p in content] == [
+                "text",
+                "image_url",
+                "text",
+                "text",
+                "text",
+                "text",
+                "text",
+                "text",
+            ]
+            assert content[0]["text"] == "inspect attachments"
+            assert content[1]["image_url"] == raw_original[1]["image_url"]
+            assert "FILE_A" in content[3]["text"]
+            assert content[4]["text"] == "between files"
+            assert expected_second in content[6]["text"]
+            assert content[7]["text"] == "after files"
+            paths = [
+                Path(content[idx]["text"].split("\nPath: ", 1)[1]) for idx in (2, 5)
+            ]
+            assert paths[0] != paths[1]
+            assert [path.read_text() for path in paths] == ["FILE_A", expected_second]
+
+        async with Terrarium() as media_engine:
+            media_creature = await media_engine.add_creature(
+                AgentConfig(
+                    name="mediahistory", agent_path=tmp_path, system_prompt="plain"
+                ),
+                llm=media_llm,
+                io="headless",
+                session=media_path,
+                start=True,
+            )
+            media_agent = media_creature.agent
+            media_agent.controller.config.include_job_status = False
+            await media_agent.inject_input(original_parts)
+            assert_media_request(media_llm, "FILE_B")
+            await media_agent.regenerate_last_response(turn_index=1)
+            assert_media_request(media_llm, "FILE_B")
+            original_view = dict(live_branch_path(media_agent))
+            await media_agent.edit_and_rerun(
+                -1, replacement, turn_index=1, branch_view=original_view
+            )
+            edited_view = dict(live_branch_path(media_agent))
+            assert edited_view != original_view
+            assert_media_request(media_llm, "FILE_C")
+            await media_agent.inject_input(
+                "continue original", branch_view=original_view
+            )
+            assert_media_request(media_llm, "FILE_B")
+            await media_agent.inject_input("continue edited", branch_view=edited_view)
+            assert_media_request(media_llm, "FILE_C")
+            saved_events = media_agent.session_store.get_events("mediahistory")
+            assert [
+                e["content"]
+                for e in saved_events
+                if e["type"] == "user_message" and e["turn_index"] == 1
+            ] == [
+                raw_original,
+                raw_original,
+                replacement,
+            ]
+            saved_media_view = selected_branch_view(media_agent)
+            saved_media_path = dict(live_branch_path(media_agent))
+            await media_engine.remove_creature(media_creature)
+            media_agent.session_store.close()
+
+        cold_llm = ScriptedLLM(["cold continuation", "cold original"])
+        cold_agent, cold_store = resume_agent(media_path, io_mode="plain", llm=cold_llm)
+        try:
+            assert selected_branch_view(cold_agent) == saved_media_view
+            assert live_branch_path(cold_agent) == saved_media_path
+            first_user = next(
+                m
+                for m in cold_agent.controller.conversation.get_messages()
+                if m.role == "user"
+            )
+            assert (
+                first_user.get_text_content()
+                == "inspect attachments\nbetween files\nafter files"
+            )
+            assert first_user.has_images()
+            assert [type(p) for p in first_user.content] == [
+                TextPart,
+                ImagePart,
+                FilePart,
+                TextPart,
+                FilePart,
+                TextPart,
+            ]
+            assert first_user.content[4].content == "FILE_C"
+            await cold_agent.start()
+            cold_agent.controller.config.include_job_status = False
+            await cold_agent.inject_input("after cold restore")
+            assert_media_request(cold_llm, "FILE_C")
+            await cold_agent.inject_input("back to original", branch_view=original_view)
+            assert_media_request(cold_llm, "FILE_B")
+            assert (
+                cold_store.get_events("mediahistory")[: len(saved_events)]
+                == saved_events
+            )
+            assert [part.to_dict() for part in original_parts] == raw_original
+        finally:
+            await cold_agent.stop()
+            cold_store.close()
+
     async def test_inject_event_and_unified_trigger_model(self, make_creature):
         """The unified ``TriggerEvent`` model: a non-user-input event
         (a synthetic ``tool_complete``) injected straight into the

@@ -5775,10 +5775,10 @@ class TestMidTurnBatchDrain:
             ][-1]
             content = last_user.content
             assert isinstance(content, list)
-            assert any(
-                isinstance(p, dict) and p.get("type") != "text" for p in content
-            ), f"image part must survive the drain: {content}"
-            texts = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+            assert [part.url for part in last_user.get_images()] == [
+                "data:image/png;base64,xyz"
+            ]
+            texts = last_user.get_text_content()
             assert "[Tool plot_1 completed]" in texts
             assert "rendered chart" in texts
         finally:

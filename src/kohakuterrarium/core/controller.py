@@ -6,6 +6,7 @@ import hashlib
 import re
 import tempfile
 from contextlib import aclosing
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator
@@ -37,8 +38,15 @@ from kohakuterrarium.core.executor import Executor
 from kohakuterrarium.core.job import JobResult, JobStatus, JobStore
 from kohakuterrarium.core.registry import Registry
 from kohakuterrarium.core.tool_output import materialize_image_part
+from kohakuterrarium.errors import InvalidRequestError
 from kohakuterrarium.llm.base import LLMProvider
-from kohakuterrarium.llm.message import ContentPart, FilePart, ImagePart, TextPart
+from kohakuterrarium.llm.message import (
+    ContentPart,
+    FilePart,
+    ImagePart,
+    TextPart,
+    content_part_from_dict,
+)
 from kohakuterrarium.llm.tools import build_provider_native_tools, build_tool_schemas
 from kohakuterrarium.modules.tool.doc_mode import DEFAULT_DOC_MODE
 from kohakuterrarium.modules.plugin.base import ToolVisibility
@@ -59,6 +67,29 @@ from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
 _FILE_PLACEHOLDER_RE = re.compile(r"\[\[file:(?P<ref>[^\]]+)\]\]")
+
+
+def _file_part_from_item(item: Any) -> FilePart | None:
+    if isinstance(item, FilePart):
+        return item
+    if isinstance(item, dict) and item.get("type") == "file":
+        return content_part_from_dict(item)
+    return None
+
+
+def _file_ref_index(
+    ref: str, n: int, names: dict[str, list[int]], paths: dict[str, list[int]]
+) -> int | None:
+    if ref.isdecimal():
+        digits = "".join(str(int(digit)) for digit in ref).lstrip("0") or "0"
+        if len(digits) > len(str(n)):
+            return None
+        idx = int(digits)
+        return idx if idx < n else None
+    hits = list(dict.fromkeys([*names.get(ref, ()), *paths.get(ref, ())]))
+    if len(hits) > 1:
+        raise InvalidRequestError(f"Ambiguous file reference: {ref}")
+    return hits[0] if hits else None
 
 
 def _merge_text_and_parts(
@@ -356,50 +387,15 @@ class Controller:
     def _build_turn_context(
         self, events: list[TriggerEvent]
     ) -> tuple[str | list[ContentPart], str]:
-        """
-        Build user message content from events plus job status.
-
-        Combines job status context and event content (multimodal-aware)
-        into final user content for the conversation.
-
-        Returns:
-            Tuple of (user_content, combined_text). combined_text is the
-            text-only portion, used to detect empty messages in native mode.
-        """
-        text_context_parts: list[str] = []
-        image_context_parts: list[ImagePart] = []
-        file_context_parts: list[FilePart] = []
-
-        if self.config.include_job_status:
-            job_context = self.job_store.format_context()
-            if job_context:
-                text_context_parts.append(job_context)
-
-        # Add event content (may be multimodal)
-        event_content = self._format_events_for_context(events)
-
-        if isinstance(event_content, str):
-            text_context_parts.append(event_content)
-        else:
-            # Multimodal content: extract text and keep non-text parts
-            for part in event_content:
-                if isinstance(part, TextPart):
-                    text_context_parts.append(part.text)
-                elif isinstance(part, ImagePart):
-                    image_context_parts.append(part)
-                elif isinstance(part, FilePart):
-                    file_context_parts.append(part)
-
-        combined_text = "\n\n".join(text_context_parts)
-
-        if image_context_parts or file_context_parts:
-            user_content: str | list[ContentPart] = [TextPart(text=combined_text)]
-            user_content.extend(image_context_parts)
-            user_content.extend(file_context_parts)
-        else:
-            user_content = combined_text
-
-        return user_content, combined_text
+        """Build user content; combined_text is only for empty-input detection."""
+        job = self.job_store.format_context() if self.config.include_job_status else ""
+        content = self._format_events_for_context(events)
+        if isinstance(content, str):
+            combined = "\n\n".join([job, content] if job else [content])
+            return combined, combined
+        parts: list[ContentPart] = ([TextPart(text=job)] if job else []) + list(content)
+        combined = "\n\n".join(p.text for p in parts if isinstance(p, TextPart))
+        return parts, combined
 
     def _chat_with_recovery(
         self, messages: list[dict], **kwargs: Any
@@ -733,81 +729,98 @@ class Controller:
                 resolved_messages.append(msg)
                 continue
 
-            raw_parts = []
-            file_parts = []
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "file":
-                    file_data = item.get("file", {})
-                    file_parts.append(
-                        FilePart(
-                            path=file_data.get("path"),
-                            name=file_data.get("name"),
-                            content=file_data.get("content"),
-                            mime=file_data.get("mime"),
-                            data_base64=file_data.get("data_base64"),
-                            encoding=file_data.get("encoding"),
-                            is_inline=bool(file_data.get("is_inline", False)),
-                        )
-                    )
-                else:
-                    raw_parts.append(item)
-
+            file_parts: list[FilePart] = []
+            file_idx_at: dict[int, int] = {}
+            name_hits: dict[str, list[int]] = {}
+            path_hits: dict[str, list[int]] = {}
+            for i, item in enumerate(content):
+                fp = _file_part_from_item(item)
+                if fp is None:
+                    continue
+                idx = len(file_parts)
+                file_parts.append(fp)
+                file_idx_at[i] = idx
+                if fp.name:
+                    name_hits.setdefault(fp.name, []).append(idx)
+                if fp.path:
+                    path_hits.setdefault(fp.path, []).append(idx)
             if not file_parts:
                 resolved_messages.append(msg)
                 continue
 
-            resolved_parts: list[ContentPart] = []
-            file_map: dict[str, list[ContentPart]] = {}
-            for idx, fp in enumerate(file_parts):
-                resolved = await self._resolve_file_part(fp)
-                file_map[str(idx)] = resolved
-                if fp.name:
-                    file_map[fp.name] = resolved
-                if fp.path:
-                    file_map[fp.path] = resolved
-
-            inserted = False
-            for item in raw_parts:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    text = item.get("text", "")
-                    pos = 0
-                    for match in _FILE_PLACEHOLDER_RE.finditer(text):
-                        if match.start() > pos:
-                            resolved_parts.append(
-                                TextPart(text=text[pos : match.start()])
-                            )
-                        ref = match.group("ref")
-                        replacement = file_map.get(ref)
-                        if replacement:
-                            resolved_parts.extend(replacement)
-                            inserted = True
-                        else:
-                            resolved_parts.append(TextPart(text=match.group(0)))
-                        pos = match.end()
-                    if pos < len(text):
-                        resolved_parts.append(TextPart(text=text[pos:]))
-                elif isinstance(item, dict) and item.get("type") == "image_url":
-                    img = item.get("image_url", {})
-                    meta = item.get("meta") or {}
-                    resolved_parts.append(
-                        ImagePart(
-                            url=img.get("url", ""),
-                            detail=img.get("detail", "low"),
-                            source_type=meta.get("source_type"),
-                            source_name=meta.get("source_name"),
+            ref_index: dict[str, int | None] = {}
+            referenced: set[int] = set()
+            for item in content:
+                if isinstance(item, TextPart):
+                    text = item.text
+                elif isinstance(item, dict) and item.get("type") == "text":
+                    text = item.get("text") or ""
+                else:
+                    continue
+                for match in _FILE_PLACEHOLDER_RE.finditer(text):
+                    ref = match.group("ref")
+                    if ref not in ref_index:
+                        ref_index[ref] = _file_ref_index(
+                            ref, len(file_parts), name_hits, path_hits
                         )
-                    )
+                    hit = ref_index[ref]
+                    if hit is not None:
+                        referenced.add(hit)
 
-            if not inserted:
-                for fp in file_parts:
-                    resolved_parts.extend(
-                        file_map.get(fp.name)
-                        or file_map.get(fp.path or "")
-                        or file_map.get(str(file_parts.index(fp)), [])
+            resolved_by_idx: dict[int, list[ContentPart]] = {}
+            for idx, fp in enumerate(file_parts):
+                resolved_by_idx[idx] = await self._resolve_file_part(fp)
+
+            resolved_parts: list[ContentPart | dict[str, Any]] = []
+            for i, item in enumerate(content):
+                if i in file_idx_at:
+                    idx = file_idx_at[i]
+                    if idx not in referenced:
+                        resolved_parts.extend(resolved_by_idx[idx])
+                    continue
+                if isinstance(item, ImagePart):
+                    resolved_parts.append(item)
+                    continue
+                if isinstance(item, dict) and item.get("type") == "image_url":
+                    resolved_parts.append(deepcopy(item))
+                    continue
+                if isinstance(item, TextPart):
+                    text = item.text
+                elif isinstance(item, dict) and item.get("type") == "text":
+                    text = item.get("text") or ""
+                else:
+                    continue
+                original_part = item.to_dict() if isinstance(item, TextPart) else item
+                if not _FILE_PLACEHOLDER_RE.search(text):
+                    resolved_parts.append(deepcopy(original_part))
+                    continue
+                pos = 0
+                for match in _FILE_PLACEHOLDER_RE.finditer(text):
+                    if match.start() > pos:
+                        resolved_parts.append(
+                            {
+                                **deepcopy(original_part),
+                                "text": text[pos : match.start()],
+                            }
+                        )
+                    hit = ref_index.get(match.group("ref"))
+                    if hit is None:
+                        resolved_parts.append(
+                            {**deepcopy(original_part), "text": match.group(0)}
+                        )
+                    else:
+                        resolved_parts.extend(resolved_by_idx[hit])
+                    pos = match.end()
+                if pos < len(text):
+                    resolved_parts.append(
+                        {**deepcopy(original_part), "text": text[pos:]}
                     )
 
             resolved_msg = dict(msg)
-            resolved_msg["content"] = [part.to_dict() for part in resolved_parts]
+            resolved_msg["content"] = [
+                part if isinstance(part, dict) else part.to_dict()
+                for part in resolved_parts
+            ]
             resolved_messages.append(resolved_msg)
         return resolved_messages
 

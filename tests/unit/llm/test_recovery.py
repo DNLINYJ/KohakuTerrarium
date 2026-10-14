@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from kohakuterrarium.errors import MediaReferenceError
 from kohakuterrarium.llm import recovery
 
 from kohakuterrarium.llm.recovery import (
@@ -32,6 +33,24 @@ class _HTTPError(Exception):
 
 
 class TestClassifyOpenAIError:
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "missing.png",
+            "invalid_image.png",
+            "timeout.png",
+            "context_length_exceeded.png",
+        ],
+    )
+    def test_required_local_media_errors_are_terminal_regardless_of_filename(
+        self, path
+    ):
+        error_class = classify_openai_error(
+            MediaReferenceError(f"Required local media is unavailable: {path}")
+        )
+        assert error_class == ErrorClass.USER_ERROR
+        assert error_class not in RetryPolicy().retry_classes
+
     @pytest.mark.parametrize(
         "exc",
         [

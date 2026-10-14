@@ -13,6 +13,7 @@ import io
 import pytest
 from PIL import Image
 
+from kohakuterrarium.errors import LLMError
 from kohakuterrarium.llm import artifact_resolve
 from kohakuterrarium.llm.artifact_resolve import (
     file_reference_path,
@@ -210,10 +211,11 @@ class TestResolveMessageImageUrls:
                 ],
             }
         ]
-        out = resolve_message_image_urls(msgs)
-        assert out is not msgs
-        assert [p.get("type") for p in out[0]["content"]] == ["text"]
-        assert url not in str(out)
+        with pytest.raises(
+            LLMError, match="Required local media is unavailable"
+        ) as error:
+            resolve_message_image_urls(msgs)
+        assert url in str(error.value)
         assert msgs[0]["content"][1]["image_url"] == reference
 
     def test_missing_artifact_url_is_not_sent(self, tmp_path, monkeypatch):
@@ -225,9 +227,12 @@ class TestResolveMessageImageUrls:
                 "content": [{"type": "image_url", "image_url": {"url": url}}],
             }
         ]
-        out = resolve_message_image_urls(msgs)
-        assert out[0]["content"] == []
-        assert url not in str(out)
+        with pytest.raises(
+            LLMError, match="Required local media is unavailable"
+        ) as error:
+            resolve_message_image_urls(msgs)
+        assert url in str(error.value)
+        assert msgs[0]["content"][0]["image_url"]["url"] == url
 
     @pytest.mark.parametrize("as_object", [False, True])
     def test_existing_file_reference_still_inlined(self, tmp_path, as_object):
