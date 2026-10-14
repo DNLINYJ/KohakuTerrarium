@@ -15,6 +15,7 @@ from kohakuterrarium.laboratory.adapters.terrarium_file_mutations import (
     replace_enrolled,
     run_mutation_worker,
 )
+from kohakuterrarium.session import file_mutation as worker
 from kohakuterrarium.session.resource_gate import (
     GATE,
     ResourceReleaseError,
@@ -33,7 +34,7 @@ from tests.unit.laboratory.file_mutation_enrollment_helpers import (
 def _force_cancel_after_worker_done(monkeypatch) -> None:
     """Raise CancelledError from the first shield after the worker is done."""
 
-    real_shield = mut.asyncio.shield
+    real_shield = worker.asyncio.shield
     first = {"used": False}
 
     def shield_after_done(aw):
@@ -49,7 +50,7 @@ def _force_cancel_after_worker_done(monkeypatch) -> None:
 
         return wait_then_cancel()
 
-    monkeypatch.setattr(mut.asyncio, "shield", shield_after_done)
+    monkeypatch.setattr(worker.asyncio, "shield", shield_after_done)
 
 
 class TestBundleCancelHoldsPublish:

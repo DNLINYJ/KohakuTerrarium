@@ -12,6 +12,8 @@ from typing import Any
 from kohakuterrarium.laboratory._internal.app import AppMessage
 from kohakuterrarium.laboratory.adapters.file_scopes import resolve_in_scope
 from kohakuterrarium.laboratory.protocols import LabRegistrar
+from kohakuterrarium.session.file_family import acquire_family
+from kohakuterrarium.session.file_mutation import run_admitted_mutation
 from kohakuterrarium.session.readonly import read_session_meta
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium.engine import Terrarium
@@ -51,6 +53,22 @@ def _transfer_path(engine: Terrarium, raw_path: object) -> Path:
     if path.suffix != ".kohakutr":
         raise ValueError("session_path must identify a .kohakutr transfer")
     return path
+
+
+def _transfer_family(path: Path) -> list[Path]:
+    """Explicit SQLite family for a transferred ``.kohakutr`` file."""
+    return [path, Path(f"{path}-wal"), Path(f"{path}-shm")]
+
+
+def _unlink_transfer_family(path: Path) -> None:
+    """Occupy the transfer family, then unlink every explicit member."""
+    family = _transfer_family(path)
+    lease = acquire_family(family, "delete_transfer")
+    try:
+        for candidate in family:
+            candidate.unlink(missing_ok=True)
+    finally:
+        lease.finish(source_released=True)
 
 
 class TerrariumSessionAdapter:
@@ -99,7 +117,7 @@ class TerrariumSessionAdapter:
             case "rollback_resume":
                 return await self._op_rollback_resume(msg.body)
             case "delete_transfer":
-                return self._op_delete_transfer(msg.body)
+                return await self._dispatch_delete_transfer(msg.body)
             case _:
                 return {
                     "error": {
@@ -211,14 +229,34 @@ class TerrariumSessionAdapter:
         self._forget_graph_tokens(graph_id)
         return {"ok": True, "removed": list(removed)}
 
-    def _op_delete_transfer(self, body: dict[str, Any]) -> dict[str, Any]:
-        path = _transfer_path(self._engine, body.get("session_path"))
+    def _reject_active_transfer(self, path: Path) -> None:
         stores = getattr(self._engine, "_session_stores", {}) or {}
         if any(_path_key(store.path) == _path_key(path) for store in stores.values()):
             raise ValueError("delete_transfer refuses an active session store")
-        for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
-            candidate.unlink(missing_ok=True)
+
+    def _op_delete_transfer(self, body: dict[str, Any]) -> dict[str, Any]:
+        path = _transfer_path(self._engine, body.get("session_path"))
+        self._reject_active_transfer(path)
+        _unlink_transfer_family(path)
         return {"ok": True, "session_path": str(path)}
+
+    async def _dispatch_delete_transfer(self, body: dict[str, Any]) -> dict[str, Any]:
+        path = _transfer_path(self._engine, body.get("session_path"))
+        self._reject_active_transfer(path)
+        await self._delete_inactive_family(path)
+        return {"ok": True, "session_path": str(path)}
+
+    async def _delete_inactive_family(self, path: Path) -> None:
+        family = _transfer_family(path)
+
+        def mutate():
+            self._reject_active_transfer(path)
+            for candidate in family:
+                candidate.unlink(missing_ok=True)
+
+        await run_admitted_mutation(
+            lambda: acquire_family(family, "delete_transfer"), mutate
+        )
 
     def _remember_resume_token(self, token: str, graph_id: str, path: Path) -> None:
         now = time.monotonic()
@@ -261,7 +299,9 @@ class TerrariumSessionAdapter:
             requested_path = str(transfer_path)
             graph_id = self._resolve_resume_token(token, transfer_path)
             if not graph_id:
-                return self._op_delete_transfer({"session_path": requested_path})
+                return await self._dispatch_delete_transfer(
+                    {"session_path": requested_path}
+                )
         store = stores.get(graph_id)
         session_path = (
             Path(store.path)
@@ -289,12 +329,7 @@ class TerrariumSessionAdapter:
                 pass
         self._forget_graph_tokens(graph_id)
         if session_path is not None:
-            for candidate in (
-                session_path,
-                Path(f"{session_path}-wal"),
-                Path(f"{session_path}-shm"),
-            ):
-                candidate.unlink(missing_ok=True)
+            await self._delete_inactive_family(session_path)
         return {"ok": True, "removed": creature_ids}
 
     def _op_workspace_preflight(self, body: dict[str, Any]) -> dict[str, Any]:

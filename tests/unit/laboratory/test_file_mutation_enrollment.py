@@ -14,6 +14,7 @@ from kohakuterrarium.laboratory.adapters.terrarium_file_mutations import (
     unlink_enrolled,
     write_bytes_enrolled,
 )
+from kohakuterrarium.session import file_family as family
 from kohakuterrarium.session.resource_gate import (
     GATE,
     REASON_LEGACY_ENROLLED,
@@ -44,7 +45,7 @@ class TestEnrollmentOrder:
     def test_write_enrolls_before_open(self, tmp_path, monkeypatch):
         path = tmp_path / "target.bin"
         order: list[str] = []
-        real_acquire = mut.acquire_legacy
+        real_acquire = family.acquire_legacy
         real_open = open
 
         def spy_acquire(target, operation):
@@ -59,7 +60,7 @@ class TestEnrollmentOrder:
             assert GATE.snapshot(path).legacy_active == 1
             return real_open(target, mode, *args, **kwargs)
 
-        monkeypatch.setattr(mut, "acquire_legacy", spy_acquire)
+        monkeypatch.setattr(family, "acquire_legacy", spy_acquire)
         monkeypatch.setattr(mut, "open", spy_open, raising=False)
         write_bytes_enrolled(path, b"hello")
         assert order[0] == "enroll:files_write"
@@ -72,7 +73,7 @@ class TestEnrollmentOrder:
         src = plain_file(tmp_path, "staging.bin", b"new")
         dst = plain_file(tmp_path, "target.bin", b"old")
         order: list[str] = []
-        real_acquire = mut.acquire_legacy
+        real_acquire = family.acquire_legacy
         real_replace = os.replace
 
         def spy_acquire(target, operation):
@@ -87,16 +88,17 @@ class TestEnrollmentOrder:
             assert GATE.snapshot(dst).legacy_active == 1
             return real_replace(source, dest)
 
-        monkeypatch.setattr(mut, "acquire_legacy", spy_acquire)
+        monkeypatch.setattr(family, "acquire_legacy", spy_acquire)
         monkeypatch.setattr(mut.os, "replace", spy_replace)
         replace_enrolled(src, dst)
-        assert order[0].startswith("enroll:target.bin:")
-        assert any(item.startswith("enroll:staging.bin:") for item in order)
+        assert order[0].startswith("enroll:")
+        assert "enroll:staging.bin:files_replace" in order
+        assert "enroll:target.bin:files_replace" in order
         assert "replace" in order
-        assert order.index("enroll:target.bin:files_replace") < order.index("replace")
-        assert order.index("enroll:staging.bin:files_replace_src") < order.index(
-            "replace"
-        )
+        staging_i = order.index("enroll:staging.bin:files_replace")
+        target_i = order.index("enroll:target.bin:files_replace")
+        replace_i = order.index("replace")
+        assert staging_i < target_i < replace_i
         assert dst.read_bytes() == b"new"
         assert not src.exists()
         assert_idle(src)
@@ -105,7 +107,7 @@ class TestEnrollmentOrder:
     def test_unlink_enrolls_before_syscall(self, tmp_path, monkeypatch):
         path = plain_file(tmp_path, "gone.bin")
         order: list[str] = []
-        real_acquire = mut.acquire_legacy
+        real_acquire = family.acquire_legacy
         real_unlink = os.unlink
 
         def spy_acquire(target, operation):
@@ -119,7 +121,7 @@ class TestEnrollmentOrder:
             assert GATE.snapshot(path).legacy_active == 1
             return real_unlink(target)
 
-        monkeypatch.setattr(mut, "acquire_legacy", spy_acquire)
+        monkeypatch.setattr(family, "acquire_legacy", spy_acquire)
         monkeypatch.setattr(mut.os, "unlink", spy_unlink)
         unlink_enrolled(path)
         assert order[0] == "enroll:files_delete"
@@ -261,14 +263,14 @@ class TestIdentityAndSiblingProgress:
         waiting = threading.Event()
         other_done = threading.Event()
         errors: list[BaseException] = []
-        real_acquire = mut.acquire_legacy
+        real_acquire = family.acquire_legacy
 
         def spy_acquire(target, operation):
             if Path(target).resolve() == blocked.resolve():
                 waiting.set()
             return real_acquire(target, operation)
 
-        monkeypatch.setattr(mut, "acquire_legacy", spy_acquire)
+        monkeypatch.setattr(family, "acquire_legacy", spy_acquire)
 
         def write_blocked():
             try:
@@ -303,3 +305,230 @@ class TestIdentityAndSiblingProgress:
         assert blocked.read_bytes() == b"new-blocked"
         assert_idle(blocked)
         assert_idle(other)
+
+
+class TestSidecarFamilyOccupancy:
+    def test_write_sidecar_blocked_by_new_main_then_releases(
+        self, tmp_path, monkeypatch
+    ):
+        main = plain_file(tmp_path, "sess.kohakutr", b"main")
+        sidecar = Path(str(main) + "-wal")
+        sidecar.write_bytes(b"old-wal")
+        occupying = try_fast(main, eligible=True)
+        assert occupying.lease is not None
+        opens: list[str] = []
+        errors: list[BaseException] = []
+        done = threading.Event()
+        real_open = open
+
+        def spy_open(target, mode="r", *args, **kwargs):
+            opens.append(mode)
+            assert GATE.snapshot(main).legacy_active == 1
+            assert GATE.snapshot(main).new_active == 0
+            return real_open(target, mode, *args, **kwargs)
+
+        monkeypatch.setattr(mut, "open", spy_open, raising=False)
+
+        def run_write():
+            try:
+                write_bytes_enrolled(sidecar, b"new-wal")
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=run_write)
+        worker.start()
+        try:
+            wait_pending(main, 1)
+            assert opens == []
+            assert sidecar.read_bytes() == b"old-wal"
+            occupying.lease.finish(source_released=True)
+            assert done.wait(5) and not errors
+            assert sidecar.read_bytes() == b"new-wal"
+            assert main.read_bytes() == b"main"
+            assert opens == ["wb"]
+        finally:
+            occupying.lease.finish(source_released=True)
+            worker.join(5)
+        assert not worker.is_alive() and not errors
+        assert_idle(main)
+        assert_idle(sidecar)
+
+    def test_replace_sidecar_blocked_by_new_main_then_releases(
+        self, tmp_path, monkeypatch
+    ):
+        main = plain_file(tmp_path, "sess.kohakutr", b"main")
+        src = plain_file(tmp_path, "staging.bin", b"new-wal")
+        sidecar = Path(str(main) + "-wal")
+        sidecar.write_bytes(b"old-wal")
+        occupying = try_fast(main, eligible=True)
+        assert occupying.lease is not None
+        replaces: list[object] = []
+        errors: list[BaseException] = []
+        done = threading.Event()
+        real_replace = os.replace
+
+        def spy_replace(source, dest):
+            replaces.append((source, dest))
+            assert GATE.snapshot(main).legacy_active == 1
+            assert GATE.snapshot(main).new_active == 0
+            return real_replace(source, dest)
+
+        monkeypatch.setattr(mut.os, "replace", spy_replace)
+
+        def run_replace():
+            try:
+                replace_enrolled(src, sidecar)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=run_replace)
+        worker.start()
+        try:
+            wait_pending(main, 1)
+            assert replaces == []
+            occupying.lease.finish(source_released=True)
+            assert done.wait(5) and not errors
+            assert sidecar.read_bytes() == b"new-wal"
+            assert main.read_bytes() == b"main"
+            assert replaces
+        finally:
+            occupying.lease.finish(source_released=True)
+            worker.join(5)
+        assert not worker.is_alive() and not errors
+        assert_idle(src)
+        assert_idle(sidecar)
+        assert_idle(main)
+
+    def test_unlink_sidecar_blocked_by_new_main_then_releases(
+        self, tmp_path, monkeypatch
+    ):
+        main = plain_file(tmp_path, "sess.kohakutr", b"main")
+        sidecar = Path(str(main) + "-wal")
+        sidecar.write_bytes(b"wal")
+        occupying = try_fast(main, eligible=True)
+        assert occupying.lease is not None
+        unlinks: list[object] = []
+        errors: list[BaseException] = []
+        done = threading.Event()
+        real_unlink = os.unlink
+
+        def spy_unlink(target):
+            unlinks.append(target)
+            assert GATE.snapshot(main).legacy_active == 1
+            assert GATE.snapshot(main).new_active == 0
+            return real_unlink(target)
+
+        monkeypatch.setattr(mut.os, "unlink", spy_unlink)
+
+        def run_unlink():
+            try:
+                unlink_enrolled(sidecar)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=run_unlink)
+        worker.start()
+        try:
+            wait_pending(main, 1)
+            assert unlinks == []
+            occupying.lease.finish(source_released=True)
+            assert done.wait(5) and not errors
+            assert not sidecar.exists()
+            assert main.read_bytes() == b"main"
+            assert unlinks
+        finally:
+            occupying.lease.finish(source_released=True)
+            worker.join(5)
+        assert not worker.is_alive() and not errors
+        assert_idle(sidecar)
+        assert_idle(main)
+
+    def test_unknown_suffix_does_not_map_owner(self, tmp_path, monkeypatch):
+        main = plain_file(tmp_path, "sess.kohakutr", b"main")
+        unknown = Path(str(main) + ".backup")
+        unknown.write_bytes(b"old")
+        occupying = try_fast(main, eligible=True)
+        assert occupying.lease is not None
+        enrolled: list[str] = []
+        real_acquire = family.acquire_legacy
+
+        def spy_acquire(target, operation):
+            enrolled.append(Path(target).name)
+            return real_acquire(target, operation)
+
+        monkeypatch.setattr(family, "acquire_legacy", spy_acquire)
+        write_bytes_enrolled(unknown, b"new")
+        assert unknown.read_bytes() == b"new"
+        assert main.read_bytes() == b"main"
+        assert occupying.lease is not None
+        assert GATE.snapshot(main).new_active == 1
+        assert "sess.kohakutr" not in enrolled
+        assert unknown.name in enrolled
+        occupying.lease.finish(source_released=True)
+        assert_idle(unknown)
+        assert_idle(main)
+
+    def test_user_target_list_unchanged_when_family_expands(
+        self, tmp_path, monkeypatch
+    ):
+        main = plain_file(tmp_path, "sess.kohakutr", b"main")
+        sidecar = Path(str(main) + "-wal")
+        sidecar.write_bytes(b"wal")
+        unknown = Path(str(main) + ".backup")
+        unknown.write_bytes(b"keep")
+        staging = plain_file(tmp_path, "staging.bin", b"next")
+        enrolled: list[str] = []
+        seen_inputs: list[list[object]] = []
+        real_acquire = family.acquire_legacy
+        real_identities = family.family_identities
+
+        def spy_identities(paths):
+            captured = list(paths)
+            seen_inputs.append(captured)
+            result = real_identities(paths)
+            assert list(paths) == captured
+            return result
+
+        def spy_acquire(target, operation):
+            enrolled.append(Path(target).name)
+            return real_acquire(target, operation)
+
+        monkeypatch.setattr(family, "family_identities", spy_identities)
+        monkeypatch.setattr(family, "acquire_legacy", spy_acquire)
+
+        write_targets = [sidecar]
+        write_bytes_enrolled(write_targets[0], b"written")
+        assert write_targets == [sidecar]
+        assert sidecar.read_bytes() == b"written"
+        assert main.read_bytes() == b"main"
+        assert unknown.read_bytes() == b"keep"
+        assert "sess.kohakutr" in enrolled
+        assert sidecar.name in enrolled
+        assert unknown.name not in enrolled
+
+        replace_targets = [staging, sidecar]
+        replace_enrolled(replace_targets[0], replace_targets[1])
+        assert replace_targets == [staging, sidecar]
+        assert sidecar.read_bytes() == b"next"
+        assert main.read_bytes() == b"main"
+        assert unknown.read_bytes() == b"keep"
+        assert not staging.exists()
+
+        delete_targets = [sidecar]
+        unlink_enrolled(delete_targets[0])
+        assert delete_targets == [sidecar]
+        assert not sidecar.exists()
+        assert main.read_bytes() == b"main"
+        assert unknown.read_bytes() == b"keep"
+        assert seen_inputs
+        for captured in seen_inputs:
+            assert unknown not in captured
+        assert_idle(main)
+        assert_idle(sidecar)
+        assert_idle(unknown)

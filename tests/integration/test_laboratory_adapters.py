@@ -346,6 +346,37 @@ class TestTerrariumFilesAdapter:
                     assert "error" not in result
                     assert target.exists() == (operation == "write")
                     assert not GATE.snapshot(target).registered
+                owner = worker_cfg_dir / "sidecar.kohakutr.v2"
+                owner.write_bytes(b"keep main untouched")
+                sidecar = owner.with_name(owner.name + "-wal")
+                for operation in ("write", "delete"):
+                    admitted = try_fast(owner, eligible=True)
+                    body = {"scope": "config://", "path": sidecar.name}
+                    if operation == "write":
+                        body["bytes_b64"] = "aGVsbG8="
+                    request = asyncio.create_task(
+                        host.request(
+                            to_node="w-files",
+                            namespace="terrarium.files",
+                            type=operation,
+                            body=body,
+                            timeout=10,
+                        )
+                    )
+                    try:
+                        deadline = asyncio.get_running_loop().time() + 5
+                        while GATE.snapshot(owner).legacy_pending == 0:
+                            assert not request.done()
+                            assert asyncio.get_running_loop().time() < deadline
+                            await asyncio.sleep(0.01)
+                        assert sidecar.exists() == (operation == "delete")
+                    finally:
+                        admitted.lease.finish(source_released=True)
+                    result = await request
+                    assert "error" not in result
+                    assert sidecar.exists() == (operation == "write")
+                    assert owner.read_bytes() == b"keep main untouched"
+                    assert not GATE.snapshot(owner).registered
             finally:
                 if old_config_dir is None:
                     os.environ.pop("KT_CONFIG_DIR", None)
@@ -367,8 +398,12 @@ class TestTerrariumSessionAdapter:
     history/search/stores/resume across the wire."""
 
     async def test_session_namespace_full_sweep(
-        self, tmp_path, _reset_inproc, scripted_llm
+        self, tmp_path, _reset_inproc, scripted_llm, monkeypatch
     ):
+        config = tmp_path / "config"
+        transfer_root = config / "resume"
+        transfer_root.mkdir(parents=True)
+        monkeypatch.setenv("KT_CONFIG_DIR", str(config))
         host = await _start_host(port=2)
         try:
             client = await _start_client("w-sess", port=2)
@@ -427,6 +462,46 @@ class TestTerrariumSessionAdapter:
                 # Error is expected for nonexistent session — the verb
                 # dispatch reached the handler.
                 assert resp is not None
+                for operation in ("delete_transfer", "rollback_resume"):
+                    target = transfer_root / (operation + ".kohakutr")
+                    target.write_bytes(b"transfer")
+                    wal = target.with_name(target.name + "-wal")
+                    wal.write_bytes(b"wal")
+                    unknown = target.with_name(target.name + ".backup")
+                    unknown.write_bytes(b"keep")
+                    admitted = try_fast(wal, eligible=True)
+                    body = {"session_path": str(target), "resume_token": "expired"}
+                    request = asyncio.create_task(
+                        host.request(
+                            to_node="w-sess",
+                            namespace="terrarium.session",
+                            type=operation,
+                            body=body,
+                            timeout=10,
+                        )
+                    )
+                    try:
+                        deadline = asyncio.get_running_loop().time() + 5
+                        while GATE.snapshot(wal).legacy_pending == 0:
+                            assert not request.done()
+                            assert asyncio.get_running_loop().time() < deadline
+                            await asyncio.sleep(0.01)
+                        assert target.exists() and wal.exists()
+                    finally:
+                        admitted.lease.finish(source_released=True)
+                    result = await request
+                    assert result["ok"] is True
+                    assert not target.exists() and not wal.exists()
+                    assert unknown.read_bytes() == b"keep"
+                    assert not GATE.snapshot(target).registered
+                    retry = await host.request(
+                        to_node="w-sess",
+                        namespace="terrarium.session",
+                        type=operation,
+                        body=body,
+                        timeout=10,
+                    )
+                    assert retry["ok"] is True
             finally:
                 await client.stop()
                 await engine.shutdown()

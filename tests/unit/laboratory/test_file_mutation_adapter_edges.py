@@ -18,6 +18,7 @@ from kohakuterrarium.laboratory.adapters import terrarium_file_mutations as mut
 from kohakuterrarium.laboratory.adapters import terrarium_files as files_mod
 from kohakuterrarium.laboratory.adapters.file_scopes import resolve_in_scope
 from kohakuterrarium.laboratory.adapters.terrarium_files import MAX_ONESHOT_BYTES
+from kohakuterrarium.session import file_family as family
 from kohakuterrarium.session.store import SessionStore
 from tests.unit.laboratory.file_mutation_enrollment_helpers import (
     assert_idle,
@@ -224,13 +225,13 @@ class TestCommitHashAndIdempotence:
         )
         staging = adapter._transfers[tid].staging
         enrolled: list[str] = []
-        real_acquire = mut.acquire_legacy
+        real_acquire = family.acquire_legacy
 
         def spy_acquire(path, operation):
             enrolled.append(operation)
             return real_acquire(path, operation)
 
-        monkeypatch.setattr(mut, "acquire_legacy", spy_acquire)
+        monkeypatch.setattr(family, "acquire_legacy", spy_acquire)
         commit = await adapter._dispatch(msg("write_commit", {"transfer_id": tid}))
         assert commit == {"written": len(payload), "sha256": sha(payload)}
         assert enrolled == []

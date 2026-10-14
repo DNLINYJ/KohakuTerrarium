@@ -17,6 +17,7 @@ from kohakuterrarium.laboratory.adapters.terrarium_file_mutations import (
     run_mutation_worker,
     write_bytes_enrolled,
 )
+from kohakuterrarium.session import file_family as family
 from kohakuterrarium.session.resource_gate import GATE
 from tests.unit.laboratory.file_mutation_enrollment_helpers import (
     assert_idle,
@@ -282,13 +283,13 @@ class TestAdapterOutputsUnchanged:
             )
         )
         enrolled: list[str] = []
-        real_acquire = mut.acquire_legacy
+        real_acquire = family.acquire_legacy
 
         def spy_acquire(target, operation):
             enrolled.append(str(target))
             return real_acquire(target, operation)
 
-        monkeypatch.setattr(mut, "acquire_legacy", spy_acquire)
+        monkeypatch.setattr(family, "acquire_legacy", spy_acquire)
         out = await adapter._dispatch(
             msg("delete", {"scope": "recipe://dir", "path": "sub"})
         )
@@ -312,7 +313,7 @@ class TestAdapterOutputsUnchanged:
             enrolled.append("acquire")
             raise AssertionError("must not enroll after hash mismatch")
 
-        monkeypatch.setattr(mut, "acquire_legacy", boom_acquire)
+        monkeypatch.setattr(family, "acquire_legacy", boom_acquire)
         out = await adapter._dispatch(
             msg(
                 "write",
@@ -338,13 +339,13 @@ class TestAdapterOutputsUnchanged:
         active.write_bytes(b"active")
         adapter._engine._session_stores["sid"] = SimpleNamespace(path=active)
         enrolled: list[str] = []
-        real_acquire = mut.acquire_legacy
+        real_acquire = family.acquire_legacy
 
         def spy_acquire(target, operation):
             enrolled.append(Path(target).name)
             return real_acquire(target, operation)
 
-        monkeypatch.setattr(mut, "acquire_legacy", spy_acquire)
+        monkeypatch.setattr(family, "acquire_legacy", spy_acquire)
         out = await adapter._dispatch(
             msg(
                 "write",
@@ -424,14 +425,14 @@ class TestWorkerOwnsLeaseNotEventLoop:
     def test_run_mutation_worker_does_not_acquire_on_loop(self, tmp_path, monkeypatch):
         path = tmp_path / "loop.bin"
         threads: list[str] = []
-        real_acquire = mut.acquire_legacy
+        real_acquire = family.acquire_legacy
         loop_ident = None
 
         def spy_acquire(target, operation):
             threads.append(threading.current_thread().name)
             return real_acquire(target, operation)
 
-        monkeypatch.setattr(mut, "acquire_legacy", spy_acquire)
+        monkeypatch.setattr(family, "acquire_legacy", spy_acquire)
 
         async def run():
             nonlocal loop_ident
