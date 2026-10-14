@@ -161,9 +161,7 @@ class TestGateBeforeSql:
             candidate_mod.sqlite3,
             "connect",
             lambda *a, **k: opened.append(a)
-            or (_ for _ in ()).throw(
-                AssertionError("SQL must not open while pending")
-            ),
+            or (_ for _ in ()).throw(AssertionError("SQL must not open while pending")),
         )
         monkeypatch.setattr(
             candidate_mod,
@@ -228,7 +226,9 @@ class TestAdmittedRead:
         path = _closed_session(tmp_path / "closed.kohakutr")
         copies = []
         opened = []
-        real_copy = candidate_mod.shutil.copy2 if hasattr(candidate_mod, "shutil") else None
+        real_copy = (
+            candidate_mod.shutil.copy2 if hasattr(candidate_mod, "shutil") else None
+        )
         real_legacy_copy = __import__("shutil").copy2
         real_connect = sqlite3.connect
 

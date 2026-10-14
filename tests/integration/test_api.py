@@ -41,10 +41,15 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+import kohakuterrarium.api.routes.persistence.resume as _resume_route
+import kohakuterrarium.api.routes.persistence.resume_cluster as _resume_cluster
+import kohakuterrarium.terrarium.workspace_resume as _workspace_resume
 from kohakuterrarium.api.app import create_app
 from kohakuterrarium.api.deps import set_service
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.readonly import read_session_meta
+from kohakuterrarium.session.metadata_candidate import read_metadata_candidate
+from kohakuterrarium.session.resource_gate import GATE, acquire_legacy
 from kohakuterrarium.studio.persistence.store import resolve_session_path_in
 from kohakuterrarium.api.routes.catalog import _deps as _catalog_deps
 from kohakuterrarium.bootstrap import agent_init as _agent_init
@@ -1850,6 +1855,39 @@ class TestApiIntegration:
         preflight = client.post("/api/sessions/retired-source/resume/preflight")
         assert preflight.status_code == 200
         assert preflight.json()["ready"] is True
+        classifications, candidates = [], []
+
+        def copied_classification(path):
+            classifications.append(Path(path))
+            return read_session_meta(path)
+
+        def controlled_candidate(path):
+            outcome = read_metadata_candidate(path, eligible=True)
+            candidates.append(outcome.reason)
+            return outcome.meta
+
+        with monkeypatch.context() as controlled:
+            controlled.setattr(
+                _resume_cluster, "read_session_meta", copied_classification
+            )
+            controlled.setattr(
+                _workspace_resume, "read_session_meta", controlled_candidate
+            )
+            controlled.setattr(_resume_route, "read_session_meta", controlled_candidate)
+            optimized = client.post("/api/sessions/retired-source/resume/preflight")
+            assert optimized.status_code == 200
+            assert optimized.json() == preflight.json()
+            assert len(classifications) == 2
+            assert candidates and set(candidates) == {"ok"}
+            assert not GATE.snapshot(target_path).registered
+            candidates.clear()
+            reservation = acquire_legacy(target_path, "controlled_preflight_fallback")
+            try:
+                fallback = client.post("/api/sessions/retired-source/resume/preflight")
+                assert fallback.json() == preflight.json()
+                assert candidates and set(candidates) == {"legacy_enrolled"}
+            finally:
+                reservation.finish(source_released=True)
         resp = client.post("/api/sessions/retired-source/resume")
         assert resp.status_code == 200
         resumed = resp.json()
