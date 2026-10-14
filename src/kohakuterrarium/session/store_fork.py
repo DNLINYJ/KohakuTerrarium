@@ -18,6 +18,7 @@ from kohakuterrarium.session.history import (
     resolve_branch_view_strict,
 )
 from kohakuterrarium.session.identity import new_conversation_id
+from kohakuterrarium.session.resource_gate import acquire_legacy
 from kohakuterrarium.session.store_protocol import SessionStoreLike
 from kohakuterrarium.utils.logging import get_logger
 
@@ -262,26 +263,103 @@ def _child_session_id(parent_session_id: str) -> str:
     return f"{parent_session_id}-fork-{short}"
 
 
+def _new_purge_cursors() -> list[sqlite3.Cursor]:
+    return []
+
+
+def _close_purge_connection(
+    conn: sqlite3.Connection | None,
+    cursors: list[sqlite3.Cursor],
+) -> bool:
+    """Close every cursor, then the DB. Always attempt DB close."""
+    if conn is None:
+        return False
+    released = True
+    primary: BaseException | None = None
+    for cursor in cursors:
+        try:
+            cursor.close()
+        except sqlite3.ProgrammingError:
+            released = False
+        except BaseException as exc:
+            released = False
+            if primary is None:
+                primary = exc
+    cursors.clear()
+    try:
+        conn.close()
+    except BaseException as exc:
+        released = False
+        if primary is None:
+            primary = exc
+        else:
+            raise primary from exc
+    if primary is not None:
+        raise primary
+    return released
+
+
 def _purge_drive_tables(target_path: str) -> None:
     """Remove Drive tables so a conversation fork carries no commitments.
 
-    Independent branches must never mutate the same Drive state. Raw SQL keeps
-    the session package independent of the Terrarium Drive implementation.
+    Independent branches must never mutate the same Drive state. Raw SQL
+    keeps the session package independent of Drive. Enroll before connect.
     """
-    conn = sqlite3.connect(target_path)
+    cursors: list[sqlite3.Cursor] = _new_purge_cursors()
+    lease = acquire_legacy(target_path, "fork_drive_purge")
+    conn: sqlite3.Connection | None = None
+    source_uncertain = False
+    primary: BaseException | None = None
     try:
-        conn.execute("PRAGMA busy_timeout = 5000")
-        rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'drive%'"
-        ).fetchall()
-        for (name,) in rows:
-            conn.execute(f'DROP TABLE IF EXISTS "{name}"')
-        if rows:
-            conn.commit()
-    except sqlite3.Error as exc:  # pragma: no cover - cleanup is best-effort
-        logger.warning("Fork drive-table purge failed", error=str(exc))
+        conn = sqlite3.connect(target_path)
+
+        def execute(sql: str) -> sqlite3.Cursor:
+            nonlocal source_uncertain
+            cursor = conn.execute(sql)
+            try:
+                cursors.append(cursor)
+            except BaseException as tracking:
+                source_uncertain = True
+                try:
+                    cursor.close()
+                except sqlite3.ProgrammingError:
+                    pass
+                except BaseException as cleanup:
+                    raise tracking from cleanup
+                raise
+            return cursor
+
+        try:
+            execute("PRAGMA busy_timeout = 5000")
+            rows = execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'drive%'"
+            ).fetchall()
+            for (name,) in rows:
+                execute(f'DROP TABLE IF EXISTS "{name}"')
+            if rows:
+                conn.commit()
+        except sqlite3.Error as exc:
+            logger.warning("Fork drive-table purge failed", error=str(exc))
+    except BaseException as exc:
+        primary = exc
+        raise
     finally:
-        conn.close()
+        close_error: BaseException | None = None
+        source_released = False
+        try:
+            source_released = _close_purge_connection(conn, cursors)
+        except BaseException as exc:
+            source_released = False
+            close_error = exc
+        if source_uncertain:
+            source_released = False
+        lease.finish(source_released=source_released)
+        if primary is not None:
+            if close_error is not None:
+                raise primary from close_error
+            raise primary
+        if close_error is not None:
+            raise close_error
 
 
 def perform_fork(

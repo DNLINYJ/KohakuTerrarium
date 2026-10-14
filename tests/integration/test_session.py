@@ -64,6 +64,7 @@ from kohakuterrarium.session.migrations import (
     path_for_version,
 )
 from kohakuterrarium.session.readonly import read_session_meta
+from kohakuterrarium.session.readonly_view import SessionReadView
 from kohakuterrarium.session.resource_gate import try_fast
 from kohakuterrarium.session.raw_history import UserMessageSelector
 from kohakuterrarium.session.resume import detect_session_type, resume_agent
@@ -573,6 +574,17 @@ class TestSessionIntegration:
         source_mtime = session_path.stat().st_mtime_ns
         assert detect_format_version(session_path.as_uri()) == FORMAT_VERSION
         assert read_session_meta(session_path.as_uri())["agents"] == ["scribe"]
+        with SessionReadView(session_path.as_uri()) as view:
+            assert try_fast(session_path, eligible=True).reason == "legacy_enrolled"
+            selected = view.items("events", prefix="scribe:e")
+            first_key, first_event = next(selected)
+            assert view.get("meta", "agents") == ["scribe"]
+            selected_events = [first_event, *(event for _, event in selected)]
+            assert selected_events == events
+            assert first_key.startswith("scribe:e")
+        admission = try_fast(session_path, eligible=True)
+        assert admission.lease is not None, admission.reason
+        admission.lease.finish(source_released=True)
         assert session_path.read_bytes() == source_bytes
         assert session_path.stat().st_mtime_ns == source_mtime
         # A missing path is a hard FileNotFoundError, not a silent 1.
