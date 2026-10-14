@@ -23,6 +23,8 @@ coordination are all real.
 
 import asyncio
 import json
+import sqlite3
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 
@@ -38,6 +40,9 @@ from kohakuterrarium.core.config_types import (
 )
 from kohakuterrarium.modules.tool.base import ToolContext
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.session.resource_gate import try_fast
+from kohakuterrarium.terrarium.drive.store_migration import _migrate_same_file_drives
+from kohakuterrarium.terrarium.drive.wire import pack_drive_record
 from kohakuterrarium.session.resume_target import resolve_resume_path
 from kohakuterrarium.studio.persistence.viewer.exchanges import build_exchanges_payload
 import kohakuterrarium.terrarium.session_coord as _session_coord
@@ -2053,6 +2058,40 @@ class TestTerrariumIntegration:
 
             collector_a.cancel()
             collector.cancel()
+
+        legacy_path = tmp_path / "legacy-drive.kohakutr"
+        migrated_path = str(legacy_path) + ".drives"
+        with closing(sqlite3.connect(legacy_path)) as legacy:
+            legacy.execute(
+                "CREATE TABLE drives (drive_id TEXT PRIMARY KEY, blob TEXT NOT NULL)"
+            )
+            legacy.execute(
+                "INSERT INTO drives VALUES (?, ?)",
+                (drive_b.drive_id, json.dumps(pack_drive_record(drive_b))),
+            )
+            legacy.commit()
+        original_bytes = legacy_path.read_bytes()
+        await asyncio.to_thread(
+            _migrate_same_file_drives, str(legacy_path), migrated_path
+        )
+        assert legacy_path.read_bytes() == original_bytes
+        admission = try_fast(legacy_path, eligible=True)
+        assert admission.lease is not None, admission.reason
+        admission.lease.finish(source_released=True)
+        migrated = SqliteDriveRepository(migrated_path)
+        try:
+            restored = await migrated.get(drive_b.drive_id)
+            assert restored == drive_b
+        finally:
+            await migrated.close()
+        await asyncio.to_thread(
+            _migrate_same_file_drives, str(legacy_path), migrated_path
+        )
+        reopened = SqliteDriveRepository(migrated_path)
+        try:
+            assert await reopened.get(drive_b.drive_id) == drive_b
+        finally:
+            await reopened.close()
 
         # Bare engines now enable the generic + goal Drive runtime by default.
         assert Terrarium().drives is not None

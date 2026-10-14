@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from kohakuterrarium.session.resource_gate import acquire_legacy
 from kohakuterrarium.terrarium.drive.errors import DriveSchemaVersionError
+from kohakuterrarium.terrarium.drive.store_migration_resources import (
+    MigrationSqlResources,
+    append_cleanup,
+    new_cursors,
+)
 from kohakuterrarium.utils.drive_migration_lock import (
     _MIGRATE_LOCK_TIMEOUT_S,
     _MIGRATE_POLL_S,
@@ -163,6 +169,17 @@ def _quarantine_incomplete_sidecar(sidecar_path: str) -> None:
     )
 
 
+def _source_resources(path: str | Path, operation: str) -> MigrationSqlResources:
+    """Enroll a prepared SQL ledger without retaining failed initialization."""
+    cursors = new_cursors()
+    lease = acquire_legacy(path, operation)
+    try:
+        return MigrationSqlResources(lease, cursors=cursors)
+    except BaseException:
+        lease.finish(source_released=True)
+        raise
+
+
 def _legacy_same_file_drives(kohakutr_path: str) -> bool:
     """Return whether a session database still contains legacy Drive rows.
 
@@ -172,21 +189,32 @@ def _legacy_same_file_drives(kohakutr_path: str) -> bool:
     path = Path(kohakutr_path)
     if not path.exists():
         return False
+    resources = _source_resources(path, "drive_probe")
+    resources.mark_source_handle()
+    primary: BaseException | None = None
     try:
-        conn = sqlite3.connect(path.resolve().as_uri() + "?immutable=1", uri=True)
-    except sqlite3.Error:
-        return False
-    try:
-        present = conn.execute(
+        try:
+            conn = sqlite3.connect(path.resolve().as_uri() + "?immutable=1", uri=True)
+        except sqlite3.Error:
+            resources.mark_source_uncertain()
+            return False
+        resources.adopt(conn)
+        present_row = resources.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='drives'"
         ).fetchone()
-        if present is None:
+        if present_row is None:
             return False
-        return conn.execute("SELECT 1 FROM drives LIMIT 1").fetchone() is not None
-    except sqlite3.Error:
+        return resources.execute("SELECT 1 FROM drives LIMIT 1").fetchone() is not None
+    except sqlite3.Error as exc:
+        if resources.tracking_failed:
+            primary = exc
+            raise
         return False
+    except BaseException as exc:
+        primary = exc
+        raise
     finally:
-        conn.close()
+        resources.finish(primary)
 
 
 @contextmanager
@@ -291,6 +319,23 @@ def _sweep_abandoned_migration_temps(sidecar_path: str) -> None:
         candidate.unlink(missing_ok=True)
 
 
+def _unlink_migration_temps(tmp: Path) -> None:
+    """Remove a failed rebuild temp and companions; report unlink errors."""
+    errors: list[OSError] = []
+    for suffix in ("", "-journal", "-wal", "-shm"):
+        try:
+            Path(str(tmp) + suffix).unlink(missing_ok=True)
+        except OSError as exc:
+            errors.append(exc)
+    if errors:
+        logger.warning(
+            "Drive migration temp cleanup failed",
+            tmp=str(tmp),
+            error=str(errors[0]),
+        )
+        raise errors[0]
+
+
 def _migrate_same_file_drives(kohakutr_path: str, sidecar_path: str) -> None:
     """Atomically copy legacy same-file Drive rows into a sidecar.
 
@@ -301,19 +346,40 @@ def _migrate_same_file_drives(kohakutr_path: str, sidecar_path: str) -> None:
     _reject_invalid_sidecar_marker(sidecar_path)
     if _sidecar_is_complete(sidecar_path):
         return
-    with _migration_lock(sidecar_path) as acquired:
-        # A peer may complete migration while this opener waits for the lock.
-        if not acquired:
-            return
-        _sweep_abandoned_migration_temps(sidecar_path)
-        if _sidecar_is_complete(sidecar_path):
-            return
-        # Preserve an incomplete destination before rebuilding from the legacy source.
-        if any(Path(sidecar_path + suffix).exists() for suffix in ("", "-wal", "-shm")):
-            _quarantine_incomplete_sidecar(sidecar_path)
-        if not _legacy_same_file_drives(kohakutr_path):
-            return
-        _rebuild_sidecar_from_legacy(kohakutr_path, sidecar_path)
+    lease = acquire_legacy(kohakutr_path, "drive_migrate")
+    try:
+        with _migration_lock(sidecar_path) as acquired:
+            # A peer may complete migration while this opener waits for the lock.
+            if not acquired:
+                return
+            _sweep_abandoned_migration_temps(sidecar_path)
+            if _sidecar_is_complete(sidecar_path):
+                return
+            # Preserve an incomplete destination before rebuilding from the legacy source.
+            if any(
+                Path(sidecar_path + suffix).exists() for suffix in ("", "-wal", "-shm")
+            ):
+                _quarantine_incomplete_sidecar(sidecar_path)
+            if not _legacy_same_file_drives(kohakutr_path):
+                return
+            _rebuild_sidecar_from_legacy(kohakutr_path, sidecar_path)
+    finally:
+        lease.finish(source_released=True)
+
+
+def _copy_legacy_tables(resources: MigrationSqlResources) -> int:
+    """Copy present legacy Drive tables into the destination sidecar."""
+    copied = 0
+    for table in _DRIVE_DATA_TABLES:
+        in_legacy = resources.execute(
+            "SELECT name FROM legacy.sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        if in_legacy is None:
+            continue
+        cur = resources.execute(f"INSERT INTO {table} SELECT * FROM legacy.{table}")
+        copied += max(cur.rowcount, 0)
+    return copied
 
 
 def _rebuild_sidecar_from_legacy(kohakutr_path: str, sidecar_path: str) -> None:
@@ -322,43 +388,42 @@ def _rebuild_sidecar_from_legacy(kohakutr_path: str, sidecar_path: str) -> None:
     Failed attempts remove the temporary database and all SQLite companions.
     """
     tmp = Path(sidecar_path + f".migrating.{uuid4().hex}")
-    tmp.unlink(missing_ok=True)
+    resources = _source_resources(kohakutr_path, "drive_rebuild")
     copied = 0
     renamed = False
+    primary: BaseException | None = None
     try:
-        # Immutable attachment prevents migration from locking a live session database.
+        # Immutable attachment prevents migration from locking a live session.
         dest = sqlite3.connect(tmp.resolve().as_uri(), uri=True, isolation_level=None)
-        try:
-            dest.executescript(_SCHEMA)
-            dest.execute(
-                "INSERT INTO drive_meta(key, value) VALUES('schema_version', ?)",
-                (str(DRIVE_SCHEMA_VERSION),),
-            )
-            dest.execute(
-                "ATTACH DATABASE ? AS legacy",
-                (Path(kohakutr_path).resolve().as_uri() + "?immutable=1",),
-            )
-            dest.execute("BEGIN IMMEDIATE")
-            for table in _DRIVE_DATA_TABLES:
-                in_legacy = dest.execute(
-                    "SELECT name FROM legacy.sqlite_master "
-                    "WHERE type='table' AND name=?",
-                    (table,),
-                ).fetchone()
-                if in_legacy is None:
-                    continue
-                cur = dest.execute(f"INSERT INTO {table} SELECT * FROM legacy.{table}")
-                copied += max(cur.rowcount, 0)
-            dest.execute("COMMIT")
-            dest.execute("DETACH DATABASE legacy")
-        finally:
-            dest.close()
+        resources.adopt(dest)
+        resources.executescript(_SCHEMA)
+        resources.execute(
+            "INSERT INTO drive_meta(key, value) VALUES('schema_version', ?)",
+            (str(DRIVE_SCHEMA_VERSION),),
+        )
+        resources.attach_legacy(Path(kohakutr_path).resolve().as_uri() + "?immutable=1")
+        resources.execute("BEGIN IMMEDIATE")
+        copied = _copy_legacy_tables(resources)
+        resources.execute("COMMIT")
+        resources.detach_legacy()
+    except BaseException as exc:
+        primary = exc
+    try:
+        resources.finish(primary)
         tmp.replace(sidecar_path)
         renamed = True
+    except BaseException as exc:
+        primary = exc
+        raise
     finally:
         if not renamed:
-            for suffix in ("", "-journal", "-wal", "-shm"):
-                Path(str(tmp) + suffix).unlink(missing_ok=True)
+            try:
+                _unlink_migration_temps(tmp)
+            except BaseException as cleanup:
+                if primary is None:
+                    raise
+                append_cleanup(primary, cleanup)
+                raise primary
     logger.info(
         "Migrated legacy same-file Drive rows into sidecar",
         rows=copied,
