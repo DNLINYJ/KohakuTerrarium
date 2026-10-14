@@ -123,4 +123,51 @@ describe("MessageRow order-preserving inline editor", () => {
       { type: "text", text: "two" },
     ])
   })
+
+  it("shows a visible error instead of saving a read-only multi-text deletion that rebinds [[file:1]]", async () => {
+    const original = [
+      { type: "text", text: "keep" },
+      { type: "file", file: { name: "dup.txt", path: "/workspace/a.txt", content: "FILE-A" } },
+      { type: "text", text: "see [[file:1]]" },
+      { type: "file", file: { name: "dup.txt", path: "/workspace/b.txt", content: "FILE-B" } },
+      { type: "file", file: { name: "dup.txt", path: "/workspace/c.txt", content: "FILE-C" } },
+    ]
+    const { wrapper, store } = mountUser(pinia, original)
+    const editSpy = vi.spyOn(store, "editMessage").mockResolvedValue({ ok: true })
+    await wrapper.get('[aria-label="Edit and rerun message"]').trigger("click")
+    expect(wrapper.get("textarea.message-edit-inline").attributes("readonly")).toBeDefined()
+    await wrapper.get('[aria-label="Remove dup.txt"]').trigger("click")
+    await wrapper.get('[aria-label="Save and rerun"]').trigger("click")
+    await vi.waitFor(() =>
+      expect(wrapper.get('[role="alert"]').text()).toMatch(/numeric file reference|placeholder/i),
+    )
+    expect(editSpy).not.toHaveBeenCalled()
+    expect(original[2].text).toBe("see [[file:1]]")
+    expect(original[1].file.content).toBe("FILE-A")
+  })
+
+  it("saves replacing the referenced same-name file without rewriting readonly text", async () => {
+    const original = [
+      { type: "text", text: "keep" },
+      { type: "file", file: { name: "dup.txt", path: "/workspace/a.txt", content: "FILE-A" } },
+      { type: "text", text: "see [[file:1]]" },
+      { type: "file", file: { name: "dup.txt", path: "/workspace/b.txt", content: "FILE-B" } },
+      { type: "file", file: { name: "dup.txt", path: "/workspace/c.txt", content: "FILE-C" } },
+    ]
+    const { wrapper, store } = mountUser(pinia, original)
+    const editSpy = vi.spyOn(store, "editMessage").mockResolvedValue({ ok: true })
+    await wrapper.get('[aria-label="Edit and rerun message"]').trigger("click")
+    const replaceInput = wrapper.get('input[data-edit-target="1"]')
+    Object.defineProperty(replaceInput.element, "files", {
+      value: [file("dup.txt", "text/plain", "FILE-B2")],
+    })
+    await replaceInput.trigger("change")
+    await wrapper.get('[aria-label="Save and rerun"]').trigger("click")
+    await vi.waitFor(() => expect(editSpy).toHaveBeenCalledTimes(1))
+    const payload = editSpy.mock.calls[0][1]
+    expect(payload.map((part) => part.type)).toEqual(["text", "file", "text", "file", "file"])
+    expect(payload[2].text).toBe("see [[file:1]]")
+    expect(payload[3].file.content).toBe("FILE-B2")
+    expect(original[3].file.content).toBe("FILE-B")
+  })
 })

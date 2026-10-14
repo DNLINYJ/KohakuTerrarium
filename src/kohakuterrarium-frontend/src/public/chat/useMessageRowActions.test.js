@@ -630,4 +630,25 @@ describe("useMessageRowActions order-preserving save", () => {
     await pending
     expect(editMessage).not.toHaveBeenCalled()
   })
+
+  it("surfaces a numeric placeholder rebind as a visible edit error and does not dispatch", async () => {
+    const source = [
+      { type: "text", text: "keep" },
+      { type: "file", file: { name: "dup.txt", path: "/workspace/a.txt", content: "FILE-A" } },
+      { type: "text", text: "see [[file:1]]" },
+      { type: "file", file: { name: "dup.txt", path: "/workspace/b.txt", content: "FILE-B" } },
+      { type: "file", file: { name: "dup.txt", path: "/workspace/c.txt", content: "FILE-C" } },
+    ]
+    const editMessage = vi.fn(async () => ({ ok: true }))
+    const message = partsMessage(source)
+    const { api } = mountActions({ message, editMessage, messagesByTab: { main: [message] } })
+    api.startEdit()
+    expect(api.editTextRestricted.value).toBe(true)
+    api.removeEditAttachment(0)
+    await api.confirmEdit()
+    expect(editMessage).not.toHaveBeenCalled()
+    expect(api.editing.value).toBe(true)
+    expect(api.editError.value).toMatch(/numeric file reference|placeholder/i)
+    expect(source[2].text).toBe("see [[file:1]]")
+  })
 })

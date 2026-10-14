@@ -35,6 +35,7 @@ from kohakuterrarium.core.controller_context import (
     tool_feedback_metadata,
 )
 from kohakuterrarium.core.executor import Executor
+from kohakuterrarium.core.inline_upload import materialize_upload
 from kohakuterrarium.core.job import JobResult, JobStatus, JobStore
 from kohakuterrarium.core.registry import Registry
 from kohakuterrarium.core.tool_output import materialize_image_part
@@ -203,11 +204,10 @@ class Controller:
         # content shares the graph's session lifecycle.
         self.session_store: Any = None
 
-        # Browser uploads arrive as bytes rather than usable local paths. Keep
-        # one controller-owned materialization alive for the active session so
-        # provider retries and later tool calls see the same exact file.
+        # Controller-owned upload copies and every path authorized for this session.
         self._inline_temp_dir: Any = None
         self._inline_file_cache: dict[str, str] = {}
+        self._inline_file_paths: set[str] = set()
 
         # Event queue
         self._event_queue: asyncio.Queue[TriggerEvent] = asyncio.Queue()
@@ -636,23 +636,20 @@ class Controller:
         else:
             return None
 
-        name = Path((part.name or "attachment").replace("\\", "/")).name
-        full_safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", name) or "attachment"
-        suffix = Path(full_safe_name).suffix[:20]
-        stem = full_safe_name[: -len(suffix)] if suffix else full_safe_name
-        safe_name = f"{stem[:100]}{suffix}"
-        digest = hashlib.sha256(raw).hexdigest()
-        cache_key = f"{digest}:{full_safe_name}"
-        path = self._inline_file_cache.get(cache_key)
-        if path is None or not Path(path).is_file():
-            if self._inline_temp_dir is None:
-                self._inline_temp_dir = tempfile.TemporaryDirectory(
-                    prefix="kohakuterrarium-attachments-"
-                )
-            target = Path(self._inline_temp_dir.name) / f"{digest[:16]}-{safe_name}"
-            target.write_bytes(raw)
-            path = str(target)
-            self._inline_file_cache[cache_key] = path
+        name = part.name or "attachment"
+        cache_key = f"{hashlib.sha256(raw).hexdigest()}:{name}"
+        if self._inline_temp_dir is None:
+            self._inline_temp_dir = tempfile.TemporaryDirectory(
+                prefix="kohakuterrarium-attachments-"
+            )
+        path = materialize_upload(
+            raw,
+            name,
+            self._inline_temp_dir.name,
+            self._inline_file_cache.get(cache_key),
+        )
+        self._inline_file_cache[cache_key] = path
+        self._inline_file_paths.add(path)
 
         guard = getattr(self.executor, "_path_guard", None) if self.executor else None
         if guard is not None and hasattr(guard, "allow_session_path"):
@@ -663,9 +660,10 @@ class Controller:
         """Revoke and remove every controller-owned live-session attachment."""
         guard = getattr(self.executor, "_path_guard", None) if self.executor else None
         if guard is not None and hasattr(guard, "revoke_session_path"):
-            for path in self._inline_file_cache.values():
+            for path in self._inline_file_paths:
                 guard.revoke_session_path(path)
         self._inline_file_cache.clear()
+        self._inline_file_paths.clear()
         if self._inline_temp_dir is not None:
             self._inline_temp_dir.cleanup()
             self._inline_temp_dir = None

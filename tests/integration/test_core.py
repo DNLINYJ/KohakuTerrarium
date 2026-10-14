@@ -2586,6 +2586,7 @@ class TestCoreIntegration:
             ]
             assert paths[0] != paths[1]
             assert [path.read_text() for path in paths] == ["FILE_A", expected_second]
+            return paths
 
         async with Terrarium() as media_engine:
             media_creature = await media_engine.add_creature(
@@ -2600,9 +2601,12 @@ class TestCoreIntegration:
             media_agent = media_creature.agent
             media_agent.controller.config.include_job_status = False
             await media_agent.inject_input(original_parts)
-            assert_media_request(media_llm, "FILE_B")
+            first_paths = assert_media_request(media_llm, "FILE_B")
+            first_paths[0].write_bytes(b"CHANGED_DERIVED_FILE")
             await media_agent.regenerate_last_response(turn_index=1)
-            assert_media_request(media_llm, "FILE_B")
+            rerun_paths = assert_media_request(media_llm, "FILE_B")
+            assert rerun_paths[0] != first_paths[0]
+            assert first_paths[0].read_bytes() == b"CHANGED_DERIVED_FILE"
             original_view = dict(live_branch_path(media_agent))
             await media_agent.edit_and_rerun(
                 -1, replacement, turn_index=1, branch_view=original_view

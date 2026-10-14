@@ -135,21 +135,6 @@ describe("multimodal identity — user_input echo", () => {
     expect(chat.messagesByTab.main.map((m) => m.eventId)).toEqual(["c_send_1", "c_send_2"])
   })
 
-  it("does not treat a 2s content-signature window as identity for a new pending_id", () => {
-    const chat = seedTab()
-    const payload = [{ type: "text", text: "hello" }, IMAGE_A]
-    chat._recentUserInputs["main:" + JSON.stringify(payload)] = Date.now()
-
-    chat._handleUserInput("main", {
-      content: payload,
-      pending_id: "c_new",
-      event_id: 44,
-    })
-
-    expect(chat.messagesByTab.main).toHaveLength(1)
-    expect(chat.messagesByTab.main[0].eventId).toBe("c_new")
-  })
-
   it("repeated echo of the same pending_id does not duplicate the row", () => {
     const chat = seedTab()
     chat.messagesByTab.main = [

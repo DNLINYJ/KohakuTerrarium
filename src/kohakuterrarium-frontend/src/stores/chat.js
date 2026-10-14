@@ -2066,8 +2066,6 @@ const _chatStoreOptions = {
     queuedMessagesByTab: {},
     /** @type {number} Monotonic token to ignore stale history/WS callbacks after instance switches */
     _instanceGeneration: 0,
-    /** @type {Record<string, number>} Recent user message signatures for cross-tab dedupe */
-    _recentUserInputs: {},
     /** @type {Record<string, {active: boolean, expectedBranchByTurn?: Record<string, number>}>} Tabs needing canonical replay after regen/edit streaming finishes */
     _branchResyncPendingByTab: {},
     /** @type {Record<string, number>} Debounce timers for post-branch history resync */
@@ -2366,7 +2364,6 @@ const _chatStoreOptions = {
       this.queuedMessagesByTab = {}
       this.processingByTab = {}
       this.modelRecoveryByTab = {}
-      this._recentUserInputs = {}
       this._branchResyncPendingByTab = {}
       this._streamingBranchByTab = {}
       this._pendingBranchPathByTab = {}
@@ -2759,7 +2756,6 @@ const _chatStoreOptions = {
       const now = Date.now()
       const contentParts = typeof text === "string" ? [{ type: "text", text }] : text
       const normalized = normalizeMessageContent(contentParts)
-      const signature = contentSignature(contentParts)
       // Client-minted stable id so a message that gets buffered mid-turn
       // can be edited / cancelled by id (UXI-08a). The backend echoes it
       // as the pending id; the ``input_queued`` ack confirms the slot.
@@ -2775,7 +2771,6 @@ const _chatStoreOptions = {
         timestamp: new Date(now).toISOString(),
       }
 
-      this._recentUserInputs[`${tab}:${signature}`] = now
       if (this.processingByTab[tab]) {
         // Don't put in main chat — hold in this tab's queue, shown
         // above the input box. The queue is per-tab so a busy stream
@@ -5905,7 +5900,6 @@ const _chatStoreOptions = {
       this.branchViewByTab = {}
       this.branchOperationByTab = {}
       this.branchOperationErrorByTab = {}
-      this._recentUserInputs = {}
       this._branchResyncPendingByTab = {}
       this._streamingBranchByTab = {}
       this._pendingBranchPathByTab = {}

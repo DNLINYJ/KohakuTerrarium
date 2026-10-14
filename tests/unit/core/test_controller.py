@@ -724,6 +724,31 @@ class TestMaterializeInlineFile:
 
         assert not Path(first).exists()
 
+    @pytest.mark.parametrize("encoded", [False, True])
+    async def test_changed_derived_upload_gets_fresh_path_without_overwrite(
+        self, encoded
+    ):
+        env = TestAgentBuilder().with_llm_script(["x"]).build()
+        part = FilePart(
+            name="note.txt",
+            is_inline=True,
+            **(
+                {"data_base64": base64.b64encode(b"ORIGINAL").decode()}
+                if encoded
+                else {"content": "ORIGINAL"}
+            ),
+        )
+        first = Path(await env.controller._materialize_inline_file(part))
+        first.write_bytes(b"CHANGED")
+        second = Path(await env.controller._materialize_inline_file(part))
+        assert second.read_bytes() == b"ORIGINAL"
+        assert first.read_bytes() == b"CHANGED"
+        assert first != second
+        assert await env.controller._materialize_inline_file(part) == str(second)
+        env.controller.cleanup_inline_files()
+        assert not first.exists()
+        assert not second.exists()
+
     async def test_long_upload_name_still_materializes(self):
         from pathlib import Path
 
@@ -812,8 +837,17 @@ class TestResolveFilePart:
         assert written.success
         reread = await env.controller._resolve_file_part(part)
         reread_text = " ".join(getattr(p, "text", "") for p in reread)
-        assert "updated attachment" in reread_text
-        assert f"Path: {path}" in reread_text
+        assert "hello world" in reread_text
+        rebuilt_path = reread_text.split("Path: ", 1)[1].split()[0]
+        assert rebuilt_path != path
+        assert Path(path).read_text() == "updated attachment"
+        dynamic = await env.controller._resolve_file_part(
+            FilePart(name="working copy", path=path)
+        )
+        assert "updated attachment" in " ".join(p.text for p in dynamic)
+        assert guard.session_allowed_paths == frozenset(
+            {str(Path(path).resolve()), str(Path(rebuilt_path).resolve())}
+        )
 
         unrelated = tmp_path / "outside.txt"
         unrelated.write_text("must stay guarded")
@@ -826,6 +860,7 @@ class TestResolveFilePart:
 
         env.controller.cleanup_inline_files()
         assert not Path(path).exists()
+        assert not Path(rebuilt_path).exists()
         assert guard.session_allowed_paths == frozenset()
 
 
@@ -2414,6 +2449,29 @@ class TestResolveMessageFilesIdentity:
         assert msgs == original
         assert nested["content"] == "AAA"
         assert nested["extra"] == ["keep"]
+
+    async def test_replacing_referenced_occurrence_keeps_numeric_binding(self):
+        c = self._ctrl()
+        parts = [
+            {"type": "text", "text": "Read the referenced attachment: [[file:1]]"},
+            *[
+                _file_item(name="same.txt", content=value)
+                for value in ("FILE_A", "FILE_B", "FILE_C")
+            ],
+            {"type": "text", "text": "Another text block"},
+        ]
+        original = copy.deepcopy(parts)
+        for replacement in ("FILE_B", "FILE_B_REPLACED"):
+            parts[2]["file"]["content"] = replacement
+            out = await c._resolve_message_files([{"role": "user", "content": parts}])
+            text = _joined_text(out[0]["content"])
+            assert (
+                text.index("Read the referenced attachment:")
+                < text.index(replacement)
+                < text.index("FILE_A")
+                < text.index("FILE_C")
+            )
+        assert original[2]["file"]["content"] == "FILE_B"
 
     async def test_same_name_different_bytes_use_distinct_tempfiles(self):
         c = self._ctrl()

@@ -27,6 +27,46 @@ export function formatBytes(bytes) {
   return bytes + " B"
 }
 
+const FILE_PLACEHOLDER_RE = /\[\[file:([^\]]+)\]\]/g
+export function parseFilePlaceholderOrdinal(ref, fileCount) {
+  if (!/^\p{Decimal_Number}+$/u.test(ref)) return null
+  let value = 0
+  for (const ch of ref) {
+    const code = ch.codePointAt(0)
+    let zero = code
+    while (/\p{Decimal_Number}/u.test(String.fromCodePoint(zero - 1))) zero--
+    value = value * 10 + ((code - zero) % 10)
+    if (value >= fileCount) return null
+  }
+  return value
+}
+
+function placeholderRefsInTexts(texts) {
+  const refs = []
+  for (const text of texts) {
+    if (typeof text !== "string" || !text) continue
+    FILE_PLACEHOLDER_RE.lastIndex = 0
+    let match
+    while ((match = FILE_PLACEHOLDER_RE.exec(text))) refs.push(match[1])
+  }
+  return refs
+}
+
+function assertNumericPlaceholderBindings(oldTexts, newTexts, oldFiles, newFiles) {
+  const oldRefs = new Set(placeholderRefsInTexts(oldTexts))
+  const newRefs = new Set(placeholderRefsInTexts(newTexts))
+  const shared = [...oldRefs].filter((ref) => newRefs.has(ref))
+  const resolve = (ref, files) => {
+    const idx = parseFilePlaceholderOrdinal(ref, files.length)
+    return idx == null ? null : files[idx]
+  }
+  for (const ref of shared) {
+    if (resolve(ref, oldFiles) !== resolve(ref, newFiles)) {
+      throw new Error("Attachment changes would rebind an existing numeric file reference")
+    }
+  }
+}
+
 function isAttachmentPart(part) {
   return part?.type === "image_url" || part?.type === "file"
 }
@@ -99,6 +139,7 @@ export async function buildEditedMessageParts(sourceContent, draftText, attachme
   }
 
   const parts = []
+  const newFiles = []
   for (let originalIndex = 0; originalIndex < sourceContent.length; originalIndex++) {
     const part = sourceContent[originalIndex]
     if (part?.type === "text") {
@@ -114,17 +155,22 @@ export async function buildEditedMessageParts(sourceContent, draftText, attachme
     if (isAttachmentPart(part)) {
       const replacement = keptByOriginal.get(originalIndex)
       if (!replacement) continue
+      let nextPart
       if (replacement.existingPart && !replacement.file) {
-        parts.push(clonePart(replacement.existingPart))
+        nextPart = clonePart(replacement.existingPart)
       } else {
-        parts.push(await attachmentToPart(replacement))
+        nextPart = await attachmentToPart(replacement)
       }
+      if (nextPart?.type === "file") newFiles.push(originalIndex)
+      parts.push(nextPart)
       continue
     }
     parts.push(clonePart(part))
   }
   for (const attachment of appended) {
-    parts.push(await attachmentToPart(attachment))
+    const part = await attachmentToPart(attachment)
+    if (part?.type === "file") newFiles.push(Symbol("new file"))
+    parts.push(part)
   }
   if (
     !textRestricted &&
@@ -134,6 +180,15 @@ export async function buildEditedMessageParts(sourceContent, draftText, attachme
   ) {
     parts.push({ type: "text", text: draftText })
   }
+  const oldFiles = []
+  sourceContent.forEach((part, originalIndex) => {
+    if (part?.type === "file") oldFiles.push(originalIndex)
+  })
+  const oldTexts = sourceContent
+    .filter((part) => part?.type === "text")
+    .map((part) => part.text || "")
+  const newTexts = parts.filter((part) => part?.type === "text").map((part) => part.text || "")
+  assertNumericPlaceholderBindings(oldTexts, newTexts, oldFiles, newFiles)
   return parts
 }
 
