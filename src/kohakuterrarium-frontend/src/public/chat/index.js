@@ -5,6 +5,7 @@ export {
   MAX_ATTACHMENT_BYTES,
   MAX_IMAGE_BYTES,
   attachmentToPart,
+  buildEditedMessageParts,
   buildMessageParts,
   contentToEditableDraft,
   detectAttachmentKind,

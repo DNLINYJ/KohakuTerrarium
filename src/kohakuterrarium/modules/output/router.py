@@ -150,9 +150,7 @@ class OutputRouter(OutputRouterParseEventMixin, OutputRouterInteractiveMixin):
             case "processing_end":
                 await self.on_processing_end()
             case "user_input":
-                content = event.content
-                if isinstance(content, str):
-                    await self.on_user_input(content)
+                await self._fan_event_to_outputs(event)
             case "assistant_image":
                 payload = event.payload
                 self._handle_assistant_image(

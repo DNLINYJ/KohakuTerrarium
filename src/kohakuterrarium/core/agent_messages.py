@@ -31,7 +31,7 @@ from kohakuterrarium.core.compact_branch import (
 )
 from kohakuterrarium.core.events import EventType, TriggerEvent
 from kohakuterrarium.errors import ConflictError
-from kohakuterrarium.llm.message import normalize_content_parts
+from kohakuterrarium.llm.message import content_parts_to_dicts, normalize_content_parts
 from kohakuterrarium.session.history import replay_conversation
 from kohakuterrarium.session.snapshot import save_agent_snapshot
 from kohakuterrarium.session.raw_history import (
@@ -113,6 +113,7 @@ class AgentMessagesMixin:
                 turn_index=turn_index,
                 user_position=user_position,
                 branch_view=branch_view,
+                request_id=request_id,
             )
             return
 
@@ -195,7 +196,10 @@ class AgentMessagesMixin:
                 append_user_event_pair,
                 self.session_store,
                 self.config.name,
-                {"content": prev_content},
+                {
+                    "content": prev_content,
+                    **({"request_id": request_id} if request_id else {}),
+                },
                 self._turn_index,
                 self._branch_id,
                 ppath,
@@ -367,7 +371,14 @@ class AgentMessagesMixin:
                 append_user_event_pair,
                 self.session_store,
                 self.config.name,
-                {"content": new_content},
+                {
+                    "content": (
+                        content_parts_to_dicts(new_content)
+                        if isinstance(new_content, list)
+                        else new_content
+                    ),
+                    **({"request_id": request_id} if request_id else {}),
+                },
                 self._turn_index,
                 self._branch_id,
                 ppath,

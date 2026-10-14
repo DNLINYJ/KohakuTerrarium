@@ -23,6 +23,8 @@ function createDrafts() {
           editing: false,
           editText: "",
           editAttachments: [],
+          editSourceContent: null,
+          editTextRestricted: false,
           editSaving: false,
           editError: "",
         }),

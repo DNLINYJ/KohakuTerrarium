@@ -120,8 +120,9 @@ class AgentEventLoopMixin:
                     except asyncio.CancelledError:
                         self._reject_run(run, status="interrupted")
                         raise
-                    except Exception:
+                    except Exception as e:
                         logger.error("Turn crashed in event consumer", exc_info=True)
+                        self._record_rerun_execution_error(run[0].event, e)
                         self._reject_run(run, status="error")
         except asyncio.CancelledError:
             pass
@@ -249,13 +250,14 @@ class AgentEventLoopMixin:
             and self.output_router is not None
             and not is_pure_rerun
         ):
-            content = (
-                primary.get_text_content()
-                if hasattr(primary, "is_multimodal") and primary.is_multimodal()
-                else (primary.content or "")
-            )
+            content = _to_serializable_content(primary.content)
+            payload = {"turn_index": self._turn_index, "branch_id": self._branch_id}
+            if pending_id := pending_id_of(primary):
+                payload["pending_id"] = pending_id
+            if request_id := primary.context.get("request_id"):
+                payload["request_id"] = request_id
             await self.output_router.emit(
-                OutputEvent(type="user_input", content=content)
+                OutputEvent(type="user_input", content=content, payload=payload)
             )
 
         if self.plugins is not None:
@@ -426,11 +428,26 @@ class AgentEventLoopMixin:
             "origin_known": pure_feedback or not carries_results,
         }
 
+    def _clear_rerun_execution_error(self, event) -> None:
+        """Drop a prior accepted-rerun error once a new rerun starts executing."""
+        if event.context.get("rerun"):
+            self._branch_execution_error = None
+
+    def _record_rerun_execution_error(self, event, exc: BaseException) -> None:
+        """Bind an accepted rerun's failure to the request that opened the branch."""
+        if not event.context.get("rerun"):
+            return
+        self._branch_execution_error = (
+            event.context.get("request_id"),
+            str(exc),
+        )
+
     async def _process_batch_with_controller(self, events: list, controller) -> None:
         """Push the whole stackable run to the controller (one combined
         ``role=user`` message) and drive the controller loop. Cancellable
         via ``interrupt()``."""
         primary = events[0]
+        self._clear_rerun_execution_error(primary)
         self._prepare_processing_cycle(primary, controller)
         # The controller turns this batch into one user message; declare the
         # branch it is written on so a later compaction can attribute its text.
@@ -463,6 +480,7 @@ class AgentEventLoopMixin:
         except Exception as e:
             error_type = type(e).__name__
             error_msg = str(e)
+            self._record_rerun_execution_error(primary, e)
             logger.error("Processing error", error_type=error_type, error=error_msg)
             self.output_router.notify_activity(
                 "processing_error",

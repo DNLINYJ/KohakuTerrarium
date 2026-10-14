@@ -270,6 +270,31 @@ class TestActivityDispatch:
 
 
 class TestLifecycle:
+    async def test_user_input_keeps_ordered_content_and_request_identity_for_observers(
+        self,
+    ):
+        class EventOutput(OutputRecorder):
+            async def emit(self, event):
+                self.observed = event
+                await super().emit(event)
+
+        secondary = EventOutput()
+        router, default = _router()
+        router.add_secondary(secondary)
+        content = [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,YQ=="}},
+            {"type": "text", "text": ""},
+        ]
+        event = OutputEvent(
+            type="user_input",
+            content=content,
+            payload={"request_id": "edit-1", "turn_index": 1, "branch_id": 2},
+        )
+        await router.emit(event)
+        assert secondary.observed.content == content
+        assert secondary.observed.payload == event.payload
+        assert len(default.events) == 1
+
     async def test_start_stop_cascade_to_named_outputs(self):
         named = OutputRecorder()
         router, default = _router(named_outputs={"x": named})

@@ -5,6 +5,12 @@ function clonePart(part) {
   return JSON.parse(JSON.stringify(part || {}))
 }
 
+function cloneContent(content) {
+  if (typeof content === "string") return content
+  if (!Array.isArray(content)) return content
+  return JSON.parse(JSON.stringify(content))
+}
+
 function partName(part) {
   if (part?.type === "image_url") {
     return part.meta?.source_name || part.meta?.revised_prompt || "image"
@@ -21,28 +27,114 @@ export function formatBytes(bytes) {
   return bytes + " B"
 }
 
-export function contentToEditableDraft(content) {
-  if (typeof content === "string") {
-    return { text: content, attachments: [] }
-  }
-  if (!Array.isArray(content)) {
-    return { text: "", attachments: [] }
-  }
+function isAttachmentPart(part) {
+  return part?.type === "image_url" || part?.type === "file"
+}
 
-  const text = content
+function mergedTextFromContent(content) {
+  return content
     .filter((part) => part?.type === "text")
     .map((part) => part.text || "")
     .join("\n")
-  const attachments = content
-    .filter((part) => part?.type === "image_url" || part?.type === "file")
-    .map((part, index) => ({
-      id: `existing_${index}_${partName(part)}`,
+}
+
+export function contentToEditableDraft(content) {
+  if (typeof content === "string") {
+    return {
+      text: content,
+      attachments: [],
+      sourceContent: content,
+      textRestricted: false,
+    }
+  }
+  if (!Array.isArray(content)) {
+    return { text: "", attachments: [], sourceContent: content, textRestricted: false }
+  }
+
+  const sourceContent = cloneContent(content)
+  const textParts = sourceContent.filter((part) => part?.type === "text")
+  const attachments = []
+  sourceContent.forEach((part, originalIndex) => {
+    if (!isAttachmentPart(part)) return
+    attachments.push({
+      id: `existing_${originalIndex}_${partName(part)}`,
       name: partName(part),
       kind: part.type === "image_url" ? "image" : "file",
+      originalIndex,
       existingPart: clonePart(part),
-    }))
+    })
+  })
 
-  return { text, attachments }
+  return {
+    text: mergedTextFromContent(sourceContent),
+    attachments,
+    sourceContent,
+    textRestricted: textParts.length > 1,
+  }
+}
+
+export async function buildEditedMessageParts(sourceContent, draftText, attachments = []) {
+  if (typeof sourceContent === "string" || !Array.isArray(sourceContent)) {
+    return buildMessageParts(draftText, attachments)
+  }
+
+  const textParts = []
+  sourceContent.forEach((part, originalIndex) => {
+    if (part?.type === "text") textParts.push({ part, originalIndex })
+  })
+  const merged = mergedTextFromContent(sourceContent)
+  const textRestricted = textParts.length > 1
+  if (textRestricted && draftText !== merged) {
+    throw new Error("Merged text editing is disabled for multi-text messages")
+  }
+
+  const keptByOriginal = new Map()
+  const appended = []
+  for (const attachment of attachments) {
+    if (Number.isInteger(attachment?.originalIndex) && attachment.originalIndex >= 0) {
+      keptByOriginal.set(attachment.originalIndex, attachment)
+    } else {
+      appended.push(attachment)
+    }
+  }
+
+  const parts = []
+  for (let originalIndex = 0; originalIndex < sourceContent.length; originalIndex++) {
+    const part = sourceContent[originalIndex]
+    if (part?.type === "text") {
+      if (textRestricted) {
+        parts.push(clonePart(part))
+        continue
+      }
+      const next = clonePart(part)
+      next.text = typeof draftText === "string" ? draftText : part.text || ""
+      parts.push(next)
+      continue
+    }
+    if (isAttachmentPart(part)) {
+      const replacement = keptByOriginal.get(originalIndex)
+      if (!replacement) continue
+      if (replacement.existingPart && !replacement.file) {
+        parts.push(clonePart(replacement.existingPart))
+      } else {
+        parts.push(await attachmentToPart(replacement))
+      }
+      continue
+    }
+    parts.push(clonePart(part))
+  }
+  for (const attachment of appended) {
+    parts.push(await attachmentToPart(attachment))
+  }
+  if (
+    !textRestricted &&
+    textParts.length === 0 &&
+    typeof draftText === "string" &&
+    draftText.trim()
+  ) {
+    parts.push({ type: "text", text: draftText })
+  }
+  return parts
 }
 
 export async function imageFileToPart(file) {

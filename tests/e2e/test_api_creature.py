@@ -488,10 +488,31 @@ class TestApiCreatureJourney:
                 if e.get("type") == "user_message"
                 and e.get("content") == "long turn now"
             )
+            replacement_parts = [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,YQ=="},
+                    "meta": {"source_name": "kept.png"},
+                },
+                {
+                    "type": "text",
+                    "text": "replacement after interrupt",
+                    "vendor": "keep",
+                },
+                {
+                    "type": "file",
+                    "file": {
+                        "name": "kept.txt",
+                        "content": "e2e bytes",
+                        "is_inline": True,
+                    },
+                },
+            ]
             edited = client.post(
                 f"/api/sessions/{session_id}/creatures/{creature_id}/messages/0/edit",
                 json={
-                    "content": "replacement after interrupt",
+                    "content": replacement_parts,
+                    "request_id": "m1b-e2e-edit",
                     "target": {
                         key: target[key]
                         for key in ("event_id", "turn_index", "branch_id")
@@ -499,6 +520,28 @@ class TestApiCreatureJourney:
                 },
             )
             assert edited.status_code == 200, edited.text
+            assert edited.json()["request_id"] == "m1b-e2e-edit"
+            assert edited.json()["execution_error"] is None
+            edit_events = client.get(
+                f"/api/sessions/{session_id}/creatures/{creature_id}/history"
+            ).json()["events"]
+            assert (
+                next(
+                    event
+                    for event in edit_events
+                    if event.get("type") == "user_message"
+                    and event.get("request_id") == "m1b-e2e-edit"
+                )["content"]
+                == replacement_parts
+            )
+            assert (
+                next(
+                    event
+                    for event in edit_events
+                    if event.get("event_id") == target["event_id"]
+                )
+                == target
+            )
             replayed = _snapshot_messages(client, session_id, creature_id)
             assert replayed[-1]["content"] == "Edited turn completed."
             for message in replayed:

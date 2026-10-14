@@ -596,6 +596,19 @@ class TestRegenerateNonTailTurn:
         # _rerun_from_last invoked via edit_and_rerun.
         assert agent._rerun_calls
 
+    async def test_regenerate_turn_index_forwards_request_id(self, agent):
+        agent._apply_user_input("u1")
+        agent._emit_assistant("a1")
+        agent._apply_user_input("u2")
+        agent._emit_assistant("a2")
+        await agent.regenerate_last_response(turn_index=1, request_id="retry-turn")
+        assert agent._rerun_calls[-1].context.get("request_id") == "retry-turn"
+        assert any(
+            event.get("request_id") == "retry-turn"
+            for event in agent.session_store.get_events(agent.config.name)
+            if event["type"] == "user_message"
+        )
+
 
 class TestReloadConversationUnderBranchView:
     async def test_no_store_no_op(self, agent):

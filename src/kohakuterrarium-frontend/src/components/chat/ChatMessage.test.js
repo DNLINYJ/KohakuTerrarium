@@ -5,16 +5,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import ChatMessage from "./ChatMessage.vue"
 import { useChatStore } from "@/stores/chat"
 
-vi.mock("@/utils/chatAttachments", () => ({
-  buildMessageParts: async (text) => text,
-  contentToEditableDraft: (content) => ({
-    text: typeof content === "string" ? content : "",
-    attachments: [],
-  }),
-  formatBytes: (size) => String(size),
-  MAX_ATTACHMENT_BYTES: 10_000,
-  MAX_IMAGE_BYTES: 10_000,
-}))
+vi.mock("@/utils/chatAttachments", async (importOriginal) => {
+  const actual = await importOriginal()
+  return {
+    ...actual,
+    formatBytes: (size) => String(size),
+    MAX_ATTACHMENT_BYTES: 10_000,
+    MAX_IMAGE_BYTES: 10_000,
+  }
+})
 
 function mountMessage(store, pinia) {
   const message = {
@@ -222,7 +221,7 @@ describe("ChatMessage branch operations", () => {
 
     expect(editSpy).toHaveBeenCalledWith(
       0,
-      "updated draft",
+      [{ type: "text", text: "updated draft" }],
       expect.objectContaining({ tabId: "main" }),
     )
   })
@@ -319,5 +318,50 @@ describe("ChatMessage branch operations", () => {
     ])
 
     expect(wrapper.find("img").exists()).toBe(false)
+  })
+
+  it("saves an unedited multimodal row as the original ordered parts", async () => {
+    const store = useChatStore()
+    store._instanceId = "instance"
+    const original = [
+      {
+        type: "image_url",
+        image_url: { url: "file:///tmp/a.png" },
+        meta: { source_name: "a.png" },
+      },
+      { type: "text", text: "caption", extra: { keep: true } },
+      { type: "file", file: { name: "note.txt", path: "/workspace/note.txt" } },
+    ]
+    const message = {
+      role: "user",
+      content: original,
+      contentParts: original,
+      turnIndex: 1,
+      branchId: 1,
+      latestBranch: 1,
+      userPosition: 0,
+    }
+    store.messagesByTab.main = [message]
+    store.activeTab = "main"
+    const editSpy = vi.spyOn(store, "editMessage").mockResolvedValue({ ok: true })
+    const wrapper = mount(ChatMessage, {
+      props: { message, messageIdx: 0, tabId: "main" },
+      global: {
+        plugins: [pinia],
+        stubs: {
+          MarkdownRenderer: true,
+          ToolCallBlock: true,
+          ToolBatchGroup: true,
+          UIEventBlock: true,
+          ContentParts: true,
+        },
+      },
+    })
+
+    await wrapper.get('[aria-label="Edit and rerun message"]').trigger("click")
+    await wrapper.get('[aria-label="Save and rerun"]').trigger("click")
+
+    expect(editSpy).toHaveBeenCalledWith(0, original, expect.objectContaining({ tabId: "main" }))
+    expect(original[1].text).toBe("caption")
   })
 })

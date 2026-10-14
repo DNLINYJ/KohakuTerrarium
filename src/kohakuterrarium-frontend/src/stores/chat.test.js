@@ -2493,7 +2493,7 @@ describe("chat store — turn/branch model (regen / edit+rerun)", () => {
 })
 
 describe("chat store — multimodal edit + branch resync", () => {
-  it("dedupes live multimodal user echoes by full content signature", () => {
+  it("dedupes live multimodal user echoes by request identity", () => {
     const chat = useChatStore()
     chat.messagesByTab = { main: [] }
 
@@ -2502,8 +2502,8 @@ describe("chat store — multimodal edit + branch resync", () => {
       { type: "image_url", image_url: { url: "data:image/png;base64,abc", detail: "low" } },
     ]
 
-    chat._handleUserInput("main", { content: payload })
-    chat._handleUserInput("main", { content: payload })
+    chat._handleUserInput("main", { content: payload, pending_id: "c_echo" })
+    chat._handleUserInput("main", { content: payload, pending_id: "c_echo" })
 
     expect(chat.messagesByTab.main).toHaveLength(1)
     expect(chat.messagesByTab.main[0].contentParts).toHaveLength(2)

@@ -2,8 +2,14 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from kohakuterrarium.core.token_ledger import ledger_for
-from kohakuterrarium.terrarium.service_dto import CreatureInfo, creature_to_info
+from kohakuterrarium.terrarium.service_dto import (
+    CreatureInfo,
+    completed_branch_result,
+    creature_to_info,
+)
 from kohakuterrarium.testing.terrarium import _FakeAgent
 
 
@@ -19,6 +25,29 @@ def _creature(agent) -> SimpleNamespace:
         send_channels=[],
         agent=agent,
     )
+
+
+class TestCompletedBranchResult:
+    @pytest.mark.parametrize("request_id", ["expected", "other", None])
+    def test_failure_is_bound_to_one_request_and_preserves_branch_selection(
+        self, request_id
+    ):
+        agent = SimpleNamespace(
+            _turn_index=3,
+            _branch_id=2,
+            _parent_branch_path=((1, 2), (2, 1)),
+            _branch_execution_error=("expected", "missing media"),
+        )
+        result = completed_branch_result(agent, request_id)
+        assert result["turn_index"] == 3
+        assert result["branch_id"] == 2
+        assert result["parent_branch_path"] == [[1, 2], [2, 1]]
+        assert result["request_id"]
+        assert result.get("execution_error") == (
+            "missing media" if request_id == "expected" else None
+        )
+        result["parent_branch_path"][0][1] = 99
+        assert agent._parent_branch_path == ((1, 2), (2, 1))
 
 
 class TestCreatureToInfoUsage:

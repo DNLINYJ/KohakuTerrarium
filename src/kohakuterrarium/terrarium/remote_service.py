@@ -144,6 +144,11 @@ def _branch_mutation_result(body: dict[str, Any]) -> BranchMutationResult:
     try:
         return {
             "status": "completed",
+            **(
+                {"execution_error": str(body["execution_error"])}
+                if body.get("execution_error")
+                else {}
+            ),
             "request_id": (
                 str(body["request_id"]) if body.get("request_id") is not None else None
             ),

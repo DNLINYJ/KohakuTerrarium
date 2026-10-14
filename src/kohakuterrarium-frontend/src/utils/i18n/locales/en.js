@@ -633,6 +633,10 @@ export default {
   "chat.pendingShow": "show",
   "chat.attachFile": "Attach file",
   "chat.attachImage": "Attach image",
+  "chat.replaceAttachment": ({ name }) => `Replace ${name}`,
+  "chat.removeAttachment": ({ name }) => `Remove ${name}`,
+  "chat.editMergedTextDisabled":
+    "This message has multiple interleaved text blocks. Merged text editing is disabled; you can still change attachments or save unchanged.",
   "chat.moreActions": "More actions",
   "chat.toolBatchHeader": ({ count }) => `${count} tool calls`,
   "chat.toolBatchExpand": "Expand tool calls",

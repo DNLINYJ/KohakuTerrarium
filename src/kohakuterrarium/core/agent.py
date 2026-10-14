@@ -190,6 +190,7 @@ class Agent(
         self._processing_task: asyncio.Task | None = None
         self._turn_completion: asyncio.Future[None] | None = None
         self._branch_request_id: str | None = None
+        self._branch_execution_error: tuple[str | None, str] | None = None
 
         self._active_handles: dict[str, Any] = {}
         self._direct_job_meta: dict[str, dict[str, Any]] = {}
