@@ -54,6 +54,7 @@ from kohakuterrarium.packages.locations import ensure_local_project
 from kohakuterrarium.studio.catalog.packages_scan import scan_creatures_in_dirs
 from kohakuterrarium.session.embedding import BaseEmbedder
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.session.resource_gate import GATE, try_fast
 from kohakuterrarium.studio.identity import grok_subscription
 from kohakuterrarium.studio.persistence import store as _persistence_store_mod
 from kohakuterrarium.studio.persistence.session_index import close_session_index
@@ -1716,8 +1717,24 @@ class TestStudioIntegration:
             assert mem["count"] >= 1
             # The search is done — the file must be releasable. With the
             # leak this delete raises PermissionError on Windows.
-            removed = studio.persistence.delete(saved_stem)
+            admission = try_fast(saved_path, eligible=True)
+            assert admission.lease is not None, admission.reason
+            deleting = asyncio.create_task(
+                asyncio.to_thread(studio.persistence.delete, saved_stem)
+            )
+            try:
+                deadline = asyncio.get_running_loop().time() + 5
+                while GATE.snapshot(saved_path).legacy_pending == 0:
+                    assert asyncio.get_running_loop().time() < deadline
+                    await asyncio.sleep(0.01)
+                assert saved_path.exists()
+                assert not deleting.done()
+            finally:
+                admission.lease.finish(source_released=True)
+            removed = await deleting
+            assert saved_path in removed
             assert all(not p.exists() for p in removed)
+            assert not GATE.snapshot(saved_path).registered
 
     async def test_drive_settings_resolver_and_service_lifecycle(
         self, scripted_llm, isolated_paths

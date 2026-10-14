@@ -18,6 +18,12 @@ from kohakuterrarium.laboratory.adapters.file_scopes import (
     resolve_in_scope,
     resolve_scope_root,
 )
+from kohakuterrarium.laboratory.adapters.terrarium_file_mutations import (
+    replace_enrolled,
+    run_mutation_worker,
+    unlink_enrolled,
+    write_bytes_enrolled,
+)
 from kohakuterrarium.laboratory.protocols import LabRegistrar
 from kohakuterrarium.terrarium.engine import Terrarium
 from kohakuterrarium.utils.logging import get_logger
@@ -225,8 +231,7 @@ class TerrariumFilesAdapter:
                 raise ScopeError(
                     f"expect_hash mismatch: file at {scope}/{rel} has sha256 {actual}"
                 )
-        async with aiofiles.open(target, "wb") as f:
-            await f.write(data)
+        await run_mutation_worker(write_bytes_enrolled, target, data)
         return {"written": len(data), "sha256": _hash_bytes(data)}
 
     async def _op_write_begin(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -315,7 +320,12 @@ class TerrariumFilesAdapter:
             await self._cleanup_after_commit(transfer_id, transfer.staging)
             return {"written": transfer.received, "sha256": actual_sha}
         try:
-            await asyncio.to_thread(os.replace, transfer.staging, transfer.target)
+            await run_mutation_worker(
+                replace_enrolled,
+                transfer.staging,
+                transfer.target,
+                on_success=lambda: self._transfers.pop(transfer_id, None),
+            )
         except PermissionError as exc:
             # Windows may lock a resumed session target; retain idempotent success.
             if not transfer.target.exists():
@@ -380,9 +390,11 @@ class TerrariumFilesAdapter:
         if not target.exists():
             raise FileNotFoundError(f"no such path: {scope}/{rel}")
         if target.is_dir():
+            # Directory occupancy is deferred: a recursive scan cannot
+            # enroll nested identities without racing concurrent creates.
             await asyncio.to_thread(shutil.rmtree, target)
         else:
-            await asyncio.to_thread(target.unlink)
+            await run_mutation_worker(unlink_enrolled, target)
         return {}
 
     async def _op_getcwd(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -446,7 +458,7 @@ class TerrariumFilesAdapter:
                     final_path.parent.mkdir, parents=True, exist_ok=True
                 )
                 try:
-                    await asyncio.to_thread(os.replace, stage_path, final_path)
+                    await run_mutation_worker(replace_enrolled, stage_path, final_path)
                 except OSError as e:
                     # Preserve the committed prefix in the error response.
                     commit_error = f"failed to commit {rel!r}: {e}"

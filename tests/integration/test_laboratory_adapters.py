@@ -26,9 +26,12 @@ in-process so coverage instrumentation captures their execution.
 """
 
 import asyncio
+import hashlib
+import os
 
 import pytest
 
+from kohakuterrarium.session.resource_gate import GATE, try_fast
 from kohakuterrarium.studio.catalog.packages_scan import invalidate_scan_caches
 
 from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
@@ -138,8 +141,6 @@ class TestTerrariumFilesAdapter:
             engine = Terrarium(session_dir=str(tmp_path / "w-files-sess"))
             # Files adapter needs config:// resolver — point KT_CONFIG_DIR
             # at the worker's config dir.
-            import os
-
             old_config_dir = os.environ.get("KT_CONFIG_DIR")
             worker_cfg_dir = tmp_path / "w-files-cfg"
             worker_cfg_dir.mkdir(parents=True, exist_ok=True)
@@ -210,29 +211,31 @@ class TestTerrariumFilesAdapter:
                     },
                     timeout=5.0,
                 )
-                if "error" not in (resp or {}):
-                    upload_id = (
-                        resp.get("upload_id") or resp.get("stream_id") or resp.get("id")
-                    )
-                    if upload_id:
-                        await host.request(
-                            to_node="w-files",
-                            namespace="terrarium.files",
-                            type="write_chunk",
-                            body={
-                                "upload_id": upload_id,
-                                "data_b64": "aGVsbG8gd29ybGQ=",
-                                "offset": 0,
-                            },
-                            timeout=5.0,
-                        )
-                        await host.request(
-                            to_node="w-files",
-                            namespace="terrarium.files",
-                            type="write_commit",
-                            body={"upload_id": upload_id},
-                            timeout=5.0,
-                        )
+                transfer_id = resp["transfer_id"]
+                chunk = await host.request(
+                    to_node="w-files",
+                    namespace="terrarium.files",
+                    type="write_chunk",
+                    body={
+                        "transfer_id": transfer_id,
+                        "bytes_b64": "aGVsbG8gd29ybGQ=",
+                        "seq": 0,
+                    },
+                    timeout=5.0,
+                )
+                assert chunk == {"received": 11}
+                committed = await host.request(
+                    to_node="w-files",
+                    namespace="terrarium.files",
+                    type="write_commit",
+                    body={"transfer_id": transfer_id},
+                    timeout=5.0,
+                )
+                assert committed == {
+                    "written": 11,
+                    "sha256": hashlib.sha256(b"hello world").hexdigest(),
+                }
+                assert (worker_cfg_dir / "chunked.bin").read_bytes() == b"hello world"
 
                 # write_abort — verb 8 (start + abort a new stream)
                 resp = await host.request(
@@ -246,18 +249,17 @@ class TestTerrariumFilesAdapter:
                     },
                     timeout=5.0,
                 )
-                if isinstance(resp, dict) and "error" not in resp:
-                    upload_id = (
-                        resp.get("upload_id") or resp.get("stream_id") or resp.get("id")
-                    )
-                    if upload_id:
-                        await host.request(
-                            to_node="w-files",
-                            namespace="terrarium.files",
-                            type="write_abort",
-                            body={"upload_id": upload_id},
-                            timeout=5.0,
-                        )
+                aborted_id = resp["transfer_id"]
+                aborted = await host.request(
+                    to_node="w-files",
+                    namespace="terrarium.files",
+                    type="write_abort",
+                    body={"transfer_id": aborted_id},
+                    timeout=5.0,
+                )
+                assert aborted == {}
+                assert not (worker_cfg_dir / "aborted.bin").exists()
+                assert not list(worker_cfg_dir.glob(".staging-stream-*"))
 
                 # delete — verb 9
                 await host.request(
@@ -293,23 +295,57 @@ class TestTerrariumFilesAdapter:
                     type="push_bundle",
                     body={
                         "scope": "config://",
-                        "target_dir": "bundle-test",
-                        "files": [
-                            {
-                                "path": "a.txt",
-                                "content_b64": "aGVsbG8=",  # "hello"
-                            },
-                            {
-                                "path": "subdir/b.txt",
-                                "content_b64": "d29ybGQ=",  # "world"
-                            },
-                        ],
+                        "files": {
+                            "bundle-test/a.txt": [
+                                hashlib.sha256(b"hello").hexdigest(),
+                                "aGVsbG8=",
+                            ],
+                            "bundle-test/subdir/b.txt": [
+                                hashlib.sha256(b"world").hexdigest(),
+                                "d29ybGQ=",
+                            ],
+                        },
                     },
                     timeout=10.0,
                 )
-                # Bundle response shape varies; just ensure it
-                # round-tripped without a connection error.
-                assert bundle_resp is not None
+                assert bundle_resp == {
+                    "deployed": ["bundle-test/a.txt", "bundle-test/subdir/b.txt"],
+                    "conflicts": [],
+                }
+                assert (worker_cfg_dir / "bundle-test/a.txt").read_bytes() == b"hello"
+                assert (
+                    worker_cfg_dir / "bundle-test/subdir/b.txt"
+                ).read_bytes() == b"world"
+                assert not (worker_cfg_dir / "test.txt").exists()
+                target = worker_cfg_dir / "gated.kohakutr"
+                for operation in ("write", "delete"):
+                    admission = try_fast(target, eligible=True)
+                    assert admission.lease is not None
+                    body = {"scope": "config://", "path": target.name}
+                    if operation == "write":
+                        body["bytes_b64"] = "aGVsbG8="
+                    request = asyncio.create_task(
+                        host.request(
+                            to_node="w-files",
+                            namespace="terrarium.files",
+                            type=operation,
+                            body=body,
+                            timeout=10.0,
+                        )
+                    )
+                    try:
+                        deadline = asyncio.get_running_loop().time() + 5
+                        while GATE.snapshot(target).legacy_pending == 0:
+                            assert asyncio.get_running_loop().time() < deadline
+                            await asyncio.sleep(0.01)
+                        assert not request.done()
+                        assert target.exists() == (operation == "delete")
+                    finally:
+                        admission.lease.finish(source_released=True)
+                    result = await request
+                    assert "error" not in result
+                    assert target.exists() == (operation == "write")
+                    assert not GATE.snapshot(target).registered
             finally:
                 if old_config_dir is None:
                     os.environ.pop("KT_CONFIG_DIR", None)
