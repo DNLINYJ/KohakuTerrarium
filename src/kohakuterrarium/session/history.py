@@ -10,8 +10,11 @@ from kohakuterrarium.core.compact_branch import (
     compact_rule_from_event,
 )
 from kohakuterrarium.core.job_label import canonical_tool_name, make_job_label
-from kohakuterrarium.llm.antigravity_format import replay_target
-from kohakuterrarium.llm.message import ASSISTANT_STATE_KEYS
+from kohakuterrarium.session.assistant_history import (
+    _coerce_tool_args_to_json,
+    project_assistant_rounds,
+    replay_assistant_event,
+)
 
 # Parent paths identify the selected branches of earlier turns. Legacy events
 # derive this ancestry from event order when no explicit path was persisted.
@@ -575,17 +578,28 @@ def replay_conversation(
 
     messages: list[dict[str, Any]] = []
     text_buf: list[str] = []
+    merge_image = False
+    canonical_target = None
     # A turn/branch owns exactly one user_message. Graph merge and
     # migration can copy the same event twice; duplicate user messages
     # would break turn-targeted edit resolution and pollute the view.
     seen_user_messages: set[tuple[int, int]] = set()
 
     def _flush_text() -> None:
+        nonlocal merge_image
         if not text_buf:
             return
         content = "".join(text_buf)
         if content:
-            messages.append({"role": "assistant", "content": content})
+            if (
+                merge_image
+                and messages
+                and isinstance(messages[-1].get("content"), list)
+            ):
+                messages[-1]["content"].append({"type": "text", "text": content})
+            else:
+                messages.append({"role": "assistant", "content": content})
+            merge_image = True
         text_buf.clear()
 
     def _flush_pending_summaries(
@@ -632,7 +646,17 @@ def replay_conversation(
             # the next rule; it may apply to this branch right now.
             i += 1
 
-    for evt in events_list:
+    eligible_ids = live_ids - {
+        evt.get("event_id")
+        for evt in events_list
+        if _covered_by_replace(
+            evt.get("event_id"),
+            evt.get("turn_index"),
+            evt.get("branch_id"),
+            replaced_rules,
+        )
+    }
+    for evt in project_assistant_rounds(events_list, eligible_ids):
         etype = evt.get("type", "")
         eid = evt.get("event_id")
 
@@ -664,7 +688,18 @@ def replay_conversation(
                 text_buf.append(chunk)
             continue
 
+        if etype in {
+            "processing_start",
+            "processing_complete",
+            "assistant_round_start",
+        }:
+            _flush_text()
+            merge_image = False
+            canonical_target = None
+            continue
         if etype in (
+            "assistant_round_display",
+            "assistant_round_end",
             "compact_start",
             "compact_complete",
             "compact_skipped",
@@ -684,6 +719,7 @@ def replay_conversation(
         _flush_text()
 
         if etype == "user_message":
+            canonical_target = None
             ti = evt.get("turn_index")
             bi = evt.get("branch_id")
             if isinstance(ti, int) and isinstance(bi, int):
@@ -732,42 +768,16 @@ def replay_conversation(
             messages.append(message)
         elif etype == "system_prompt_set":
             messages.append({"role": "system", "content": evt.get("content", "")})
-        elif etype == "assistant_reasoning":
-            target = next(
-                (
-                    message
-                    for message in reversed(messages)
-                    if message.get("role") == "assistant"
-                ),
-                None,
+        elif etype in {"assistant_message", "assistant_image", "assistant_reasoning"}:
+            replay_assistant_event(
+                messages, evt, include_metadata, merge_image, canonical_target
             )
-            state = evt.get("_kt_antigravity_content")
-            if state:
-                target = replay_target(messages, target, state)
-            if target is not None:
-                for key in ASSISTANT_STATE_KEYS:
-                    value = evt.get(key)
-                    if value not in (None, "", [], {}):
-                        target[key] = value
+            if etype == "assistant_message" and evt.get("_assistant_projected"):
+                canonical_target = messages[-1]
+        merge_image = etype == "assistant_image"
 
     _flush_text()
     return messages
-
-
-def _coerce_tool_args_to_json(args: Any) -> str:
-    """Best-effort serialisation for ``assistant_tool_calls.arguments``.
-
-    OpenAI-shaped tool-call arguments must remain JSON strings for replay and
-    downstream sanitization.
-    """
-    if isinstance(args, str):
-        return args
-    if args is None:
-        return "{}"
-    try:
-        return json.dumps(args)
-    except (TypeError, ValueError):
-        return "{}"
 
 
 def _inject_synthetic_announcements(
@@ -822,8 +832,20 @@ def _inject_synthetic_announcements(
                 announced_ids.add(cid)
         pending.clear()
 
+    eligible = {evt.get("event_id") for evt in events} - (covered_event_ids or set())
+    canonical = {
+        evt.get("event_id"): evt["message"]
+        for evt in project_assistant_rounds(events, eligible)
+        if evt.get("_assistant_projected")
+    }
     for evt in events:
         etype = evt.get("type", "")
+        if evt.get("event_id") in canonical:
+            _flush_pending()
+            announced_ids.update(
+                str(call.get("id") or "")
+                for call in (canonical[evt["event_id"]].get("tool_calls") or [])
+            )
         if etype in {"user_input", "user_message"}:
             _flush_pending()
             announced_ids.clear()

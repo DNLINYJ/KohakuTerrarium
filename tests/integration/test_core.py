@@ -142,6 +142,52 @@ class _HistoryReplayLLM(ScriptedLLM):
             yield "OK"
 
 
+class _AssistantMediaLLM(ScriptedLLM):
+    """Generate two ordered structured responses and plain continuation replies."""
+
+    def __init__(self):
+        super().__init__(["continued"])
+        self.generated = 0
+        self.last_assistant_content_parts = []
+        self.last_assistant_extra_fields = {}
+
+    async def chat(self, messages, **kwargs):
+        self.call_log.append(copy.deepcopy(self._normalize_messages(messages)))
+        self.call_count += 1
+        self.last_assistant_content_parts = []
+        self.last_assistant_extra_fields = {}
+        if self.call_count <= 2:
+            self.generated += 1
+            version = "A" if self.generated == 1 else "B"
+            encoded = base64.b64encode(f"ASSISTANT_IMAGE_{version}".encode()).decode()
+            self.last_assistant_content_parts = [
+                TextPart(text=f"structured_{version}"),
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{encoded}",
+                        "detail": "high",
+                        "provider_token": version,
+                    },
+                    "meta": {
+                        "source_name": "same.png",
+                        "source_type": "generated",
+                        "extension": {"version": version},
+                    },
+                },
+                FilePart(
+                    name="same.txt", content=f"ASSISTANT_FILE_{version}", is_inline=True
+                ),
+                TextPart(text=f"tail_{version}"),
+            ]
+            self.last_assistant_extra_fields = {
+                "provider_extension": {"state": [version]}
+            }
+            yield f"streamed_{version}"
+        else:
+            yield "continued"
+
+
 class _EchoTool(BaseTool):
     """DIRECT tool: returns its bracket body (the ``content`` arg) back.
 
@@ -2862,6 +2908,194 @@ class TestCoreIntegration:
         finally:
             await resumed.stop()
             resumed_store.close()
+
+        assistant_dir = tmp_path / "assistant-media"
+        monkeypatch.setenv("KT_SESSION_DIR", str(assistant_dir))
+        assistant_llm = _AssistantMediaLLM()
+
+        def assert_assistant_media(agent, llm, version):
+            messages = agent.controller.conversation.to_messages()
+            media = [
+                message for message in messages if message.get("provider_extension")
+            ]
+            assert len(media) == 1
+            expected = media[0]
+            assert expected["provider_extension"] == {"state": [version]}
+            content = expected["content"]
+            assert [part["type"] for part in content] == [
+                "text",
+                "text",
+                "image_url",
+                "file",
+                "text",
+            ]
+            assert [content[index]["text"] for index in (0, 1, 4)] == [
+                f"streamed_{version}",
+                f"structured_{version}",
+                f"tail_{version}",
+            ]
+            image = content[2]
+            assert image["image_url"]["provider_token"] == version
+            assert image["meta"]["extension"] == {"version": version}
+            assert (
+                base64.b64decode(
+                    resolve_artifact_url(image["image_url"]["url"]).split(",", 1)[1]
+                )
+                == f"ASSISTANT_IMAGE_{version}".encode()
+            )
+            assert content[3]["file"]["content"] == f"ASSISTANT_FILE_{version}"
+            sent = next(
+                message
+                for message in llm.last_messages
+                if message.get("provider_extension")
+            )
+            assert sent["provider_extension"] == expected["provider_extension"]
+            assert sent["content"][0:3] == content[0:3]
+            assert sent["content"][-1] == content[-1]
+            file_marker = next(
+                part["text"]
+                for part in sent["content"]
+                if part.get("text", "").startswith("Attached file: same.txt\nPath: ")
+            )
+            assert (
+                Path(file_marker.split("Path: ", 1)[1]).read_bytes()
+                == f"ASSISTANT_FILE_{version}".encode()
+            )
+            return copy.deepcopy(expected)
+
+        async with Terrarium(session_dir=assistant_dir) as engine:
+            creature = await engine.add_creature(
+                AgentConfig(name="assistantmedia", system_prompt="plain"),
+                llm=assistant_llm,
+                io="headless",
+                start=True,
+            )
+            assistant_agent = creature.agent
+            assistant_agent.controller.config.include_job_status = False
+            await creature.run("generate")
+            assistant_original = dict(live_branch_path(assistant_agent))
+            await assistant_agent.regenerate_last_response(turn_index=1)
+            assistant_sibling = dict(live_branch_path(assistant_agent))
+            await assistant_agent.inject_input(
+                "continue sibling", branch_view=assistant_sibling
+            )
+            sibling_message = assert_assistant_media(
+                assistant_agent, assistant_llm, "B"
+            )
+            await assistant_agent.inject_input(
+                "continue original", branch_view=assistant_original
+            )
+            original_message = assert_assistant_media(
+                assistant_agent, assistant_llm, "A"
+            )
+            assert assistant_llm.generated == 2
+            assert (
+                original_message["content"][2]["image_url"]["url"]
+                != sibling_message["content"][2]["image_url"]["url"]
+            )
+            assistant_path = assistant_agent.session_store.path
+            assistant_events = copy.deepcopy(
+                assistant_agent.session_store.get_events("assistantmedia")
+            )
+            raw_original = branch_history.replay_with_settled_tools(
+                assistant_events, branch_view=assistant_original
+            )
+            assert (
+                next(
+                    message
+                    for message in raw_original
+                    if message.get("provider_extension")
+                )
+                == original_message
+            )
+            raw_sibling = branch_history.replay_with_settled_tools(
+                assistant_events, branch_view=assistant_sibling
+            )
+            assert (
+                next(
+                    message
+                    for message in raw_sibling
+                    if message.get("provider_extension")
+                )
+                == sibling_message
+            )
+
+        cold_llm = ScriptedLLM(["cold sibling", "cold original"])
+        assistant_cold, assistant_store = resume_agent(
+            assistant_path, io_mode="plain", llm=cold_llm
+        )
+        try:
+            assistant_cold.controller.config.include_job_status = False
+            await assistant_cold.start()
+            await assistant_cold.inject_input(
+                "cold sibling", branch_view=assistant_sibling
+            )
+            assert (
+                assert_assistant_media(assistant_cold, cold_llm, "B") == sibling_message
+            )
+            await assistant_cold.inject_input(
+                "cold original", branch_view=assistant_original
+            )
+            assert (
+                assert_assistant_media(assistant_cold, cold_llm, "A")
+                == original_message
+            )
+            assert (
+                assistant_store.get_events("assistantmedia")[: len(assistant_events)]
+                == assistant_events
+            )
+            assert assistant_llm.generated == 2
+        finally:
+            await assistant_cold.stop()
+            assistant_store.close()
+
+        rewritten_path = tmp_path / "assistant-posthook.kohakutr"
+        post_llm = _AssistantMediaLLM()
+        async with Terrarium() as engine:
+            rewritten = await engine.add_creature(
+                AgentConfig(name="rewrittenmedia", system_prompt="plain"),
+                llm=post_llm,
+                io="headless",
+                session=rewritten_path,
+                start=True,
+                plugins=[_RewriteResponsePlugin()],
+            )
+            rewritten.agent.controller.config.include_job_status = False
+            await rewritten.run("generate and rewrite")
+            final = (
+                rewritten.agent.controller.conversation.get_last_assistant_message().to_dict()
+            )
+            assert final["content"] == "streamed_A\nstructured_A\ntail_A [reviewed]"
+            rewritten_events = rewritten.agent.session_store.get_events(
+                "rewrittenmedia"
+            )
+            assert (
+                branch_history.replay_with_settled_tools(rewritten_events)[-1] == final
+            )
+            canonical = next(
+                event
+                for event in rewritten_events
+                if event["type"] == "assistant_message"
+            )
+            assert canonical["message"] == final
+        post_cold_llm = ScriptedLLM(["confirmed"])
+        post_cold, post_store = resume_agent(
+            rewritten_path, io_mode="plain", llm=post_cold_llm
+        )
+        try:
+            await post_cold.start()
+            await post_cold.inject_input("confirm rewritten history")
+            assert (
+                next(
+                    message
+                    for message in post_cold_llm.last_messages
+                    if message.get("provider_extension")
+                )
+                == final
+            )
+        finally:
+            await post_cold.stop()
+            post_store.close()
 
     async def test_inject_event_and_unified_trigger_model(self, make_creature):
         """The unified ``TriggerEvent`` model: a non-user-input event

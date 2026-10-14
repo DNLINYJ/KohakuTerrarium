@@ -149,6 +149,8 @@ class OutputRouter(OutputRouterParseEventMixin, OutputRouterInteractiveMixin):
                 await self.on_processing_start()
             case "processing_end":
                 await self.on_processing_end()
+            case "assistant_round_start" | "assistant_message":
+                await self._fan_event_to_outputs(event)
             case "user_input":
                 await self._fan_event_to_outputs(event)
             case "assistant_image":

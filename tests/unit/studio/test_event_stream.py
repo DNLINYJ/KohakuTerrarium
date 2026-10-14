@@ -322,6 +322,20 @@ def _evt(type_, **kw):
 
 
 class TestStreamOutputEmit:
+    @pytest.mark.parametrize("kind", ["assistant_round_start", "assistant_message"])
+    async def test_canonical_history_events_do_not_duplicate_display(self, kind):
+        queue = asyncio.Queue()
+        log = []
+        out = StreamOutput("src", queue, log)
+        await out.emit(
+            OutputEvent(
+                type=kind,
+                payload={"message": {"role": "assistant", "content": "saved"}},
+            )
+        )
+        assert queue.empty()
+        assert log == []
+
     async def test_text_event(self, _stream):
         so, q, _log = _stream
         await so.emit(_evt("text", content="hi"))

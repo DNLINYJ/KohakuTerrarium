@@ -259,6 +259,8 @@ def prepare_snapshot(
                 "text",
                 "assistant_reasoning",
                 "assistant_tool_calls",
+                "assistant_message",
+                "assistant_image",
                 "user_message",
                 "tool_call",
                 "compact_complete",

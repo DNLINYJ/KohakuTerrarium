@@ -281,6 +281,8 @@ class StreamOutput(OutputModule):
         dispatch them directly.
         """
         match event.type:
+            case "assistant_round_start" | "assistant_message":
+                pass
             case "model_recovery":
                 self._put({"type": "model_recovery", **event.payload})
             case "text":

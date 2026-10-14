@@ -27,6 +27,11 @@ from kohakuterrarium.core.controller_plugins import (
     register_controller_command,
     run_post_llm_call_chain,
 )
+from kohakuterrarium.core.controller_messages import (
+    begin_assistant,
+    end_assistant,
+    _merge_text_and_parts,
+)
 from kohakuterrarium.core.conversation import Conversation, ConversationConfig
 from kohakuterrarium.core.events import EventType, TriggerEvent
 from kohakuterrarium.core.controller_context import (
@@ -91,19 +96,6 @@ def _file_ref_index(
     if len(hits) > 1:
         raise InvalidRequestError(f"Ambiguous file reference: {ref}")
     return hits[0] if hits else None
-
-
-def _merge_text_and_parts(
-    text: str, structured_parts: list[ContentPart]
-) -> str | list[ContentPart]:
-    """Combine streamed text with structured parts (text-first list)."""
-    if not structured_parts:
-        return text
-    merged: list[ContentPart] = []
-    if text:
-        merged.append(TextPart(text=text))
-    merged.extend(structured_parts)
-    return merged
 
 
 def _schema_allowed(
@@ -227,6 +219,8 @@ class Controller:
         # Post-LLM rewrites use the same router as streamed output so attached
         # consumers observe a coherent assistant turn.
         self.output_router: Any = None
+        # Capture the Message returned by append, not a later conversation tail.
+        self._completed_assistant_message = None
 
         # Injections remain pending until the next round so every pre-LLM hook
         # receives the same augmented message list.
@@ -494,7 +488,9 @@ class Controller:
         # execution event. Background handlers may append a tool placeholder as
         # soon as the event is yielded, and provider protocols require that result
         # to follow the assistant message which introduced its tool_call_id.
-        self.conversation.append("assistant", final_content, **append_kwargs)
+        self._completed_assistant_message = self.conversation.append(
+            "assistant", final_content, **append_kwargs
+        )
 
         for event in pending_native_events:
             yield event
@@ -895,6 +891,8 @@ class Controller:
 
         logger.info("Generating response...")
 
+        await begin_assistant(self)
+
         if self._is_native_mode:
             tool_schemas = self._get_native_tool_schemas()
             async for event in self._run_native_completion(messages, tool_schemas):
@@ -913,7 +911,7 @@ class Controller:
                         source_name=part.source_name,
                         revised_prompt=getattr(part, "revised_prompt", None),
                     )
-            self.conversation.append(
+            self._completed_assistant_message = self.conversation.append(
                 "assistant",
                 _merge_text_and_parts(self._last_assistant_content, structured),
                 extra_fields=(
@@ -925,6 +923,7 @@ class Controller:
         # the canonical assistant message rather than only the streamed copy.
         if self.plugins:
             await run_post_llm_call_chain(self, messages)
+        await end_assistant(self)
 
     def register_command(
         self, command_name: str, cmd: Command, override: bool = False

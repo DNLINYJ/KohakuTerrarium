@@ -6,6 +6,8 @@ outputs for controller feedback, and cascades lifecycle to every
 attached module.
 """
 
+import pytest
+
 from kohakuterrarium.modules.output.event import OutputEvent
 from kohakuterrarium.modules.output.router import OutputRouter
 from kohakuterrarium.modules.output.router_state import (
@@ -270,6 +272,25 @@ class TestActivityDispatch:
 
 
 class TestLifecycle:
+    @pytest.mark.parametrize("kind", ["assistant_round_start", "assistant_message"])
+    async def test_canonical_round_events_keep_typed_payload(self, kind):
+        secondary = OutputRecorder()
+        router, default = _router()
+        router.add_secondary(secondary)
+        event = OutputEvent(
+            type=kind,
+            payload={
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "final"}],
+                }
+            },
+        )
+        await router.emit(event)
+        assert secondary.events[-1].type == kind
+        assert secondary.events[-1].payload == event.payload
+        assert default.events[-1].payload == event.payload
+
     async def test_user_input_keeps_ordered_content_and_request_identity_for_observers(
         self,
     ):
