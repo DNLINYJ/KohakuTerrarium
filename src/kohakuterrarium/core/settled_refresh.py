@@ -6,8 +6,7 @@ from kohakuterrarium.core.agent_message_history import (
     snapshot_needs_settled_tool_replay,
 )
 from kohakuterrarium.core.branch_continuation import live_branch_path
-from kohakuterrarium.core.conversation import Conversation
-from kohakuterrarium.llm.message import dicts_to_messages
+from kohakuterrarium.core.branch_conversation import build_branch_conversation
 from kohakuterrarium.errors import ConflictError
 
 
@@ -44,16 +43,7 @@ def refresh_mutation_prefix(agent, index: int) -> int:
     if len(matches) != 1:
         raise ConflictError("Cannot restore pending-history mutation target")
     prepared = {**prepared, "messages": prepared["messages"][: matches[0] + 1]}
-    candidate = Conversation(conversation.config)
-    for message in conversation.get_messages():
-        if message.role == "system":
-            candidate.append_message(message)
-    for raw, message in zip(
-        prepared["messages"], dicts_to_messages(prepared["messages"])
-    ):
-        if message.role != "system":
-            message.metadata = dict(raw.get("metadata") or {})
-            candidate.append_message(message)
+    candidate = build_branch_conversation(conversation, prepared["messages"])
     if not any(
         message.role == "user"
         and message.metadata.get("turn_index") == turn
@@ -61,7 +51,7 @@ def refresh_mutation_prefix(agent, index: int) -> int:
         for message in candidate.get_messages()
     ):
         raise ConflictError("History retention would remove the mutation target")
-    apply_prepared_branch_view(agent, prepared)
+    apply_prepared_branch_view(agent, prepared, candidate=candidate)
     return next(
         i
         for i, message in enumerate(conversation.get_messages())
