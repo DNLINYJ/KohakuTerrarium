@@ -30,7 +30,6 @@ from kohakuterrarium.core.controller_plugins import (
 from kohakuterrarium.core.controller_messages import (
     begin_assistant,
     end_assistant,
-    prepare_session_media,
     _merge_text_and_parts,
 )
 from kohakuterrarium.core.conversation import Conversation, ConversationConfig
@@ -396,6 +395,7 @@ class Controller:
         self, messages: list[dict], **kwargs: Any
     ) -> AsyncIterator[str]:
         """Bind this controller's output router to its model request."""
+        kwargs["media_session_path"] = getattr(self.session_store, "path", None)
         return chat_with_recovery(self.llm, self.output_router, messages, **kwargs)
 
     async def _run_native_completion(
@@ -890,7 +890,6 @@ class Controller:
                 tools=self._get_native_tool_schemas() if self._is_native_mode else None,
             )
 
-        messages = await prepare_session_media(self, messages)
         logger.info("Generating response...")
 
         await begin_assistant(self)

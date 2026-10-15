@@ -6,6 +6,7 @@ from typing import Any
 
 from kohakuterrarium.llm.media_reference import (
     artifact_reference,
+    current_media_session_path,
     prepare_image_urls,
     resolve_media_url,
     session_media_path,
@@ -34,6 +35,8 @@ def _local_media_path(url: str) -> Path | None:
 
 def resolve_artifact_url(url: str, *, session_path: str | Path | None = None) -> str:
     """Inline a local reference, preserving its original URL on failure."""
+    if session_path is None:
+        session_path = current_media_session_path()
     paths = (
         _local_media_path
         if session_path is None

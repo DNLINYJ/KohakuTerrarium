@@ -1,7 +1,10 @@
 import json
+from copy import deepcopy
 
 import pytest
 
+from kohakuterrarium.errors import MediaReferenceError
+from kohakuterrarium.llm.media_reference import session_media_scope
 from kohakuterrarium.llm.antigravity_auth import AntigravityError
 from kohakuterrarium.llm.antigravity_format import (
     STATE_KEY,
@@ -62,6 +65,71 @@ def test_signed_tool_roundtrip_orders_results_by_id(upstream_ids):
     message["tool_calls"] = calls[:1]
     with pytest.raises(AntigravityError, match="history_requires_new_session"):
         encode_messages([message], "gemini-3-flash", "account")
+
+
+def test_selected_local_images_resolve_but_bound_assistant_display_is_not_read(
+    tmp_path,
+):
+    session = tmp_path / "owner.kohakutr"
+    artifacts = session.with_suffix(".artifacts")
+    artifacts.mkdir()
+    image = artifacts / "pic.png"
+    image.write_bytes(b"IMG")
+    artifact_url = "/api/sessions/owner/artifacts/pic.png"
+    assistant = {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "image_url",
+                "image_url": {"url": "/api/sessions/owner/artifacts/missing.png"},
+            }
+        ],
+    }
+    bound = [{"text": "saved signed output", "thoughtSignature": "signed"}]
+    assistant[STATE_KEY] = signed_state(assistant, bound, "m", "a")
+    original = deepcopy(assistant)
+    with session_media_scope(session):
+        for url in (artifact_url, image.as_uri()):
+            _, contents = encode_messages(
+                [
+                    {
+                        "role": "user",
+                        "content": [{"type": "image_url", "image_url": {"url": url}}],
+                    },
+                    assistant,
+                ],
+                "m",
+                "a",
+            )
+            assert contents == [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"inlineData": {"mimeType": "image/png", "data": "SU1H"}}
+                    ],
+                },
+                {"role": "model", "parts": bound},
+            ]
+        image.unlink()
+        with pytest.raises(
+            MediaReferenceError, match="Required local media is unavailable"
+        ):
+            encode_messages(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": artifact_url}}
+                        ],
+                    }
+                ],
+                "m",
+                "a",
+            )
+        assert encode_messages([assistant], "m", "a")[1] == [
+            {"role": "model", "parts": bound}
+        ]
+    assert assistant == original
 
 
 def test_text_edit_or_account_switch_does_not_replay_old_content():

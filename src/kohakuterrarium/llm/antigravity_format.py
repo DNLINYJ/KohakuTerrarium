@@ -8,6 +8,10 @@ import re
 
 from kohakuterrarium.llm.antigravity_auth import AntigravityError
 from kohakuterrarium.llm.base import ToolSchema
+from kohakuterrarium.llm.media_reference import (
+    current_media_session_path,
+    resolve_session_image_urls,
+)
 
 STATE_KEY = "_kt_antigravity_content"
 
@@ -61,6 +65,10 @@ def _content_parts(content) -> list[dict]:
         return [{"text": content}]
     if not isinstance(content, list):
         raise AntigravityError("unsupported_content")
+    if (session_path := current_media_session_path()) is not None:
+        content = resolve_session_image_urls(
+            [{"content": content}], session_path=session_path
+        )[0]["content"]
     parts = []
     for item in content:
         if not isinstance(item, dict):
@@ -158,7 +166,7 @@ def encode_messages(
             continue
         if role not in {"user", "assistant"}:
             raise AntigravityError("unsupported_role")
-        parts = _content_parts(message.get("content"))
+        parts = [] if role == "assistant" else _content_parts(message.get("content"))
         if role == "assistant":
             state = message.get(STATE_KEY)
             bound = isinstance(state, dict) and all(
@@ -185,6 +193,8 @@ def encode_messages(
                 }
             elif pending:
                 raise AntigravityError("history_requires_new_session")
+            else:
+                parts = _content_parts(message.get("content"))
             if pending and (
                 len({c.get("id") for c in pending}) != len(pending)
                 or any(not c.get("id") for c in pending)

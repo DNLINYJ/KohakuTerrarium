@@ -2,7 +2,6 @@
 
 import asyncio
 from copy import deepcopy
-from types import SimpleNamespace
 
 import pytest
 
@@ -10,32 +9,12 @@ from kohakuterrarium.core.controller import Controller, ControllerConfig
 from kohakuterrarium.core.controller_messages import (
     begin_assistant,
     end_assistant,
-    prepare_session_media,
 )
 from kohakuterrarium.core.conversation import Conversation
 from kohakuterrarium.core.events import create_user_input_event
 from kohakuterrarium.llm.message import ImagePart, TextPart
 from kohakuterrarium.testing.llm import ScriptedLLM
 from kohakuterrarium.testing.output import OutputRecorder
-
-
-@pytest.mark.parametrize("store", [None, object()])
-async def test_preparing_remote_or_plain_content_needs_no_session_or_filesystem(store):
-    messages = [
-        {"role": "user", "content": "plain"},
-        {
-            "role": "assistant",
-            "content": [
-                {"type": "image_url", "image_url": {"url": "https://images.invalid/a"}},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": "data:image/png;base64,YQ=="},
-                },
-            ],
-        },
-    ]
-    controller = SimpleNamespace(session_store=store)
-    assert await prepare_session_media(controller, messages) is messages
 
 
 def _assistant_message(

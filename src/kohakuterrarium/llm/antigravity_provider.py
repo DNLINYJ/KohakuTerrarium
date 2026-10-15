@@ -1,5 +1,6 @@
 """Google Antigravity provider using locally borrowed agy access credentials."""
 
+import asyncio
 from uuid import uuid4
 
 import httpx
@@ -176,8 +177,8 @@ class AntigravityProvider(BaseLLMProvider):
                 await AgyCredentials.ensure_fresh(rejected=rejected)
                 rejected = None
                 project, scope, token = await load_project(client, self._policy)
-                request = self._request(
-                    messages, scope, tools, provider_native_tools, kwargs
+                request = await asyncio.to_thread(
+                    self._request, messages, scope, tools, provider_native_tools, kwargs
                 )
                 payload = {
                     "project": project,

@@ -3,6 +3,8 @@
 import base64
 import re
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,24 @@ _ARTIFACT_MIME_BY_EXT = {
     ".heic": "image/heic",
     ".avif": "image/avif",
 }
+
+
+_session_path: ContextVar[Path | None] = ContextVar("media_session_path", default=None)
+
+
+@contextmanager
+def session_media_scope(path: str | Path | None):
+    """Bind artifact ownership to provider execution and its awaited worker tasks."""
+    token = _session_path.set(Path(path) if path is not None else None)
+    try:
+        yield
+    finally:
+        _session_path.reset(token)
+
+
+def current_media_session_path() -> Path | None:
+    """Return the session location bound to this provider execution context."""
+    return _session_path.get()
 
 
 def artifact_reference(url: str) -> tuple[str, str] | None:

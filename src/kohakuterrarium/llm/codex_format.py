@@ -27,7 +27,7 @@ def to_responses_input(
     for msg in messages:
         role = msg.get("role")
         if role in ("user", "tool"):
-            # Filter unavailable images without changing the stored messages.
+            # Resolve only input roles without changing the stored messages.
             msg = resolve_message_image_urls([msg])[0]
         content = msg.get("content", "")
         if role == "user":

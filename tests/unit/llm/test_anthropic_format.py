@@ -12,7 +12,9 @@ from copy import deepcopy
 
 import pytest
 
+from kohakuterrarium.errors import MediaReferenceError
 from kohakuterrarium.llm import artifact_resolve
+from kohakuterrarium.llm.media_reference import session_media_scope
 from kohakuterrarium.llm.anthropic_format import (
     KT_CONTENT_KEY,
     model_accepts_sampling,
@@ -409,6 +411,43 @@ class TestUserContent:
             "type": "image",
             "source": {"type": "url", "url": "https://x/y.png"},
         }
+
+    @pytest.mark.parametrize("shape", ["nested", "shorthand", "fallback"])
+    def test_required_local_image_uses_scoped_session_root_and_fails_when_missing(
+        self, tmp_path, shape
+    ):
+        session_path = tmp_path / "explicit" / "own.kohakutr"
+        artifacts = session_path.with_suffix(".artifacts")
+        artifacts.mkdir(parents=True)
+        image_path = artifacts / "pic.png"
+        image_path.write_bytes(b"PNG")
+        url = (
+            image_path.as_uri()
+            if shape == "fallback"
+            else "/api/sessions/own/artifacts/pic.png"
+        )
+        reference = (
+            {"image_url": {"url": url}}
+            if shape == "nested"
+            else {"url" if shape == "fallback" else "image_url": url}
+        )
+        message = [{"type": "image_url", **reference}]
+        with session_media_scope(session_path):
+            assert user_content(message) == [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "UE5H",
+                    },
+                }
+            ]
+            image_path.unlink()
+            with pytest.raises(
+                MediaReferenceError, match="Required local media is unavailable"
+            ):
+                user_content(message)
 
     def test_unsupported_image_url_becomes_text_placeholder(self):
         out = user_content([{"type": "image_url", "image_url": {"url": "ftp://x"}}])

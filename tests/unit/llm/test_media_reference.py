@@ -1,14 +1,16 @@
 """Session-scoped image preparation and compatibility-adapter behavior."""
 
 from copy import deepcopy
-from types import SimpleNamespace
 
 import pytest
 
-from kohakuterrarium.core.controller_messages import prepare_session_media
 from kohakuterrarium.errors import MediaReferenceError
 from kohakuterrarium.llm import artifact_resolve
-from kohakuterrarium.llm.media_reference import resolve_session_image_urls
+from kohakuterrarium.llm.media_reference import (
+    current_media_session_path,
+    resolve_session_image_urls,
+    session_media_scope,
+)
 
 
 async def test_session_root_preparation_preserves_parts_and_rejects_namespace_escape(
@@ -41,9 +43,8 @@ async def test_session_root_preparation_preserves_parts_and_rejects_namespace_es
     expected[0]["content"][0]["image_url"]["url"] = "data:image/png;base64,T1dO"
     expected[0]["content"][1]["image_url"] = "data:image/png;base64,T1dO"
     assert prepared == expected
-    controller = SimpleNamespace(session_store=SimpleNamespace(path=local))
     shorthand = [{"role": "assistant", "content": messages[0]["content"][1:]}]
-    assert await prepare_session_media(controller, shorthand) == [
+    assert resolve_session_image_urls(shorthand, session_path=local) == [
         {"role": "assistant", "content": expected[0]["content"][1:]}
     ]
     assert (
@@ -57,6 +58,22 @@ async def test_session_root_preparation_preserves_parts_and_rejects_namespace_es
     assert messages == original
     with pytest.raises(MediaReferenceError, match="unavailable"):
         artifact_resolve.resolve_message_image_urls(messages)
+    default_artifacts = default_root / "own session.artifacts"
+    default_artifacts.mkdir()
+    (default_artifacts / "pic.png").write_bytes(b"WRONG DEFAULT")
+    with session_media_scope(local):
+        assert artifact_resolve.resolve_message_image_urls(messages) == expected
+        with session_media_scope(tmp_path / "missing" / "own session.kohakutr"):
+            assert (
+                artifact_resolve.resolve_message_image_urls(
+                    messages, session_path=local
+                )
+                == expected
+            )
+            with pytest.raises(MediaReferenceError, match="unavailable"):
+                artifact_resolve.resolve_message_image_urls(messages)
+        assert current_media_session_path() == local
+    assert current_media_session_path() is None
     outside = tmp_path / "outside.artifacts"
     outside.mkdir()
     (outside / "pic.png").write_bytes(b"OUTSIDE")

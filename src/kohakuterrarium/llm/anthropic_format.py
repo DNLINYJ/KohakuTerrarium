@@ -9,7 +9,7 @@ from kohakuterrarium.llm.anthropic_pairing import (
     SYNTHETIC_TOOL_RESULT_TEXT,
     fix_anthropic_tool_block_pairing,
 )
-from kohakuterrarium.llm.artifact_resolve import resolve_artifact_url
+from kohakuterrarium.llm.artifact_resolve import resolve_message_image_urls
 from kohakuterrarium.llm.base import NativeToolCall, ToolSchema
 
 # Preserve the historical import path; pairing logic lives in anthropic_pairing.
@@ -211,8 +211,10 @@ def image_part(part: dict[str, Any]) -> dict[str, Any]:
         or part.get("url")
         or ""
     )
-    # Remote APIs cannot fetch local artifact paths, so inline them before sending.
-    url = resolve_artifact_url(url)
+    canonical = {"type": "image_url", "image_url": {"url": url}}
+    url = resolve_message_image_urls([{"content": [canonical]}])[0]["content"][0][
+        "image_url"
+    ]["url"]
     if url.startswith("data:"):
         match = DATA_IMAGE_RE.match(url)
         if match:

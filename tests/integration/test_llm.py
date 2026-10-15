@@ -28,13 +28,15 @@ Why these collaborators are real:
     reset so resolution is deterministic with no installed packages.
 """
 
-import base64
 import asyncio
-from collections import deque
+import base64
 import io
 import json
 import random
 import time
+from collections import deque
+from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -46,7 +48,9 @@ from websockets import serve
 from kohakuterrarium import Terrarium
 from kohakuterrarium.errors import MediaReferenceError
 from kohakuterrarium.core.agent_budget_recovery import apply_context_repair
+from kohakuterrarium.core.controller import Controller, ControllerConfig
 from kohakuterrarium.core.conversation import Conversation
+from kohakuterrarium.core.events import create_user_input_event
 from kohakuterrarium.llm import antigravity_auth as agy_auth
 from kohakuterrarium.session.history import (
     replay_conversation,
@@ -2043,6 +2047,83 @@ class TestLlmIntegration:
                 await responses_provider.chat_complete(budget_history)
             ).content == "bounded"
             assert budget_requests[2]["input"] == budget_requests[1]["input"]
+
+            session_store = SessionStore(
+                tmp_path / "custom-input-root" / "selected.kohakutr"
+            )
+            try:
+                session_store.write_artifact("current.png", image_bytes)
+                local_url = "/api/sessions/selected/artifacts/current.png"
+                missing_url = "/api/sessions/selected/artifacts/missing.png"
+                normal_read = Path.read_bytes
+                for scenario, role, urls, expected_images, should_fail in (
+                    (
+                        "budget-missing-old",
+                        "user",
+                        [missing_url] + [local_url] * 59,
+                        50,
+                        False,
+                    ),
+                    ("budget-valid", "user", [local_url] * 100, 50, False),
+                    ("assistant-unused", "assistant", [missing_url] * 40, 0, False),
+                    ("required-missing", "user", [missing_url], 0, True),
+                ):
+                    controller = Controller(
+                        responses_provider, ControllerConfig(include_job_status=False)
+                    )
+                    controller.session_store = session_store
+                    controller.conversation.append(
+                        role, [ImagePart(url=url) for url in urls]
+                    )
+                    originals = deepcopy(controller.conversation.to_messages())
+                    requests_before = len(budget_requests)
+                    reads = []
+
+                    def counted_read(path):
+                        if path.suffix == ".png" and ".artifacts" in str(path):
+                            reads.append(path)
+                        return normal_read(path)
+
+                    with monkeypatch.context() as request_patch:
+                        request_patch.setattr(Path, "read_bytes", counted_read)
+                        await controller.push_event(create_user_input_event("continue"))
+                        if should_fail:
+                            with pytest.raises(
+                                MediaReferenceError,
+                                match="Required local media is unavailable",
+                            ):
+                                async for _ in controller.run_once():
+                                    pass
+                        else:
+                            async for _ in controller.run_once():
+                                pass
+                    if should_fail:
+                        assert len(budget_requests) == requests_before
+                        continue
+                    assert len(budget_requests) == requests_before + 1, scenario
+                    sent_images = [
+                        part
+                        for item in budget_requests[-1]["input"]
+                        for part in item.get("content", [])
+                        if part.get("type") == "input_image"
+                    ]
+                    assert len(sent_images) == expected_images, scenario
+                    assert len(reads) == expected_images, scenario
+                    assert all(
+                        path == session_store.artifacts_dir / "current.png"
+                        for path in reads
+                    )
+                    assert all(
+                        base64.b64decode(part["image_url"].split(",", 1)[1])
+                        == image_bytes
+                        for part in sent_images
+                    )
+                    assert (
+                        controller.conversation.to_messages()[: len(originals)]
+                        == originals
+                    )
+            finally:
+                session_store.close()
 
             # Refused images leave the request and the host conversation alike.
             host = Conversation()
