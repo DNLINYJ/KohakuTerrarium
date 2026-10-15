@@ -45,33 +45,13 @@ async def _discard_after_reattach(monkeypatch, engine, graph_id: str, attached):
 
 
 class TestRecipeDiscardSameFileGuard:
-    async def test_wal_spelling_alias_reattach_refuses_without_deleting(
-        self, tmp_path, monkeypatch
+    @pytest.mark.parametrize("alias_name", ["alias.kohakutr", "alias.kohakutr-wal"])
+    async def test_alias_reattach_refuses_without_deleting(
+        self, tmp_path, monkeypatch, alias_name
     ):
         path = tmp_path / "recipe.kohakutr"
         store = _closed_store(path)
-        alias = tmp_path / "alias.kohakutr-wal"
-        _symlink_or_skip(alias, path)
-        engine = _OwnedEngine("g", store)
-        try:
-            with pytest.raises(ValueError, match="active session store"):
-                await _discard_after_reattach(
-                    monkeypatch, engine, "g", SimpleNamespace(path=alias)
-                )
-            assert path.exists()
-            assert alias.is_symlink()
-            assert alias.exists()
-            assert "reattached" in engine._session_stores
-            assert_idle(path)
-        finally:
-            store.close(update_status=False)
-
-    async def test_normal_alias_reattach_refuses_without_deleting(
-        self, tmp_path, monkeypatch
-    ):
-        path = tmp_path / "recipe.kohakutr"
-        store = _closed_store(path)
-        alias = tmp_path / "alias.kohakutr"
+        alias = tmp_path / alias_name
         _symlink_or_skip(alias, path)
         engine = _OwnedEngine("g", store)
         try:

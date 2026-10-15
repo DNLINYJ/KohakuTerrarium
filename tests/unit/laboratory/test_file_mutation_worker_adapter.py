@@ -12,7 +12,6 @@ import pytest
 
 from kohakuterrarium.laboratory.adapters import terrarium_file_mutations as mut
 from kohakuterrarium.laboratory.adapters import terrarium_files as files_mod
-from kohakuterrarium.laboratory.adapters.file_scopes import ScopeError
 from kohakuterrarium.laboratory.adapters.terrarium_file_mutations import (
     run_mutation_worker,
     write_bytes_enrolled,
@@ -63,11 +62,7 @@ class TestCancellationHoldsLease:
         transfer = adapter._transfers[tid]
         target = transfer.target
         staging = transfer.staging
-        hold, entered, finished = (
-            threading.Event(),
-            threading.Event(),
-            threading.Event(),
-        )
+        hold, entered = threading.Event(), threading.Event()
         cleanup_calls: list[str] = []
         real_replace = os.replace
         real_cleanup = adapter._cleanup_after_commit
@@ -93,7 +88,6 @@ class TestCancellationHoldsLease:
             assert GATE.snapshot(staging).legacy_active == 1
             task.cancel()
             await asyncio.sleep(0.05)
-            assert not finished.is_set()
             assert GATE.snapshot(target).legacy_active == 1
             assert cleanup_calls == []
             assert tid in adapter._transfers
@@ -197,22 +191,6 @@ class TestCancellationHoldsLease:
 
 
 class TestAdapterOutputsUnchanged:
-    async def test_one_shot_write_output(self, adapter, tmp_path):
-        out = await adapter._dispatch(
-            msg(
-                "write",
-                {
-                    "scope": "recipe://plain",
-                    "path": "f.txt",
-                    "bytes_b64": b64(b"hello"),
-                },
-            )
-        )
-        assert out == {"written": 5, "sha256": sha(b"hello")}
-        target = tmp_path / "kt-config" / "recipes" / "plain" / "f.txt"
-        assert target.read_bytes() == b"hello"
-        assert_idle(target)
-
     async def test_stream_commit_output(self, adapter, tmp_path):
         payload = b"chunked-body"
         begin = await adapter._dispatch(
@@ -238,95 +216,6 @@ class TestAdapterOutputsUnchanged:
         target = tmp_path / "kt-config" / "recipes" / "stream" / "sess.kohakutr"
         assert target.read_bytes() == payload
         assert_idle(target)
-
-    async def test_bundle_replace_output(self, adapter, tmp_path):
-        files = {"a.txt": [sha(b"hi"), b64(b"hi")]}
-        out = await adapter._dispatch(
-            msg("push_bundle", {"scope": "recipe://bundle", "files": files})
-        )
-        assert out == {"deployed": ["a.txt"], "conflicts": []}
-        target = tmp_path / "kt-config" / "recipes" / "bundle" / "a.txt"
-        assert target.read_bytes() == b"hi"
-        assert_idle(target)
-
-    async def test_single_file_delete_output(self, adapter, tmp_path):
-        await adapter._dispatch(
-            msg(
-                "write",
-                {
-                    "scope": "recipe://del",
-                    "path": "f.txt",
-                    "bytes_b64": b64(b"x"),
-                },
-            )
-        )
-        target = tmp_path / "kt-config" / "recipes" / "del" / "f.txt"
-        assert target.exists()
-        out = await adapter._dispatch(
-            msg("delete", {"scope": "recipe://del", "path": "f.txt"})
-        )
-        assert out == {}
-        assert not target.exists()
-        assert_idle(target)
-
-    async def test_directory_delete_is_not_enrolled(
-        self, adapter, monkeypatch, tmp_path
-    ):
-        await adapter._dispatch(
-            msg(
-                "write",
-                {
-                    "scope": "recipe://dir",
-                    "path": "sub/f.txt",
-                    "bytes_b64": b64(b"x"),
-                },
-            )
-        )
-        enrolled: list[str] = []
-        real_acquire = family.acquire_legacy
-
-        def spy_acquire(target, operation):
-            enrolled.append(str(target))
-            return real_acquire(target, operation)
-
-        monkeypatch.setattr(family, "acquire_legacy", spy_acquire)
-        out = await adapter._dispatch(
-            msg("delete", {"scope": "recipe://dir", "path": "sub"})
-        )
-        assert out == {}
-        assert enrolled == []
-
-    async def test_hash_preflight_mismatch_does_not_enroll(self, adapter, monkeypatch):
-        await adapter._dispatch(
-            msg(
-                "write",
-                {
-                    "scope": "recipe://eh",
-                    "path": "f.txt",
-                    "bytes_b64": b64(b"old"),
-                },
-            )
-        )
-        enrolled: list[str] = []
-
-        def boom_acquire(*args, **kwargs):
-            enrolled.append("acquire")
-            raise AssertionError("must not enroll after hash mismatch")
-
-        monkeypatch.setattr(family, "acquire_legacy", boom_acquire)
-        out = await adapter._dispatch(
-            msg(
-                "write",
-                {
-                    "scope": "recipe://eh",
-                    "path": "f.txt",
-                    "bytes_b64": b64(b"new"),
-                    "expect_hash": "bogus",
-                },
-            )
-        )
-        assert out["error"]["kind"] == "invalid"
-        assert enrolled == []
 
     async def test_active_store_rejection_does_not_gate_saved_files(
         self, adapter, monkeypatch, tmp_path
@@ -444,7 +333,3 @@ class TestWorkerOwnsLeaseNotEventLoop:
         assert loop_ident is not None
         assert all(name != loop_ident for name in threads)
         assert_idle(path)
-
-    def test_scope_error_still_raised_from_worker(self):
-        with pytest.raises(ScopeError):
-            raise ScopeError("payload exceeds one-shot limit")

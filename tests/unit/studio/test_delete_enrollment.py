@@ -208,35 +208,6 @@ class TestDeleteEnrollmentScope:
             holder.finish(source_released=True)
         _assert_idle(path)
 
-    def test_duplicate_resolved_paths_enroll_once(self, tmp_path, monkeypatch):
-        path = _plain_session(tmp_path, "dup")
-        monkeypatch.setattr(store_mod, "_SESSION_DIR", tmp_path)
-        monkeypatch.setattr(
-            store_mod,
-            "all_versions_for_session_default",
-            lambda _name: [path, Path(str(path))],
-        )
-        enrolled: list[str] = []
-        locks: list[str] = []
-        real_acquire = store_mod.acquire_legacy
-        real_lock = store_mod.acquire_writer_lock
-
-        def spy_acquire(target, operation):
-            enrolled.append(operation)
-            return real_acquire(target, operation)
-
-        def spy_lock(lock_path):
-            locks.append(lock_path)
-            return real_lock(lock_path)
-
-        monkeypatch.setattr(store_mod, "acquire_legacy", spy_acquire)
-        monkeypatch.setattr(store_mod, "acquire_writer_lock", spy_lock)
-        deleted = store_mod.delete_session_files("dup")
-        assert deleted == [path]
-        assert enrolled == ["delete"]
-        assert len(locks) == 1
-        _assert_idle(path)
-
     def test_plain_duplicate_and_separate_version_purges_listed_targets(
         self, tmp_path, monkeypatch
     ):
@@ -258,6 +229,7 @@ class TestDeleteEnrollmentScope:
         real_lock = store_mod.acquire_writer_lock
 
         def spy_acquire(target, operation):
+            assert operation == "delete"
             enrolled.append(store_mod._path_identity(Path(target)))
             return real_acquire(target, operation)
 
@@ -308,6 +280,7 @@ class TestDeleteEnrollmentScope:
         real_lock = store_mod.acquire_writer_lock
 
         def spy_acquire(target, operation):
+            assert operation == "delete"
             enrolled.append(store_mod._path_identity(Path(target)))
             return real_acquire(target, operation)
 

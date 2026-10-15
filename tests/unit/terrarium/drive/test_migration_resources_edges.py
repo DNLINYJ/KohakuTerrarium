@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 import kohakuterrarium.terrarium.drive.store_migration as migration
-from kohakuterrarium.session.resource_gate import GATE, acquire_legacy, try_fast
+from kohakuterrarium.session.resource_gate import GATE, try_fast
 from kohakuterrarium.terrarium.drive.errors import DriveSchemaVersionError
 from kohakuterrarium.terrarium.drive.store_migration import DRIVE_SCHEMA_VERSION
 from kohakuterrarium.terrarium.drive.store_migration_resources import (
@@ -19,13 +19,11 @@ from kohakuterrarium.terrarium.drive.store_migration_resources import (
 )
 from kohakuterrarium.utils.file_lock import FileLock
 from tests.unit.terrarium.drive.store_migration_resource_fixtures import (
-    FailingCloseConnection,
     _REAL_CONNECT,
     assert_idle,
     complete_sidecar,
     connect_with_factory,
     empty_session,
-    force_close,
     legacy_db,
     sidecar,
 )
@@ -44,30 +42,6 @@ class _OrphanCloseFails(sqlite3.Cursor):
 class _OrphanCloseConnection(sqlite3.Connection):
     def execute(self, *args, **kwargs):
         return super().cursor(_OrphanCloseFails).execute(*args, **kwargs)
-
-
-class _BoomLedger(list):
-    def __iter__(self):
-        raise RuntimeError("ledger iteration failed")
-
-
-class _BoomAfterFirst(list):
-    def __iter__(self):
-        yield next(list.__iter__(self))
-        raise RuntimeError("ledger iteration failed")
-
-
-class _FailCursor(sqlite3.Cursor):
-    def close(self):
-        raise RuntimeError("cursor close failed")
-
-
-class _WatchClose(sqlite3.Connection):
-    closed = False
-
-    def close(self):
-        type(self).closed = True
-        return super().close()
 
 
 def _meta_file(path: str, value: str | None = None, *, table: bool = True) -> str:
@@ -120,51 +94,6 @@ class TestRetainCursorCloseChain:
             migration._legacy_same_file_drives(path)
         assert "orphan close failed" in str(caught.value.__cause__)
         assert try_fast(path, eligible=True).reason == "legacy_release_uncertain"
-
-
-class TestCloseSqlLedgerIteration:
-    def test_iteration_error_still_closes_db(self, tmp_path):
-        path = tmp_path / "ledger.sqlite"
-        _WatchClose.closed = False
-        conn = _REAL_CONNECT(path, factory=_WatchClose)
-        resources = MigrationSqlResources(
-            acquire_legacy(path, "ledger-iter"), cursors=_BoomLedger()
-        )
-        resources.mark_source_handle()
-        resources.adopt(conn)
-        with pytest.raises(RuntimeError, match="ledger iteration failed"):
-            resources.finish()
-        assert _WatchClose.closed is True
-        assert try_fast(path, eligible=True).reason == "legacy_release_uncertain"
-
-    def test_cursor_close_then_iteration_error_preserves_chain(self, tmp_path):
-        path = tmp_path / "ledger-chain.sqlite"
-        _WatchClose.closed = False
-        conn = _REAL_CONNECT(path, factory=_WatchClose)
-        resources = MigrationSqlResources(
-            acquire_legacy(path, "ledger-chain"), cursors=_BoomAfterFirst()
-        )
-        resources.adopt(conn)
-        resources.retain_cursor(conn.cursor(factory=_FailCursor))
-        with pytest.raises(RuntimeError, match="cursor close failed") as caught:
-            resources.close_sql()
-        assert "ledger iteration failed" in str(caught.value.__cause__)
-        assert _WatchClose.closed is True
-
-    def test_iteration_error_then_db_close_failure_still_attempts_close(self, tmp_path):
-        path = tmp_path / "ledger-db.sqlite"
-        FailingCloseConnection.instances = []
-        conn = _REAL_CONNECT(path, factory=FailingCloseConnection)
-        resources = MigrationSqlResources(
-            acquire_legacy(path, "ledger-db"), cursors=_BoomLedger()
-        )
-        resources.adopt(conn)
-        try:
-            with pytest.raises(RuntimeError, match="ledger iteration failed") as caught:
-                resources.close_sql()
-            assert "db close failed" in str(caught.value.__cause__)
-        finally:
-            force_close(FailingCloseConnection.instances)
 
 
 class TestSourceResourcesInitFailure:

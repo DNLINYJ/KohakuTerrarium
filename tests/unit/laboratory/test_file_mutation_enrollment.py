@@ -474,7 +474,7 @@ class TestSidecarFamilyOccupancy:
         assert_idle(unknown)
         assert_idle(main)
 
-    def test_user_target_list_unchanged_when_family_expands(
+    def test_family_admission_does_not_expand_mutation_targets(
         self, tmp_path, monkeypatch
     ):
         main = plain_file(tmp_path, "sess.kohakutr", b"main")
@@ -502,9 +502,7 @@ class TestSidecarFamilyOccupancy:
         monkeypatch.setattr(family, "family_identities", spy_identities)
         monkeypatch.setattr(family, "acquire_legacy", spy_acquire)
 
-        write_targets = [sidecar]
-        write_bytes_enrolled(write_targets[0], b"written")
-        assert write_targets == [sidecar]
+        write_bytes_enrolled(sidecar, b"written")
         assert sidecar.read_bytes() == b"written"
         assert main.read_bytes() == b"main"
         assert unknown.read_bytes() == b"keep"
@@ -512,17 +510,13 @@ class TestSidecarFamilyOccupancy:
         assert sidecar.name in enrolled
         assert unknown.name not in enrolled
 
-        replace_targets = [staging, sidecar]
-        replace_enrolled(replace_targets[0], replace_targets[1])
-        assert replace_targets == [staging, sidecar]
+        replace_enrolled(staging, sidecar)
         assert sidecar.read_bytes() == b"next"
         assert main.read_bytes() == b"main"
         assert unknown.read_bytes() == b"keep"
         assert not staging.exists()
 
-        delete_targets = [sidecar]
-        unlink_enrolled(delete_targets[0])
-        assert delete_targets == [sidecar]
+        unlink_enrolled(sidecar)
         assert not sidecar.exists()
         assert main.read_bytes() == b"main"
         assert unknown.read_bytes() == b"keep"

@@ -86,10 +86,6 @@ class TestSurface:
         assert err.cleanup_errors == ()
         assert isinstance(err.__cause__, RuntimeError)
 
-    def test_read_signature_is_keyword_only_eligible(self):
-        assert read_metadata_candidate.__defaults__ is None
-        assert "eligible" in read_metadata_candidate.__code__.co_varnames
-
 
 class TestGateBeforeSql:
     def test_ineligible_falls_back_to_legacy_without_sql(self, tmp_path, monkeypatch):

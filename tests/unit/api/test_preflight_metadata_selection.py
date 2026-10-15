@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 import kohakuterrarium.api.routes.persistence.resume as route
 import kohakuterrarium.api.routes.persistence.resume_cluster as cluster
+import kohakuterrarium.session.metadata_candidate as candidate
 import kohakuterrarium.session.version as version
 from kohakuterrarium.api.app import create_app
 from kohakuterrarium.api.deps import get_service_factory
@@ -24,7 +25,7 @@ from kohakuterrarium.session.metadata_candidate import (
     read_metadata_candidate,
 )
 from kohakuterrarium.session.readonly import read_session_meta
-from kohakuterrarium.session.resource_gate import ResourceReleaseError
+from kohakuterrarium.session.resource_gate import GATE, ResourceReleaseError
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium.graph_manifest import MANIFEST_KEY
 
@@ -86,6 +87,7 @@ def test_request_selection_defaults_legacy_and_does_not_leak(setup, manifest):
                 "listen": [],
                 "send": [],
             }
+    before = path.read_bytes()
     assert local_metadata_reader() is None
     baseline = client.post("/api/sessions/saved/resume/preflight")
     assert baseline.status_code == 200
@@ -114,6 +116,64 @@ def test_request_selection_defaults_legacy_and_does_not_leak(setup, manifest):
     assert replaced.status_code == 200
     assert replaced.json()["ready"] is True
     assert counts == {"classification": 2, "version": 1, "ok": 2}
+    assert path.read_bytes() == before
+    assert not GATE.snapshot(path).registered
+
+
+@pytest.mark.parametrize("fault", ["source", "decoder"])
+def test_real_cleanup_failure_reaches_http_without_retry(setup, monkeypatch, fault):
+    app, client, path, counts, _ = setup
+    original_connect = candidate.sqlite3.connect
+    original_decoder = candidate.KVault
+    held = []
+
+    class Connection(candidate.sqlite3.Connection):
+        def close(self):
+            raise OSError("source release failed")
+
+    def connect(*args, **kwargs):
+        conn = original_connect(
+            *args, factory=Connection, check_same_thread=False, **kwargs
+        )
+        held.append(conn)
+        return conn
+
+    class Decoder(original_decoder):
+        def close(self):
+            raise OSError("decoder release failed")
+
+    def selected(path):
+        counts["selected"] += 1
+        with monkeypatch.context() as scoped:
+            if fault == "source":
+                scoped.setattr(candidate.sqlite3, "connect", connect)
+            else:
+                scoped.setattr(candidate, "KVault", Decoder)
+            return read_metadata_candidate(path, eligible=True).meta
+
+    def service():
+        counts["service"] += 1
+        raise AssertionError("local preflight must not create a runtime")
+
+    app.dependency_overrides[get_service_factory] = lambda: service
+    app.dependency_overrides[local_metadata_reader] = lambda: selected
+    try:
+        result = client.post("/api/sessions/saved/resume/preflight")
+        assert result.status_code == (503 if fault == "source" else 500)
+        assert result.json()["detail"]["code"] == (
+            "session_metadata_resource_unavailable"
+            if fault == "source"
+            else "session_metadata_read_failed"
+        )
+        assert "ready" not in result.json()
+        assert counts == {"classification": 2, "version": 1, "selected": 1}
+        if fault == "source":
+            assert GATE.snapshot(path).new_uncertain
+        else:
+            assert not GATE.snapshot(path).registered
+    finally:
+        for connection in held:
+            candidate.sqlite3.Connection.close(connection)
 
 
 @pytest.mark.parametrize("fail_on", [1, 2])
@@ -169,6 +229,9 @@ def test_remote_and_cluster_never_invoke_local_reader(setup, monkeypatch):
     assert calls == ["worker"]
     assert counts == {"classification": 2}
     counts.clear()
+    missing = client.post("/api/sessions/missing/resume/preflight")
+    assert missing.status_code == 404
+    assert not counts
     calls.clear()
     result = client.post(
         "/api/sessions/saved/resume/preflight",

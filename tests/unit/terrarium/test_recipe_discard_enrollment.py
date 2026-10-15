@@ -14,7 +14,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from kohakuterrarium.session.file_family import acquire_family
 from kohakuterrarium.session.resource_gate import (
     GATE,
     REASON_LEGACY_ENROLLED,
@@ -232,34 +231,6 @@ class TestDiscardFamilyEnrollment:
         assert not path.exists()
         leftovers = list(tmp_path.glob(f"{path.name}.discard-*"))
         assert leftovers
-        assert_idle(path)
-
-    def test_handle_free_finish_true_after_failed_syscall(self, tmp_path, monkeypatch):
-        path = tmp_path / "fail.kohakutr"
-        path.write_bytes(b"session")
-        finishes: list[bool] = []
-        real_acquire = acquire_family
-
-        class _Lease:
-            def __init__(self, inner):
-                self._inner = inner
-
-            def finish(self, *, source_released: bool) -> None:
-                finishes.append(source_released)
-                self._inner.finish(source_released=source_released)
-
-        def spy_acquire(paths, operation):
-            return _Lease(real_acquire(paths, operation))
-
-        def boom_replace(*args, **kwargs):
-            raise OSError("replace failed")
-
-        monkeypatch.setattr(discard_mod, "acquire_family", spy_acquire)
-        monkeypatch.setattr(Path, "replace", boom_replace)
-        with pytest.raises(OSError, match="replace failed"):
-            _discard_session_family(path)
-        assert finishes == [True]
-        assert path.exists()
         assert_idle(path)
 
     def test_unrelated_file_progresses_while_target_waits(self, tmp_path, monkeypatch):

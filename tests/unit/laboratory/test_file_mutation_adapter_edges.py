@@ -436,18 +436,3 @@ class TestListAndBundleEdges:
         )
         assert out["error"]["kind"] == "invalid"
         assert "not valid base64" in out["error"]["message"]
-
-    async def test_staged_hash_mismatch_is_production_write_corruption(self, adapter):
-        """Lines 452-453 re-hash a file the adapter just wrote.
-
-        Reaching a mismatch requires the bytes to change between write and
-        hash on the same path. Production does not inject that race; the
-        nearby bundle hash-mismatch (payload vs declared digest) is covered
-        by ``TestPushBundle.test_hash_mismatch_rejected``.
-        """
-        files = {"a.txt": [sha(b"different"), b64(b"real")]}
-        out = await adapter._dispatch(
-            msg("push_bundle", {"scope": "recipe://staged-hash", "files": files})
-        )
-        assert out["error"]["kind"] == "invalid"
-        assert "mismatched hash" in out["error"]["message"]
