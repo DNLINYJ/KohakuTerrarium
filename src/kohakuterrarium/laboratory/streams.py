@@ -184,7 +184,7 @@ class RemoteStream:
         if frame.get("eof"):
             await self._close_local()
             raise StopAsyncIteration
-        if "error" in frame:
+        if "type" not in frame and isinstance(frame.get("error"), dict):
             err = frame["error"]
             await self._close_local()
             raise RemoteStreamError(err.get("kind", "unknown"), err.get("message", ""))
