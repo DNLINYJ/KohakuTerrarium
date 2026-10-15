@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 
 from kohakuterrarium.serving.desktop_attention import expose_desktop_attention
+from kohakuterrarium.serving.desktop_chrome import configure_desktop_chrome
+from kohakuterrarium.serving.desktop_palette import BACKGROUND, FOREGROUND
 from kohakuterrarium.utils.config_dir import config_dir
 from kohakuterrarium.utils.fd_limit import raise_fd_limit
 from kohakuterrarium.utils.logging import configure_utf8_stdio
@@ -19,12 +21,14 @@ from kohakuterrarium.utils.startup_trace import mark as mark_startup
 
 LOADING_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><style>
-html,body{height:100%;margin:0;background:#151525;color:#e8e8f2;font:16px system-ui,sans-serif}
+html,body{height:100%;margin:0;background:BACKGROUND;color:FOREGROUND;font:16px system-ui,sans-serif}
 body{display:grid;place-items:center}.shell{text-align:center}.spinner{width:34px;height:34px;
-margin:0 auto 18px;border:3px solid #373751;border-top-color:#9b87f5;border-radius:50%;
+margin:0 auto 18px;border:3px solid #ccc4ba;border-top-color:#6250d5;border-radius:50%;
 animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
 </style></head><body><div class="shell"><div class="spinner"></div>
-<div>Starting KohakuTerrarium…</div></div></body></html>"""
+<div>Starting KohakuTerrarium…</div></div></body></html>""".replace(
+    "BACKGROUND", BACKGROUND
+).replace("FOREGROUND", FOREGROUND)
 
 
 class _InProcessServer:
@@ -52,9 +56,9 @@ class _InProcessServer:
 def _error_html(message: str) -> str:
     escaped = html.escape(message)
     return f"""<!doctype html><html><head><meta charset="utf-8"><style>
-html,body{{height:100%;margin:0;background:#151525;color:#e8e8f2;font:16px system-ui,sans-serif}}
-body{{display:grid;place-items:center}}.shell{{max-width:640px;padding:32px}}h2{{color:#ff8f8f}}
-pre{{white-space:pre-wrap;color:#cfcfe5}}</style></head><body><div class="shell">
+html,body{{height:100%;margin:0;background:{BACKGROUND};color:{FOREGROUND};font:16px system-ui,sans-serif}}
+body{{display:grid;place-items:center}}.shell{{max-width:640px;padding:32px}}h2{{color:#b42318}}
+pre{{white-space:pre-wrap;color:{FOREGROUND}}}</style></head><body><div class="shell">
 <h2>Startup failed</h2><pre>{escaped}</pre></div></body></html>"""
 
 
@@ -313,9 +317,10 @@ def run_desktop_app(port: int = 8001, log_level: str = "INFO") -> None:
         zoomable=True,
         text_select=True,
         confirm_close=True,
-        background_color="#1a1a2e",
+        background_color=BACKGROUND,
     )
     expose_desktop_attention(window)
+    configure_desktop_chrome(window)
     mark_startup("desktop_window_created", surface="desktop", window="loading")
 
     def _shown():

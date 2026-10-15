@@ -9,13 +9,23 @@ from types import SimpleNamespace
 import pytest
 
 from kohakuterrarium.serving import desktop
+from kohakuterrarium.serving.desktop_palette import BACKGROUND, FOREGROUND
 
 ROOT = Path(__file__).resolve().parents[3]
 SRC = ROOT / "src"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_native_dpi(monkeypatch):
+    monkeypatch.setattr(
+        "kohakuterrarium.serving.desktop_chrome._enable_per_monitor_dpi", lambda: None
+    )
+
+
 class _Events:
     def __init__(self):
+        self.before_show = _Event()
+        self.loaded = _Event()
         self.shown = _Event()
         self.closed = _Event()
 
@@ -329,13 +339,27 @@ def test_server_start_overlaps_loading_window_startup(monkeypatch):
 
     desktop.run_desktop_app(port=8001, log_level="ERROR")
 
-    assert [function.__name__ for function in webview.window.exposed] == [
+    expected = [
         "get_desktop_capabilities",
         "request_desktop_attention",
     ]
+    if sys.platform == "win32":
+        expected.append("set_desktop_theme")
+    assert [function.__name__ for function in webview.window.exposed] == expected
     assert order[:2] == ["server", "shown"]
     assert webview.window.loaded == ["http://127.0.0.1:8123"]
     assert webview.created[0][1]["html"] == desktop.LOADING_HTML
+    assert webview.created[0][1]["background_color"] == BACKGROUND
+
+
+def test_startup_and_error_pages_share_caption_palette():
+    for page in (desktop.LOADING_HTML, desktop._error_html('<bad & "input">')):
+        assert f"background:{BACKGROUND}" in page
+        assert f"color:{FOREGROUND}" in page
+        assert "#151525" not in page
+    assert "&lt;bad &amp; &quot;input&quot;&gt;" in desktop._error_html(
+        '<bad & "input">'
+    )
 
 
 def test_server_fallback_port_drives_navigation(monkeypatch):

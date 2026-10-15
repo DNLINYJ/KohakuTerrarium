@@ -526,5 +526,11 @@
     "function": "_create_from_profile",
     "target": "kohakuterrarium.llm.antigravity_provider",
     "reason": "Load the Google consumer transport only for a selected Antigravity profile."
+  },
+  {
+    "file": "src/kohakuterrarium/serving/desktop_chrome.py",
+    "function": "before_show",
+    "target": "kohakuterrarium.serving.desktop_titlebar",
+    "reason": "WinForms types are available only after the optional Windows pywebview backend has initialized on its UI thread."
   }
 ]

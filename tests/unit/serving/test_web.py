@@ -133,6 +133,9 @@ def test_desktop_blocking_ensures_file_logging(monkeypatch):
 
 
 def test_desktop_blocking_passes_window_icon_on_windows(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "kohakuterrarium.serving.desktop_chrome._enable_per_monitor_dpi", lambda: None
+    )
     started = {}
 
     class _Shown:
@@ -143,7 +146,10 @@ def test_desktop_blocking_passes_window_icon_on_windows(monkeypatch, tmp_path):
             self.handlers.append(handler)
             return self
 
-    window = SimpleNamespace(events=SimpleNamespace(shown=_Shown()))
+    window = SimpleNamespace(
+        events=SimpleNamespace(shown=_Shown(), before_show=_Shown(), loaded=_Shown()),
+        expose=lambda *functions: None,
+    )
     webview = SimpleNamespace(
         create_window=lambda *args, **kwargs: window,
         start=lambda **kwargs: started.update(kwargs),

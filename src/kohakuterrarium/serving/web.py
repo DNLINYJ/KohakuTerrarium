@@ -19,6 +19,8 @@ import uvicorn
 import kohakuterrarium.session.run_state as run_state
 from kohakuterrarium.packages.locations import get_package_root, packages_dir
 from kohakuterrarium.packages.walk import list_packages
+from kohakuterrarium.serving.desktop_chrome import configure_desktop_chrome
+from kohakuterrarium.serving.desktop_palette import BACKGROUND
 from kohakuterrarium.utils.config_dir import config_dir
 from kohakuterrarium.utils.fd_limit import raise_fd_limit
 from kohakuterrarium.utils.logging import (
@@ -414,8 +416,9 @@ def _run_desktop_app_blocking(port: int = 8001, log_level: str = "INFO") -> None
         zoomable=True,
         text_select=True,
         confirm_close=True,
-        background_color="#1a1a2e",
+        background_color=BACKGROUND,
     )
+    configure_desktop_chrome(window)
     mark_startup("desktop_window_created", surface="desktop", port=port)
 
     def _set_icon_windows():
