@@ -593,6 +593,39 @@ class TestSessionIntegration:
         # detect_session_type reads config_type out of meta.
         assert detect_session_type(session_path) == "agent"
 
+        with SessionReadView(session_path) as view:
+            inspection_meta = dict(view.items("meta"))
+            inspection_state = dict(view.items("state"))
+        repo_root = Path(__file__).resolve().parents[2]
+        inspection = await asyncio.to_thread(
+            subprocess.run,
+            [
+                sys.executable,
+                str(repo_root / "scripts" / "inspect_session.py"),
+                str(session_path),
+                "--all",
+                "--search",
+                "channel",
+            ],
+            cwd=tmp_path,
+            env={**os.environ, "PYTHONPATH": str(repo_root / "src")},
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+        )
+        assert inspection.returncode == 0, inspection.stderr
+        assert f"  scribe: {len(events)} events" in inspection.stdout
+        assert "a second channel broadcast message" in inspection.stdout
+        assert "Search: 'channel'" in inspection.stdout
+        assert "(0 results)" not in inspection.stdout
+        with SessionReadView(session_path) as view:
+            assert dict(view.items("meta")) == inspection_meta
+            assert dict(view.items("state")) == inspection_state
+            assert [
+                event for _, event in view.items("events", prefix="scribe:e")
+            ] == events
+
         # ---- phase 2: reopen the file fresh, resume the agent ----
         reopened = SessionStore(str(session_path))
         try:

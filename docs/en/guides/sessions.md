@@ -83,6 +83,32 @@ in one process on one machine. It does not coordinate external processes or arbi
 custom code that bypasses those operations, and it does not redesign concurrency
 between existing legacy readers and writers.
 
+### Inspecting an offline session from a checkout
+
+With KohakuTerrarium installed in the active environment (for development,
+`uv pip install -e ".[dev]"`), run:
+
+```bash
+python scripts/inspect_session.py /path/to/saved.kohakutr
+python scripts/inspect_session.py /path/to/saved.kohakutr --all --search "query"
+```
+
+The inspector owns a `SessionStore.open_readonly()` handle and closes only that
+handle, including when output fails or is interrupted. It does not change session
+status or recency and does not persist reconstructed event counters on close.
+It uses the existing Store resource enrollment: an in-process fast reader delays
+opening, and source-release uncertainty prevents opening.
+
+This is **business-read-only**, not SQLite `mode=ro`: native table initialization
+and SQLite coordination can still modify schema or filesystem bytes. Use it on an
+offline session, not alongside another process writing that file. It neither borrows
+nor finalizes a running owner's Store, and adds no cross-process coordination.
+
+Summary counts enumerate keys rather than decoding event/channel/subagent payloads;
+explicit detail and search options still read their contents. Opening an old session
+without a persisted event counter can still scan event values during Store construction.
+The key-only summary optimization does not remove that separate legacy startup cost.
+
 ## What persists
 
 On each turn KohakuTerrarium records:
