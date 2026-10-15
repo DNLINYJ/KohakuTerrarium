@@ -12,6 +12,7 @@ from kohakuterrarium.core.compact_branch import (
 from kohakuterrarium.core.job_label import canonical_tool_name, make_job_label
 from kohakuterrarium.session.assistant_history import (
     _coerce_tool_args_to_json,
+    assistant_round_messages,
     project_assistant_rounds,
     replay_assistant_event,
 )
@@ -833,11 +834,7 @@ def _inject_synthetic_announcements(
         pending.clear()
 
     eligible = {evt.get("event_id") for evt in events} - (covered_event_ids or set())
-    canonical = {
-        evt.get("event_id"): evt["message"]
-        for evt in project_assistant_rounds(events, eligible)
-        if evt.get("_assistant_projected")
-    }
+    canonical = assistant_round_messages(events, eligible)
     for evt in events:
         etype = evt.get("type", "")
         if evt.get("event_id") in canonical:

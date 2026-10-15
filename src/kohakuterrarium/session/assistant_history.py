@@ -59,15 +59,6 @@ def _copy_event(event: dict[str, Any]) -> dict[str, Any]:
     return copied
 
 
-def _has_boundary_between(
-    events: list[dict[str, Any]], start_index: int, end_index: int
-) -> bool:
-    for between in events[start_index + 1 : end_index]:
-        if between.get("type") in _BOUNDARY_TYPES:
-            return True
-    return False
-
-
 def _find_pairs(
     events: list[dict[str, Any]],
     eligible_ids: set[int] | None,
@@ -81,8 +72,11 @@ def _find_pairs(
     """
     start_index: dict[int, int] = {}
     duplicate_starts: set[int] = set()
+    boundary_counts = [0]
     for index, event in enumerate(events):
-        if event.get("type") != "assistant_round_start":
+        etype = event.get("type")
+        boundary_counts.append(boundary_counts[-1] + (etype in _BOUNDARY_TYPES))
+        if etype != "assistant_round_start":
             continue
         event_id = _positive_id(event.get("event_id"))
         if event_id is None:
@@ -138,7 +132,12 @@ def _find_pairs(
         calls = message.get("tool_calls")
         if calls is not None and (
             not isinstance(calls, list)
-            or not all(isinstance(call, dict) for call in calls)
+            or not all(
+                isinstance(call, dict)
+                and isinstance(call.get("id"), str)
+                and call["id"]
+                for call in calls
+            )
         ):
             continue
         anchor = events[anchor_index]
@@ -146,11 +145,30 @@ def _find_pairs(
             continue
         if not (_eligible(start_id, eligible_ids) and _eligible(end_id, eligible_ids)):
             continue
-        if _has_boundary_between(events, anchor_index, end_index):
+        if boundary_counts[end_index] != boundary_counts[anchor_index + 1]:
             continue
         pairs[start_id] = end
 
     return pairs
+
+
+def assistant_round_messages(
+    events: list[dict], eligible_ids: set[int] | None = None
+) -> dict[int, dict]:
+    """Read canonical round messages without constructing a replay projection."""
+    messages = {
+        start: end["message"]
+        for start, end in _find_pairs(events, eligible_ids).items()
+    }
+    messages.update(
+        {
+            event["event_id"]: event["message"]
+            for event in events
+            if event.get("_assistant_projected")
+            and _eligible(event.get("event_id"), eligible_ids)
+        }
+    )
+    return messages
 
 
 def project_assistant_rounds(
@@ -171,62 +189,46 @@ def project_assistant_rounds(
         for end in pairs.values()
         if _positive_id(end.get("event_id")) is not None
     }
-    event_index = {
-        event.get("event_id"): index
-        for index, event in enumerate(events)
-        if _positive_id(event.get("event_id")) is not None
-    }
-    pair_ranges: dict[int, int] = {}
-    for start_id, end in pairs.items():
-        end_id = end.get("event_id")
-        start_pos = event_index.get(start_id)
-        end_pos = event_index.get(end_id)
-        if start_pos is None or end_pos is None:
-            continue
-        pair_ranges[start_id] = end_pos
-
+    active_calls: set[str] | None = None
     projected: list[dict[str, Any]] = []
-    for index, event in enumerate(events):
+    for event in events:
         copied = _copy_event(event)
         event_id = _positive_id(event.get("event_id"))
         etype = event.get("type")
 
-        if event_id is not None and event_id in pairs:
+        if (
+            etype == "assistant_round_start"
+            and event_id is not None
+            and event_id in pairs
+        ):
             end = pairs[event_id]
             copied["type"] = "assistant_message"
             copied["message"] = deepcopy(end.get("message"))
             copied["canonical_source_event_id"] = end.get("event_id")
             copied["_assistant_projected"] = True
+            active_calls = {
+                call.get("id") for call in (end["message"].get("tool_calls") or [])
+            }
             projected.append(copied)
             continue
 
-        if event_id is not None and event_id in end_ids:
+        if (
+            etype == "assistant_message"
+            and event_id is not None
+            and event_id in end_ids
+        ):
             copied["type"] = "assistant_round_end"
+            active_calls = None
             projected.append(copied)
             continue
 
-        if etype in _DISPLAY_TYPES:
-            in_projected_round = False
-            for start_id, end_pos in pair_ranges.items():
-                start_pos = event_index.get(start_id)
-                if start_pos is None:
-                    continue
-                if start_pos < index < end_pos:
-                    if etype == "assistant_tool_calls":
-                        canonical_calls = {
-                            call.get("id")
-                            for call in (
-                                pairs[start_id].get("message", {}).get("tool_calls")
-                                or []
-                            )
-                        }
-                        if not {
-                            call.get("id") for call in (event.get("tool_calls") or [])
-                        }.issubset(canonical_calls):
-                            continue
-                    in_projected_round = True
-                    break
-            if in_projected_round:
+        if active_calls is not None and etype in _DISPLAY_TYPES:
+            calls = (
+                {call.get("id") for call in (event.get("tool_calls") or [])}
+                if etype == "assistant_tool_calls"
+                else set()
+            )
+            if calls.issubset(active_calls):
                 copied["type"] = "assistant_round_display"
         projected.append(copied)
 

@@ -31,6 +31,34 @@ def _types(events):
     return [evt.get("type") for evt in events]
 
 
+class _CountGet(dict):
+    """Dict that records ``.get`` scans for deterministic complexity checks."""
+
+    calls = 0
+
+    def get(self, key, default=None):
+        type(self).calls += 1
+        return super().get(key, default)
+
+
+class _CountEvents(list):
+    sliced_items = 0
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        if isinstance(key, slice):
+            type(self).sliced_items += len(value)
+        return value
+
+
+class _CountId(int):
+    calls = 0
+
+    def __hash__(self):
+        type(self).calls += 1
+        return int.__hash__(self)
+
+
 class TestProjectAssistantRounds:
     def test_text_mode_synthetic_declaration_is_not_suppressed(self):
         events = [
@@ -125,37 +153,6 @@ class TestProjectAssistantRounds:
         assert events[6]["message"]["content"][0]["text"] == "hello"
         assert events[6]["message"]["extra_field"]["source"] == "model"
         assert out[6]["message"]["content"][0]["text"] == "hello"
-
-    def test_tool_result_before_end_is_projected_before_result(self):
-        events = [
-            _evt(1, "assistant_round_start"),
-            _evt(2, "text_chunk", content="calling"),
-            _evt(3, "assistant_tool_calls", tool_calls=[{"id": "c1"}]),
-            _evt(4, "tool_call", call_id="c1", name="bash"),
-            _evt(5, "tool_result", call_id="c1", output="done"),
-            _evt(
-                6,
-                "assistant_message",
-                round_start_event_id=1,
-                message=_message(content="", tool_calls=[{"id": "c1"}]),
-            ),
-        ]
-
-        out = project_assistant_rounds(events)
-
-        assert _types(out) == [
-            "assistant_message",
-            "assistant_round_display",
-            "assistant_round_display",
-            "tool_call",
-            "tool_result",
-            "assistant_round_end",
-        ]
-        assert out[0]["_assistant_projected"] is True
-        assert out[0]["message"]["tool_calls"] == [{"id": "c1"}]
-        assert _ids(out).index(6) > _ids(out).index(5)
-        assert out[0]["event_id"] == 1
-        assert out[4]["type"] == "tool_result"
 
     def test_two_rounds_same_turn(self):
         events = [
@@ -413,38 +410,12 @@ class TestProjectAssistantRounds:
             "assistant_round_end",
         ]
 
-    def test_retains_ids_and_monotonic_order(self):
-        events = [
-            _evt(1, "user_message", content="q"),
-            _evt(2, "assistant_round_start"),
-            _evt(3, "text_chunk", content="a"),
-            _evt(4, "activity:thinking", name="think"),
-            _evt(
-                5,
-                "assistant_message",
-                round_start_event_id=2,
-                message=_message(content="a"),
-            ),
-            _evt(6, "assistant_round_start"),
-            _evt(7, "assistant_text", content="b"),
-            _evt(
-                8,
-                "assistant_message",
-                round_start_event_id=6,
-                message=_message(content="b"),
-            ),
-        ]
-
-        out = project_assistant_rounds(events)
-
-        assert len(out) == len(events)
-        assert _ids(out) == _ids(events) == [1, 2, 3, 4, 5, 6, 7, 8]
-        assert out[3]["type"] == "activity:thinking"
-        assert [evt["event_id"] for evt in out] == sorted(
-            evt["event_id"] for evt in out
-        )
-
     def test_idempotent_reapplication_keeps_projected_anchor(self):
+        message = _message(
+            content=[{"type": "text", "text": "hello"}],
+            extra={"k": "v"},
+            reasoning_content="r",
+        )
         events = [
             _evt(1, "assistant_round_start"),
             _evt(2, "text_chunk", content="hello"),
@@ -452,7 +423,7 @@ class TestProjectAssistantRounds:
                 3,
                 "assistant_message",
                 round_start_event_id=1,
-                message=_message(content="hello", reasoning_content="r"),
+                message=message,
             ),
         ]
 
@@ -463,42 +434,24 @@ class TestProjectAssistantRounds:
         assert _ids(first) == _ids(second)
         assert second[0]["_assistant_projected"] is True
         assert second[0]["canonical_source_event_id"] == 3
+        assert first[0]["message"] == message
+        assert first[0]["message"] is not message
+        assert first[0]["message"]["extra"] is not message["extra"]
         assert second[0]["message"] == first[0]["message"]
         assert second[0] is not first[0]
         assert second[0]["message"] is not first[0]["message"]
+        assert second[0]["message"]["extra"] is not first[0]["message"]["extra"]
+        assert second[0]["message"] is not second[2]["message"]
+        assert second[2]["message"] is not first[2]["message"]
         second[0]["message"]["content"] = "mutated"
-        assert first[0]["message"]["content"] == "hello"
-
-    def test_already_projected_list_unchanged_and_detached(self):
-        message = _message(content=["part"], extra={"k": "v"})
-        events = [
-            {
-                "event_id": 1,
-                "type": "assistant_message",
-                "turn_index": 1,
-                "branch_id": 1,
-                "parent_branch_path": [],
-                "message": message,
-                "canonical_source_event_id": 3,
-                "_assistant_projected": True,
-            },
-            _evt(2, "assistant_round_display", content="hello"),
-            _evt(3, "assistant_round_end", round_start_event_id=1, message=message),
-        ]
-        original_types = _types(events)
-
-        out = project_assistant_rounds(events)
-
-        assert _types(out) == original_types
-        assert out[0]["_assistant_projected"] is True
-        assert out[0]["canonical_source_event_id"] == 3
-        assert out[0]["message"] == message
-        assert out[0]["message"] is not message
-        assert out[0]["message"]["extra"] is not message["extra"]
-        assert out[2]["message"] is not out[0]["message"]
-        out[0]["message"]["extra"]["k"] = "changed"
-        assert events[0]["message"]["extra"]["k"] == "v"
+        second[0]["message"]["extra"]["k"] = "changed"
+        assert first[0]["message"]["content"] == [{"type": "text", "text": "hello"}]
+        assert first[0]["message"]["extra"]["k"] == "v"
+        assert first[2]["message"]["extra"]["k"] == "v"
+        assert events[0].get("message") is None
+        assert events[2]["message"]["content"] == [{"type": "text", "text": "hello"}]
         assert events[2]["message"]["extra"]["k"] == "v"
+        assert message["extra"]["k"] == "v"
 
     def test_parent_path_list_and_tuple_are_same_lineage(self):
         events = [
@@ -521,30 +474,167 @@ class TestProjectAssistantRounds:
 
     def test_keeps_non_display_events_inside_projected_round(self):
         events = [
-            _evt(1, "assistant_round_start"),
-            _evt(2, "text", content="stream"),
-            _evt(3, "assistant_text", content="alias"),
-            _evt(4, "tool_call", call_id="c1", name="bash"),
-            _evt(5, "tool_result", call_id="c1", output="ok"),
-            _evt(6, "activity:tool", name="bash"),
-            _evt(7, "processing_start"),
+            _evt(1, "user_message", content="q"),
+            _evt(2, "assistant_round_start"),
+            _evt(3, "text", content="stream"),
+            _evt(4, "assistant_text", content="alias"),
+            _evt(5, "text_chunk", content="calling"),
+            _evt(6, "assistant_tool_calls", tool_calls=[{"id": "c1"}]),
+            _evt(7, "tool_call", call_id="c1", name="bash"),
+            _evt(8, "tool_result", call_id="c1", output="ok"),
+            _evt(9, "activity:thinking", name="think"),
+            _evt(10, "activity:tool", name="bash"),
+            _evt(11, "processing_start"),
             _evt(
-                8,
+                12,
                 "assistant_message",
-                round_start_event_id=1,
-                message=_message(content="stream"),
+                round_start_event_id=2,
+                message=_message(content="stream", tool_calls=[{"id": "c1"}]),
+            ),
+            _evt(13, "assistant_round_start"),
+            _evt(14, "assistant_text", content="b"),
+            _evt(
+                15,
+                "assistant_message",
+                round_start_event_id=13,
+                message=_message(content="b"),
             ),
         ]
 
         out = project_assistant_rounds(events)
 
+        assert len(out) == len(events)
+        assert _ids(out) == _ids(events) == list(range(1, 16))
+        assert [evt["event_id"] for evt in out] == sorted(
+            evt["event_id"] for evt in out
+        )
         assert _types(out) == [
+            "user_message",
             "assistant_message",
+            "assistant_round_display",
+            "assistant_round_display",
             "assistant_round_display",
             "assistant_round_display",
             "tool_call",
             "tool_result",
+            "activity:thinking",
             "activity:tool",
             "processing_start",
             "assistant_round_end",
+            "assistant_message",
+            "assistant_round_display",
+            "assistant_round_end",
         ]
+        assert out[1]["_assistant_projected"] is True
+        assert out[1]["event_id"] == 2
+        assert out[1]["message"]["tool_calls"] == [{"id": "c1"}]
+        assert _ids(out).index(12) > _ids(out).index(8)
+        assert out[7]["type"] == "tool_result"
+        assert out[8]["type"] == "activity:thinking"
+
+    def test_malformed_call_identity_keeps_legacy_display(self):
+        events = [
+            _evt(1, "assistant_round_start"),
+            _evt(2, "text_chunk", content="recover"),
+            _evt(
+                3,
+                "assistant_message",
+                round_start_event_id=1,
+                message=_message(tool_calls=[{"id": []}]),
+            ),
+        ]
+        assert _types(project_assistant_rounds(events)) == _types(events)
+
+    def test_cross_type_duplicate_id_does_not_activate_another_interval(self):
+        events = [
+            _evt(1, "assistant_round_start"),
+            _evt(2, "text_chunk", content="first"),
+            _evt(
+                3,
+                "assistant_message",
+                round_start_event_id=1,
+                message=_message(content="first"),
+            ),
+            _evt(1, "activity:thinking"),
+            _evt(4, "text_chunk", content="later"),
+        ]
+        out = project_assistant_rounds(events)
+        assert out[3]["type"] == "activity:thinking"
+        assert out[4]["type"] == "text_chunk"
+        assert out[4]["content"] == "later"
+
+    def test_valid_round_projection_scans_scale_linearly(self):
+        def count(rounds):
+            events = []
+            for index in range(rounds):
+                start = _CountId(index * 3 + 1)
+                events.extend(
+                    [
+                        _evt(start, "assistant_round_start"),
+                        _evt(_CountId(start + 1), "text_chunk", content="x"),
+                        _evt(
+                            _CountId(start + 2),
+                            "assistant_message",
+                            round_start_event_id=start,
+                            message=_message(content="x"),
+                        ),
+                    ]
+                )
+            _CountId.calls = 0
+            out = project_assistant_rounds(events)
+            assert len(out) == rounds * 3
+            assert (
+                _types(out)
+                == [
+                    "assistant_message",
+                    "assistant_round_display",
+                    "assistant_round_end",
+                ]
+                * rounds
+            )
+            return _CountId.calls
+
+        assert count(128) < count(64) * 3
+
+    def test_event_get_scans_scale_linearly_with_nested_rounds(self):
+        def _nested(rounds: int) -> list[_CountGet]:
+            events = _CountEvents()
+            starts: list[int] = []
+            event_id = 1
+            for _ in range(rounds):
+                events.append(_CountGet(_evt(event_id, "assistant_round_start")))
+                starts.append(event_id)
+                event_id += 1
+            for _ in range(rounds):
+                events.append(_CountGet(_evt(event_id, "text_chunk", content="x")))
+                event_id += 1
+            for start_id in reversed(starts):
+                events.append(
+                    _CountGet(
+                        _evt(
+                            event_id,
+                            "assistant_message",
+                            round_start_event_id=start_id,
+                            message=_message(content="x"),
+                        )
+                    )
+                )
+                event_id += 1
+            return events
+
+        def _scan_count(rounds: int) -> int:
+            _CountGet.calls = 0
+            _CountEvents.sliced_items = 0
+            out = project_assistant_rounds(_nested(rounds))
+            assert _types(out)[:2] == ["assistant_round_start", "assistant_round_start"]
+            assert out[-1]["type"] == "assistant_message"
+            innermost_start = rounds - 1
+            innermost_end = 2 * rounds
+            assert out[innermost_start]["type"] == "assistant_message"
+            assert out[innermost_end]["type"] == "assistant_round_end"
+            return _CountGet.calls + _CountEvents.sliced_items
+
+        small = _scan_count(32)
+        large = _scan_count(64)
+        assert small > 0
+        assert large < small * 3
