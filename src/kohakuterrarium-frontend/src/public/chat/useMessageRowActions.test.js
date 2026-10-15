@@ -186,32 +186,37 @@ describe("useMessageRowActions edit lifecycle", () => {
     expect(api.editAttachments.value).toEqual([])
   })
 
-  it.each(["in-place locator", "branch locator", "closed tab", "ABA tab", "missing target"])(
-    "does not submit a prepared edit after %s replacement",
-    async (change) => {
-      const fileText = deferred()
-      const editMessage = vi.fn(async () => ({ ok: true }))
-      const { api } = mountActions({ editMessage })
-      api.startEdit()
-      api.editAttachments.value.push(fileAttachment(fileText))
-      const pending = api.confirmEdit()
-      if (change === "in-place locator") api.__props.message.locator.eventId = 9
-      if (change === "branch locator") api.__props.message.locator.branchId = 2
-      if (change === "closed tab") api.__chat.tabs = []
-      if (change === "ABA tab") {
-        api.__chat.tabs = []
-        api.__chat.tabs = ["main"]
-      }
-      if (change === "missing target")
-        api.__chat.messagesByTab.main = [
-          userMessage({ id: "neighbor", locator: { eventId: 9, turnIndex: 2, branchId: 1 } }),
-        ]
-      fileText.resolve("body")
-      await pending
-      expect(editMessage).not.toHaveBeenCalled()
-      expect(api.editSaving.value).toBe(false)
-    },
-  )
+  it.each([
+    "in-place locator",
+    "branch locator",
+    "closed tab",
+    "ABA tab",
+    "missing target",
+    "instance id",
+  ])("does not submit a prepared edit after %s replacement", async (change) => {
+    const fileText = deferred()
+    const editMessage = vi.fn(async () => ({ ok: true }))
+    const { api } = mountActions({ editMessage })
+    api.startEdit()
+    api.editAttachments.value.push(fileAttachment(fileText))
+    const pending = api.confirmEdit()
+    if (change === "in-place locator") api.__props.message.locator.eventId = 9
+    if (change === "branch locator") api.__props.message.locator.branchId = 2
+    if (change === "closed tab") api.__chat.tabs = []
+    if (change === "ABA tab") {
+      api.__chat.tabs = []
+      api.__chat.tabs = ["main"]
+    }
+    if (change === "missing target")
+      api.__chat.messagesByTab.main = [
+        userMessage({ id: "neighbor", locator: { eventId: 9, turnIndex: 2, branchId: 1 } }),
+      ]
+    if (change === "instance id") api.__chat._instanceId = "other"
+    fileText.resolve("body")
+    await pending
+    expect(editMessage).not.toHaveBeenCalled()
+    expect(api.editSaving.value).toBe(false)
+  })
 
   it("does not apply a late file read error after the host view changed", async () => {
     const owner = ref("A")
@@ -605,30 +610,6 @@ describe("useMessageRowActions order-preserving save", () => {
     expect(payload[0].text).toBe("hello")
     expect(payload[1].file.path).toBe("/workspace/note.txt")
     expect(payload[2].file.content).toBe("body")
-  })
-
-  it("captures serialized parts before await and rejects a stale owner", async () => {
-    const gate = deferred()
-    const editMessage = vi.fn(async () => ({ ok: true }))
-    const message = partsMessage([
-      { type: "text", text: "hello" },
-      { type: "file", file: { name: "note.txt", path: "/workspace/note.txt" } },
-    ])
-    const { api } = mountActions({ message, editMessage, messagesByTab: { main: [message] } })
-    api.startEdit()
-    const extra = {
-      id: "new_async",
-      name: "late.txt",
-      kind: "file",
-      file: { name: "late.txt", type: "text/plain", size: 4, text: () => gate.promise },
-    }
-    api.editAttachments.value.push(extra)
-    const pending = api.confirmEdit()
-    extra.file.name = "mutated.txt"
-    api.__chat._instanceId = "other"
-    gate.resolve("body")
-    await pending
-    expect(editMessage).not.toHaveBeenCalled()
   })
 
   it("surfaces a numeric placeholder rebind as a visible edit error and does not dispatch", async () => {

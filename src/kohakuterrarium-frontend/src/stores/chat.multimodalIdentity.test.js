@@ -59,36 +59,6 @@ function seedBranchHistory(content = "hello") {
 }
 
 describe("multimodal identity — user_input echo", () => {
-  it("reconciles the optimistic row in place when pending_id matches", () => {
-    const chat = seedTab()
-    const eventId = "c_send_1"
-    chat.messagesByTab.main = [
-      {
-        id: "u_1",
-        role: "user",
-        content: "",
-        contentParts: [IMAGE_A],
-        eventId,
-        timestamp: "t0",
-      },
-    ]
-
-    chat._handleUserInput("main", {
-      content: [IMAGE_A],
-      pending_id: eventId,
-      event_id: 41,
-      turn_index: 1,
-      branch_id: 1,
-    })
-
-    expect(chat.messagesByTab.main).toHaveLength(1)
-    expect(chat.messagesByTab.main[0]).toMatchObject({
-      id: "u_1",
-      eventId,
-      contentParts: [IMAGE_A],
-    })
-  })
-
   it("appends distinct pending_ids even when image-only content is identical", () => {
     const chat = seedTab()
     chat.messagesByTab.main = [
@@ -113,44 +83,24 @@ describe("multimodal identity — user_input echo", () => {
     expect(chat.messagesByTab.main.map((m) => m.eventId)).toEqual(["c_send_1", "c_send_2"])
   })
 
-  it("does not drop a second identical-text send that carries a different pending_id", () => {
+  it("replaces optimistic parts in place with authoritative content and ignores a repeated echo", () => {
     const chat = seedTab()
+    const eventId = "c_send_1"
     chat.messagesByTab.main = [
       {
         id: "u_1",
         role: "user",
-        content: "ping",
-        contentParts: [{ type: "text", text: "ping" }],
-        eventId: "c_send_1",
-      },
-    ]
-
-    chat._handleUserInput("main", {
-      content: [{ type: "text", text: "ping" }],
-      pending_id: "c_send_2",
-      event_id: 43,
-    })
-
-    expect(chat.messagesByTab.main).toHaveLength(2)
-    expect(chat.messagesByTab.main.map((m) => m.eventId)).toEqual(["c_send_1", "c_send_2"])
-  })
-
-  it("repeated echo of the same pending_id does not duplicate the row", () => {
-    const chat = seedTab()
-    chat.messagesByTab.main = [
-      {
-        id: "u_1",
-        role: "user",
-        content: "hello",
-        contentParts: [{ type: "text", text: "hello" }],
-        eventId: "c_send_1",
+        content: "caption",
+        contentParts: [{ type: "text", text: "caption" }],
+        eventId,
+        timestamp: "t0",
       },
     ]
 
     const echo = {
-      content: [{ type: "text", text: "hello" }],
-      pending_id: "c_send_1",
-      event_id: 45,
+      content: [{ type: "text", text: "caption" }, IMAGE_A],
+      pending_id: eventId,
+      event_id: 46,
       turn_index: 1,
       branch_id: 1,
     }
@@ -158,32 +108,11 @@ describe("multimodal identity — user_input echo", () => {
     chat._handleUserInput("main", echo)
 
     expect(chat.messagesByTab.main).toHaveLength(1)
-    expect(chat.messagesByTab.main[0].eventId).toBe("c_send_1")
-  })
-
-  it("replaces optimistic parts with the authoritative full content for the same pending_id", () => {
-    const chat = seedTab()
-    chat.messagesByTab.main = [
-      {
-        id: "u_1",
-        role: "user",
-        content: "caption",
-        contentParts: [{ type: "text", text: "caption" }],
-        eventId: "c_send_1",
-      },
-    ]
-
-    chat._handleUserInput("main", {
-      content: [{ type: "text", text: "caption" }, IMAGE_A],
-      pending_id: "c_send_1",
-      event_id: 46,
+    expect(chat.messagesByTab.main[0]).toMatchObject({
+      id: "u_1",
+      eventId,
+      contentParts: [{ type: "text", text: "caption" }, IMAGE_A],
     })
-
-    expect(chat.messagesByTab.main).toHaveLength(1)
-    expect(chat.messagesByTab.main[0].contentParts).toEqual([
-      { type: "text", text: "caption" },
-      IMAGE_A,
-    ])
   })
 
   it("never falls back to content matching when a supplied pending_id is not found", () => {

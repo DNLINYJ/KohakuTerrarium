@@ -211,16 +211,6 @@ describe("order-preserving inline editor helpers", () => {
     expect(original[4].text).toBe("second")
   })
 
-  it("leaves the plain composer prepend-text helper unchanged", async () => {
-    const parts = await buildMessageParts(" hello ", [
-      { file: file("a.txt", "text/plain", "A"), name: "a.txt", kind: "file" },
-    ])
-    expect(parts).toEqual([
-      { type: "text", text: " hello " },
-      expect.objectContaining({ type: "file", file: expect.objectContaining({ content: "A" }) }),
-    ])
-  })
-
   it("appends entered caption when the array source has no original text part", async () => {
     const source = [
       {

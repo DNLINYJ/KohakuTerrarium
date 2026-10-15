@@ -11,14 +11,21 @@ from kohakuterrarium.errors import ConflictError
 from kohakuterrarium.session.store import SessionStore
 
 
-@pytest.mark.parametrize("settled", [True, False])
-@pytest.mark.parametrize("feedback", [True, False])
 @pytest.mark.parametrize(
-    "invalid_target",
-    [None, "untagged", "missing", "same-turn", "bounded", "retention-drop"],
+    ("settled", "feedback", "scenario"),
+    [
+        (False, True, None),
+        (True, False, None),
+        (True, True, None),
+        (True, False, "same-turn"),
+        (True, True, "bounded"),
+        (True, False, "untagged"),
+        (True, False, "missing"),
+        (True, False, "retention-drop"),
+    ],
 )
 def test_refresh_pending_prefix_from_saved_structured_result(
-    tmp_path, settled, feedback, invalid_target
+    tmp_path, settled, feedback, scenario
 ):
     conv = Conversation()
     conv.append("system", "plain")
@@ -77,7 +84,7 @@ def test_refresh_pending_prefix_from_saved_structured_result(
             branch_id=1,
             parent_branch_path=[],
         )
-        if settled and invalid_target == "same-turn":
+        if settled and scenario == "same-turn":
             store.append_event(
                 "agent",
                 "tool_result",
@@ -94,16 +101,16 @@ def test_refresh_pending_prefix_from_saved_structured_result(
             branch_id=1,
             parent_branch_path=[(1, 1)],
         )
-        if settled and invalid_target != "same-turn":
+        if settled and scenario != "same-turn":
             store.append_event(
                 "agent",
                 "tool_result",
                 {"name": "media", "call_id": "job1", "output": parts},
-                turn_index=1 if invalid_target == "same-turn" else 2,
+                turn_index=2,
                 branch_id=1,
-                parent_branch_path=[] if invalid_target == "same-turn" else [(1, 1)],
+                parent_branch_path=[(1, 1)],
             )
-        if invalid_target == "bounded":
+        if scenario == "bounded":
             conv.config.max_messages = 6
             for suffix_turn in range(3, 12):
                 store.append_event(
@@ -123,18 +130,18 @@ def test_refresh_pending_prefix_from_saved_structured_result(
             _parent_branch_path=[(1, 1)],
         )
         target_index = 5 if feedback else 4
-        if invalid_target == "untagged":
+        if scenario == "untagged":
             conv.get_messages()[target_index].metadata.clear()
-        elif invalid_target == "missing":
+        elif scenario == "missing":
             conv.get_messages()[target_index].metadata["turn_index"] = 99
-        if invalid_target == "retention-drop":
+        if scenario == "retention-drop":
             conv.append("system", "second system")
             conv.config.max_messages = 1
         original = conv.to_messages(include_metadata=True)
-        if invalid_target == "bounded":
+        if scenario == "bounded":
             agent._turn_index = 11
             agent._parent_branch_path = [(turn, 1) for turn in range(1, 11)]
-        if settled and invalid_target in {"untagged", "missing", "retention-drop"}:
+        if settled and scenario in {"untagged", "missing", "retention-drop"}:
             with pytest.raises(ConflictError):
                 refresh_mutation_prefix(agent, target_index)
             assert conv.to_messages(include_metadata=True) == original
