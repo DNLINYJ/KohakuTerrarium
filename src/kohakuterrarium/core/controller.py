@@ -30,6 +30,7 @@ from kohakuterrarium.core.controller_plugins import (
 from kohakuterrarium.core.controller_messages import (
     begin_assistant,
     end_assistant,
+    prepare_session_media,
     _merge_text_and_parts,
 )
 from kohakuterrarium.core.conversation import Conversation, ConversationConfig
@@ -889,6 +890,7 @@ class Controller:
                 tools=self._get_native_tool_schemas() if self._is_native_mode else None,
             )
 
+        messages = await prepare_session_media(self, messages)
         logger.info("Generating response...")
 
         await begin_assistant(self)
