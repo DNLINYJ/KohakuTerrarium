@@ -535,6 +535,7 @@ def perform_fork(
             dest.close(update_status=False)
         finally:
             if target.exists():
+                lease = acquire_legacy(target, "fork_failed_output_delete")
                 try:
                     target.unlink()
                 except OSError as cleanup_exc:
@@ -543,6 +544,8 @@ def perform_fork(
                         path=str(target),
                         error=str(cleanup_exc),
                     )
+                finally:
+                    lease.finish(source_released=True)
         raise
 
     _copy_artifacts(Path(source.path), target)

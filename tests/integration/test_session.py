@@ -1071,7 +1071,9 @@ class TestSessionIntegration:
         finally:
             reopened.close()
 
-    async def test_fork_at_event_copies_lineage(self, patched_llm, tmp_path):
+    async def test_fork_at_event_copies_lineage(
+        self, patched_llm, tmp_path, monkeypatch
+    ):
         """Run an agent, then fork its session at a mid-stream event.
 
         Asserts copy-on-fork lineage: the child is an independent file
@@ -1269,8 +1271,23 @@ class TestSessionIntegration:
             raise RuntimeError("mutator blew up")
 
         boom_path = tmp_path / "brancher-boom.kohakutr.v2"
-        with pytest.raises(RuntimeError, match="mutate callable raised"):
-            store.fork(str(boom_path), at_event_id=fork_point_id, mutate=boom)
+        original_unlink = Path.unlink
+        cleanup_paths = []
+
+        def guarded_unlink(path, *args, **kwargs):
+            if path == boom_path:
+                admission = try_fast(path, eligible=True)
+                if admission.lease is not None:
+                    admission.lease.finish(source_released=True)
+                assert admission.reason == "legacy_enrolled"
+                cleanup_paths.append(path)
+            return original_unlink(path, *args, **kwargs)
+
+        with monkeypatch.context() as cleanup:
+            cleanup.setattr(Path, "unlink", guarded_unlink)
+            with pytest.raises(RuntimeError, match="mutate callable raised"):
+                store.fork(str(boom_path), at_event_id=fork_point_id, mutate=boom)
+        assert cleanup_paths == [boom_path]
         assert not boom_path.exists()  # partial output removed
 
         # A mutate callable that returns a NON-dict is a TypeError, and
@@ -1444,7 +1461,9 @@ class TestSessionIntegration:
         still_live = normalize_resumable_events(unfinished, live_job_ids={"c-open"})
         assert not [e for e in still_live if e.get("_synthetic_resume")]
 
-    async def test_v1_to_v2_migration_round_trip(self, patched_llm, tmp_path):
+    async def test_v1_to_v2_migration_round_trip(
+        self, patched_llm, tmp_path, monkeypatch
+    ):
         """Write a v1-format session, migrate it, resume from the result.
 
         ``ensure_latest_version`` discovers the bare v1 file, runs the
@@ -1654,6 +1673,31 @@ class TestSessionIntegration:
         assert all("_history_key" in m for m in fallback["messages"])
         snap_v1.close()
 
+        partial_path = path_for_version(snap_v1_path, 2)
+        original_flush, original_unlink = SessionStore.flush, Path.unlink
+        cleanup_paths = []
+
+        def failed_flush(store):
+            if Path(store.path) == partial_path:
+                raise OSError("migration output failure")
+            return original_flush(store)
+
+        def guarded_unlink(path, *args, **kwargs):
+            if path == partial_path:
+                admission = try_fast(path, eligible=True)
+                if admission.lease is not None:
+                    admission.lease.finish(source_released=True)
+                assert admission.reason == "legacy_enrolled"
+                cleanup_paths.append(path)
+            return original_unlink(path, *args, **kwargs)
+
+        with monkeypatch.context() as cleanup:
+            cleanup.setattr(SessionStore, "flush", failed_flush)
+            cleanup.setattr(Path, "unlink", guarded_unlink)
+            with pytest.raises(RuntimeError, match="migration output failure"):
+                ensure_latest_version(snap_v1_path)
+        assert cleanup_paths == [partial_path]
+        assert snap_v1_path.exists() and not partial_path.exists()
         snap_migrated_path = ensure_latest_version(snap_v1_path)
         assert snap_migrated_path == path_for_version(snap_v1_path, 2)
         snap_migrated = SessionStore(str(snap_migrated_path))

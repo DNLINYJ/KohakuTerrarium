@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from kohakuterrarium.session.migrations import v1_to_v2
+from kohakuterrarium.session.resource_gate import acquire_legacy
 from kohakuterrarium.session.version import FORMAT_VERSION, detect_format_version
 from kohakuterrarium.utils.logging import get_logger
 
@@ -159,6 +160,7 @@ def migrate(source_path: str | Path, target_version: int) -> Path:
         except Exception as exc:
             # Earlier migration products remain valid independent session files.
             if dst_path.exists():
+                lease = acquire_legacy(dst_path, "migration_failed_output_delete")
                 try:
                     dst_path.unlink()
                 except OSError as cleanup_exc:
@@ -167,6 +169,8 @@ def migrate(source_path: str | Path, target_version: int) -> Path:
                         path=str(dst_path),
                         error=str(cleanup_exc),
                     )
+                finally:
+                    lease.finish(source_released=True)
             raise RuntimeError(
                 f"Session migration v{src_v}→v{dst_v} failed for {src}: {exc}"
             ) from exc
