@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -128,11 +128,13 @@ def preflight_to_dict(preflight: WorkspacePreflight) -> dict[str, Any]:
 
 def preflight_session_workspaces(
     store: SessionStore | str | Path,
+    *,
+    metadata_reader: Callable[[str | Path], dict[str, Any]] | None = None,
 ) -> WorkspacePreflight | None:
     """Read saved workspace metadata without migration or lifecycle writes."""
     path = Path(store.path if isinstance(store, SessionStore) else store)
     readable = latest_readable_version(path)
-    meta = read_session_meta(readable)
+    meta = (read_session_meta if metadata_reader is None else metadata_reader)(readable)
     dirty_state = meta.get("workspace_resume_state")
     if isinstance(dirty_state, dict) and dirty_state.get("status") == "partial_dirty":
         raise WorkspaceResumeError(

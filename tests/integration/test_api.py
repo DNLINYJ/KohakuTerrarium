@@ -41,11 +41,12 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-import kohakuterrarium.api.routes.persistence.resume as _resume_route
 import kohakuterrarium.api.routes.persistence.resume_cluster as _resume_cluster
-import kohakuterrarium.terrarium.workspace_resume as _workspace_resume
 from kohakuterrarium.api.app import create_app
 from kohakuterrarium.api.deps import set_service
+from kohakuterrarium.api.routes.persistence.preflight_metadata import (
+    local_metadata_reader,
+)
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.readonly import read_session_meta
 from kohakuterrarium.session.metadata_candidate import read_metadata_candidate
@@ -1870,10 +1871,11 @@ class TestApiIntegration:
             controlled.setattr(
                 _resume_cluster, "read_session_meta", copied_classification
             )
-            controlled.setattr(
-                _workspace_resume, "read_session_meta", controlled_candidate
+            controlled.setitem(
+                client.app.dependency_overrides,
+                local_metadata_reader,
+                lambda: controlled_candidate,
             )
-            controlled.setattr(_resume_route, "read_session_meta", controlled_candidate)
             optimized = client.post("/api/sessions/retired-source/resume/preflight")
             assert optimized.status_code == 200
             assert optimized.json() == preflight.json()

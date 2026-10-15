@@ -141,7 +141,12 @@ def test_local_candidate_failure_returns_non_success_without_retry(
 
     try:
         response = client.post("/api/sessions/saved/resume/preflight")
-        assert response.status_code == 500
+        assert response.status_code == (503 if fault == "source" else 500)
+        assert response.json()["detail"]["code"] == (
+            "session_metadata_resource_unavailable"
+            if fault == "source"
+            else "session_metadata_read_failed"
+        )
         assert counts["selected"] == 1
         assert counts["classification"] == 2
         assert counts["version"] == 1
