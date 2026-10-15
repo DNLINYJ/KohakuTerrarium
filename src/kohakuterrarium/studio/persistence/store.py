@@ -315,9 +315,10 @@ def _path_identity(path: Path) -> str:
 
 
 def _unique_lock_authorities(targets: list[Path], suffix: str) -> list[str]:
-    """Return session paths with distinct physical lock-file identities."""
-    identities = {_path_identity(path) for path in targets}
-    identities.update(os.path.normcase(os.path.abspath(path)) for path in targets)
+    """Return listed targets deduplicated by their physical lock-file identities."""
+    identities = {
+        os.path.normcase(str(path.parent.resolve() / path.name)) for path in targets
+    }
     by_lock = {}
     for path in sorted(identities):
         by_lock.setdefault(_path_identity(Path(path + suffix)), path)
@@ -339,9 +340,9 @@ def delete_session_files(session_name: str) -> list[Path]:
 
     Legacy raw stems use fuzzy resolution. An empty result means no matching
     session exists. Index entries are purged immediately so list and stats
-    views do not retain deleted sessions until reconciliation. Occupancy and
-    writer/Drive locks include canonical and lexical identities; family mutation,
-    index purge, and live forget keep the original targets.
+    views do not retain deleted sessions until reconciliation. Occupancy uses
+    canonical source identities; writer/Drive locks protect listed targets without
+    adding file-symlink referents. Mutation and index cleanup retain original targets.
     """
     targets = all_versions_for_session_default(session_name)
     if not targets:

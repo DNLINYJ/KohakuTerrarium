@@ -36,6 +36,7 @@ side effect.
 import asyncio
 import io
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 
 import numpy as np
@@ -61,6 +62,7 @@ from kohakuterrarium.studio.persistence.session_index import close_session_index
 from kohakuterrarium.studio.sessions import memory_search as _session_memory_mod
 from kohakuterrarium.studio.studio import Studio
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
+from kohakuterrarium.utils.file_lock import FileLock
 from kohakuterrarium.session import job_reaper, run_state
 from kohakuterrarium.studio.sessions.live import live_sessions
 from kohakuterrarium.studio.sessions.live.restore import restore_live_sessions
@@ -1715,6 +1717,29 @@ class TestStudioIntegration:
                 agent=None,
             )
             assert mem["count"] >= 1
+            alias = session_dir / "inspection-alias.kohakutr"
+            try:
+                alias.symlink_to(saved_path)
+            except OSError:
+                alias = None
+            if alias is not None:
+                original = saved_path.read_bytes()
+                with ExitStack() as guards:
+                    for suffix in (".lock", ".drives.migrate-lock"):
+                        lock = FileLock(str(saved_path) + suffix)
+                        lock.acquire()
+                        guards.callback(lock.release)
+                    removed_alias = await asyncio.to_thread(
+                        studio.persistence.delete, "inspection-alias"
+                    )
+                assert removed_alias == [alias]
+                assert not alias.is_symlink()
+                assert saved_path.read_bytes() == original
+                assert not GATE.snapshot(saved_path).registered
+                again = await studio.sessions.search_memory(
+                    saved_stem, "index", mode="fts"
+                )
+                assert again["count"] >= 1
             # The search is done — the file must be releasable. With the
             # leak this delete raises PermissionError on Windows.
             admission = try_fast(saved_path, eligible=True)

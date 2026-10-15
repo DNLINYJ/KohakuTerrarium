@@ -290,6 +290,25 @@ class TestDeleteEnrollmentScope:
 
         monkeypatch.setattr(store_mod, "acquire_legacy", spy_acquire)
         monkeypatch.setattr(store_mod, "acquire_writer_lock", spy_lock)
+        monkeypatch.setattr(
+            store_mod.drive_migration_lock, "_MIGRATE_LOCK_TIMEOUT_S", 0
+        )
+        for suffix, error in (
+            (".lock", SessionLockedError),
+            (".drives.migrate-lock", TimeoutError),
+        ):
+            holder = FileLock(str(real) + suffix)
+            holder.acquire()
+            try:
+                with pytest.raises(error):
+                    store_mod.delete_session_files("alias")
+                assert alias.exists() and real.exists()
+                assert alias_wal.exists() and real_wal.exists()
+                _assert_idle(real)
+            finally:
+                holder.release()
+        enrolled.clear()
+        locks.clear()
         deleted = store_mod.delete_session_files("alias")
         assert not alias.exists()
         assert not real.exists()
