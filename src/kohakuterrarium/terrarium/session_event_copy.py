@@ -16,6 +16,19 @@ def _comparable_event(event: dict) -> dict:
     return payload
 
 
+def _remap_round_anchor(event: dict, event_ids: dict[int, int]) -> dict:
+    """Copy a canonical message's anchor into the destination event namespace."""
+    copied = dict(event)
+    if copied.get("type") == "assistant_message" and "round_start_event_id" in copied:
+        anchor = copied["round_start_event_id"]
+        copied["round_start_event_id"] = (
+            event_ids.get(anchor)
+            if isinstance(anchor, int) and not isinstance(anchor, bool)
+            else None
+        )
+    return copied
+
+
 def copy_events_into(src: SessionStore, dst: SessionStore) -> int:
     """Append events beyond the shared prefix, assigning destination event IDs."""
     # This synchronous topology transaction includes all accepted writes.
@@ -29,12 +42,16 @@ def copy_events_into(src: SessionStore, dst: SessionStore) -> int:
     for agent in src.discover_agents_from_events():
         incoming = src.get_events(agent)
         shared = 0
+        event_ids: dict[int, int] = {}
         for old, new in zip(dst.get_events(agent), incoming):
-            if _comparable_event(old) != _comparable_event(new):
+            if _comparable_event(old) != _comparable_event(
+                _remap_round_anchor(new, event_ids)
+            ):
                 break
+            event_ids[new["event_id"]] = old["event_id"]
             shared += 1
         for raw in incoming[shared:]:
-            data = dict(raw)
+            data = _remap_round_anchor(raw, event_ids)
             event_type = data.pop("type", "event")
             # ``append_event`` sets event_id itself; clear any stale id.
             data.pop("event_id", None)
@@ -46,6 +63,7 @@ def copy_events_into(src: SessionStore, dst: SessionStore) -> int:
                 pbp = data.pop("parent_branch_path")
                 if isinstance(pbp, list):
                     kwargs["parent_branch_path"] = [tuple(p) for p in pbp]
-            dst.append_event(agent, event_type, data, **kwargs)
+            _, destination_id = dst.append_event(agent, event_type, data, **kwargs)
+            event_ids[raw["event_id"]] = destination_id
             n += 1
     return n
