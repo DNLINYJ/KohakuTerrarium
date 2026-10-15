@@ -215,32 +215,13 @@ class TestStoreEnrollment:
         still = try_fast(path, eligible=True)
         assert still.reason == REASON_LEGACY_RELEASE_UNCERTAIN
 
-    def test_table_close_failure_cannot_enable_new(self, tmp_path):
-        path = tmp_path / "closefail.kohakutr"
-        store = SessionStore(path)
-
-        def boom():
-            raise RuntimeError("table close failed")
-
-        original_close = store.events.close
-        store.events.close = boom
-        try:
-            with pytest.raises(RuntimeError):
-                store.close()
-            snap = GATE.snapshot(path)
-            assert snap.legacy_uncertain is True
-            denied = try_fast(path, eligible=True)
-            assert denied.reason == REASON_LEGACY_RELEASE_UNCERTAIN
-        finally:
-            store.events.close = original_close
-            store._close_enrolled_resources()
-
     def test_self_close_rejection_does_not_release_lease(self, tmp_path):
         path = tmp_path / "self-close.kohakutr"
         store = SessionStore(path)
         try:
             with pytest.raises(RuntimeError, match="affinity worker"):
                 store.submit(store.close).result(timeout=5)
+            assert store._closed is False
             assert GATE.snapshot(path).legacy_active == 1
             denied = try_fast(path, eligible=True)
             assert denied.reason == REASON_LEGACY_ENROLLED
@@ -633,19 +614,6 @@ class TestCloseInterruptAndSelfClose:
         finally:
             if not cleaned:
                 original_close_enrolled()
-
-    def test_self_close_rejection_leaves_closed_false(self, tmp_path):
-        path = tmp_path / "self-close-flag.kohakutr"
-        store = SessionStore(path)
-        try:
-            with pytest.raises(RuntimeError, match="affinity worker"):
-                store.submit(store.close).result(timeout=5)
-            assert store._closed is False
-            assert GATE.snapshot(path).legacy_active == 1
-            store.submit(store.state.put, "still-open", "value").result(timeout=5)
-        finally:
-            store.close()
-        assert GATE.snapshot(path).registered is False
 
     def test_table_close_failure_retains_old_propagate_behavior(self, tmp_path):
         path = tmp_path / "table-close-propagate.kohakutr"

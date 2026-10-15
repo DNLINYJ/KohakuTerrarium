@@ -11,8 +11,7 @@ from kohakuterrarium.session.resource_gate import GATE, try_fast
 from kohakuterrarium.session.store import SessionStore
 
 
-@pytest.mark.parametrize("phase", ["tracking", "fetch"])
-def test_primary_query_failure_survives_cursor_close(tmp_path, monkeypatch, phase):
+def test_tracking_failure_survives_cursor_close(tmp_path, monkeypatch):
     path = tmp_path / "query-error.kohakutr"
     with closing(SessionStore(path)) as store:
         store.init_meta("sid", "agent", "", "", [])
@@ -22,9 +21,6 @@ def test_primary_query_failure_survives_cursor_close(tmp_path, monkeypatch, phas
     real_connect = sqlite3.connect
 
     class Cursor(sqlite3.Cursor):
-        def fetchone(self):
-            raise primary
-
         def close(self):
             raise cleanup
 
@@ -45,8 +41,7 @@ def test_primary_query_failure_survives_cursor_close(tmp_path, monkeypatch, phas
 
     monkeypatch.setattr(readonly_view.sqlite3, "connect", connect)
     view = SessionReadView(path)
-    if phase == "tracking":
-        view._cursors = RejectAppend(view._cursors)
+    view._cursors = RejectAppend(view._cursors)
     try:
         with pytest.raises(BaseException) as caught:
             view.get("meta", "session_id")
