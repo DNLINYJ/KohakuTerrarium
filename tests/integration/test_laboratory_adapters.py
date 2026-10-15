@@ -31,6 +31,7 @@ import os
 
 import pytest
 
+from kohakuterrarium.core.config import AgentConfig
 from kohakuterrarium.session.resource_gate import GATE, try_fast
 from kohakuterrarium.studio.catalog.packages_scan import invalidate_scan_caches
 
@@ -411,7 +412,7 @@ class TestTerrariumSessionAdapter:
             session_attacher = WorkerSessionAttacher(
                 engine, client, session_dir=str(tmp_path / "w-sess-sess")
             )
-            TerrariumSessionAdapter(engine, client)
+            session_adapter = TerrariumSessionAdapter(engine, client)
             TerrariumRuntimeAdapter(engine, client, session_attacher=session_attacher)
             try:
                 await _wait_joined(host, "w-sess")
@@ -502,6 +503,46 @@ class TestTerrariumSessionAdapter:
                         timeout=10,
                     )
                     assert retry["ok"] is True
+
+                target = transfer_root / "cancelled-rollback.kohakutr"
+                creature = await engine.add_creature(
+                    AgentConfig(name="rollback"),
+                    llm=ScriptedLLM(["recorded"]),
+                    io="headless",
+                    session=target,
+                    start=True,
+                )
+                assert (await creature.run("record before rollback")).ok
+                graph_id = creature.graph_id
+                store = engine._session_stores[graph_id]
+                session_adapter._remember_resume_token("cancelled", graph_id, target)
+                original_close = store.close
+                loop = asyncio.get_running_loop()
+
+                def close_then_cancel(*args, **kwargs):
+                    original_close(*args, **kwargs)
+                    loop.call_soon(rollback.cancel)
+
+                with monkeypatch.context() as scoped:
+                    scoped.setattr(store, "close", close_then_cancel)
+                    rollback = asyncio.create_task(
+                        session_adapter._op_rollback_resume({"graph_id": graph_id})
+                    )
+                    with pytest.raises(asyncio.CancelledError):
+                        await rollback
+                assert not target.exists()
+                assert not engine.list_creatures()
+                assert graph_id not in engine._session_stores
+                assert not GATE.snapshot(target).registered
+                retry = await host.request(
+                    to_node="w-sess",
+                    namespace="terrarium.session",
+                    type="rollback_resume",
+                    body={"graph_id": graph_id},
+                    timeout=5,
+                )
+                assert retry == {"ok": True, "removed": []}
+                assert not target.exists()
             finally:
                 await client.stop()
                 await engine.shutdown()

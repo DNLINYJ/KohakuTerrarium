@@ -1,6 +1,8 @@
 """Session adapter guards and persisted lifecycle outcomes around cleanup."""
 
+import asyncio
 from contextlib import closing
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -9,9 +11,106 @@ from kohakuterrarium.laboratory.adapters.terrarium_session import (
     _MAX_RESUME_TOKENS,
     _transfer_path,
 )
+from kohakuterrarium.session.resource_gate import GATE, try_fast
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.testing.terrarium import TestTerrariumBuilder
+from tests.unit.laboratory.file_mutation_enrollment_helpers import wait_pending
 from tests.unit.laboratory.test_session_cleanup_enrollment import _adapter, _msg
+
+
+@pytest.mark.parametrize("unlink_fails", [False, True])
+async def test_cancel_after_rollback_close_finishes_cleanup_without_new(
+    tmp_path, monkeypatch, unlink_fails
+):
+    adapter, engine = _adapter(monkeypatch, tmp_path)
+    path = tmp_path / "rollback.kohakutr"
+    store = SessionStore(path)
+    engine._session_stores["graph"] = store
+    engine._owned_sessions.add("graph")
+    adapter._remember_resume_token("token", "graph", path)
+    close = store.close
+    loop = asyncio.get_running_loop()
+    outer = None
+    failure = PermissionError("rollback unlink failed")
+    real_unlink = Path.unlink
+
+    def closed(*args, **kwargs):
+        close(*args, **kwargs)
+        loop.call_soon(outer.cancel)
+
+    def unlink(target, *args, **kwargs):
+        if target == path and unlink_fails:
+            raise failure
+        return real_unlink(target, *args, **kwargs)
+
+    monkeypatch.setattr(store, "close", closed)
+    monkeypatch.setattr(Path, "unlink", unlink)
+    outer = asyncio.create_task(adapter._op_rollback_resume({"graph_id": "graph"}))
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await outer
+    assert not engine._session_stores and not engine._owned_sessions
+    assert not adapter._resume_tokens
+    assert not GATE.snapshot(path).registered
+    if unlink_fails:
+        assert caught.value.__cause__ is failure
+        assert path.exists()
+    else:
+        assert not path.exists()
+        assert await adapter._op_rollback_resume({"graph_id": "graph"}) == {
+            "ok": True,
+            "removed": [],
+        }
+        assert not path.exists()
+
+
+@pytest.mark.parametrize("reattached", [False, True])
+async def test_rollback_cleanup_survives_repeated_cancel_and_rechecks_owner(
+    tmp_path, monkeypatch, reattached
+):
+    adapter, engine = _adapter(monkeypatch, tmp_path)
+    path = tmp_path / "waiting.kohakutr"
+    store = SessionStore(path)
+    engine._session_stores["graph"] = store
+    adapter._remember_resume_token("token", "graph", path)
+    close = store.close
+    leases = []
+
+    def closed(*args, **kwargs):
+        close(*args, **kwargs)
+        lease = try_fast(path, eligible=True).lease
+        assert lease is not None
+        leases.append(lease)
+
+    monkeypatch.setattr(store, "close", closed)
+    outer = asyncio.create_task(adapter._op_rollback_resume({"graph_id": "graph"}))
+    try:
+        await asyncio.to_thread(wait_pending, path, 1)
+        outer.cancel()
+        await asyncio.sleep(0)
+        outer.cancel()
+        await asyncio.sleep(0)
+        assert not outer.done() and path.exists()
+        if reattached:
+            engine._session_stores["replacement"] = SimpleNamespace(path=str(path))
+        leases[0].finish(source_released=True)
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await outer
+        if reattached:
+            assert isinstance(caught.value.__cause__, ValueError)
+            assert "active session store" in str(caught.value.__cause__)
+            assert path.exists()
+        else:
+            assert not path.exists()
+        assert not GATE.snapshot(path).registered
+    finally:
+        for lease in leases:
+            lease.finish(source_released=True)
+        if not outer.done():
+            try:
+                await outer
+            except asyncio.CancelledError:
+                pass
+        engine._session_stores.clear()
 
 
 @pytest.mark.parametrize("value", [None, "", "resume/note.txt"])

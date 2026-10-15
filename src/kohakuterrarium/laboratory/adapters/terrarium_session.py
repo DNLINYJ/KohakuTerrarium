@@ -4,6 +4,7 @@ The adapter supports history, search, store discovery, and adoption of a
 ``.kohakutr`` file that the controller has already copied to the worker.
 """
 
+import asyncio
 import os
 import time
 from pathlib import Path
@@ -13,7 +14,7 @@ from kohakuterrarium.laboratory._internal.app import AppMessage
 from kohakuterrarium.laboratory.adapters.file_scopes import resolve_in_scope
 from kohakuterrarium.laboratory.protocols import LabRegistrar
 from kohakuterrarium.session.file_family import acquire_family
-from kohakuterrarium.session.file_mutation import run_admitted_mutation
+from kohakuterrarium.session.file_mutation import await_mutation, run_admitted_mutation
 from kohakuterrarium.session.readonly import read_session_meta
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium.engine import Terrarium
@@ -329,7 +330,8 @@ class TerrariumSessionAdapter:
                 pass
         self._forget_graph_tokens(graph_id)
         if session_path is not None:
-            await self._delete_inactive_family(session_path)
+            cleanup = asyncio.create_task(self._delete_inactive_family(session_path))
+            await await_mutation(cleanup)
         return {"ok": True, "removed": creature_ids}
 
     def _op_workspace_preflight(self, body: dict[str, Any]) -> dict[str, Any]:
