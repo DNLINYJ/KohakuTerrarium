@@ -65,6 +65,7 @@ from kohakuterrarium.studio.sessions import memory_search as _memory_search
 from kohakuterrarium.terrarium import LocalTerrariumService, Terrarium
 from kohakuterrarium.testing.llm import ScriptedLLM
 from tests.helpers.kt_biome import find_kt_biome_source
+from tests.helpers.resume_metadata_contention import resume_with_metadata_contention
 
 pytestmark = pytest.mark.timeout(60)
 
@@ -1890,7 +1891,9 @@ class TestApiIntegration:
                 assert candidates and set(candidates) == {"legacy_enrolled"}
             finally:
                 reservation.finish(source_released=True)
-        resp = client.post("/api/sessions/retired-source/resume")
+        resp = resume_with_metadata_contention(
+            client, target_path, "/api/sessions/retired-source/resume", monkeypatch
+        )
         assert resp.status_code == 200
         resumed = resp.json()
         assert resumed["type"] == "agent"
