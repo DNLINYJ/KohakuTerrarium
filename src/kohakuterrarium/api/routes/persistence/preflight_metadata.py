@@ -1,4 +1,4 @@
-"""Default-off local preflight read selection and candidate failure responses."""
+"""Best-effort local preflight metadata reads and typed failure responses."""
 
 import asyncio
 from collections.abc import Callable
@@ -7,15 +7,23 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from kohakuterrarium.session.metadata_candidate import MetadataReadError
+from kohakuterrarium.session.metadata_candidate import (
+    MetadataReadError,
+    read_metadata_candidate,
+)
 from kohakuterrarium.session.resource_gate import ResourceReleaseError
 
 MetadataReader = Callable[[str | Path], dict[str, Any]]
 
 
-def local_metadata_reader() -> MetadataReader | None:
-    """Return no candidate until a supported serving assembly supplies a reader."""
-    return None
+def _read_metadata(path: str | Path) -> dict[str, Any]:
+    """Read local metadata with admission-controlled copy fallback."""
+    return read_metadata_candidate(path, eligible=True).meta
+
+
+def local_metadata_reader() -> MetadataReader:
+    """Select best-effort metadata reads for the local preflight suffix."""
+    return _read_metadata
 
 
 async def read_local_preflight(operation: Callable, *args, **kwargs):

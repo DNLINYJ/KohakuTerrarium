@@ -41,12 +41,10 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+import kohakuterrarium.api.routes.persistence.preflight_metadata as _preflight_metadata
 import kohakuterrarium.api.routes.persistence.resume_cluster as _resume_cluster
 from kohakuterrarium.api.app import create_app
 from kohakuterrarium.api.deps import set_service
-from kohakuterrarium.api.routes.persistence.preflight_metadata import (
-    local_metadata_reader,
-)
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.readonly import read_session_meta
 from kohakuterrarium.session.metadata_candidate import read_metadata_candidate
@@ -1863,19 +1861,18 @@ class TestApiIntegration:
             classifications.append(Path(path))
             return read_session_meta(path)
 
-        def controlled_candidate(path):
-            outcome = read_metadata_candidate(path, eligible=True)
+        def observed_candidate(path, *, eligible=False):
+            assert eligible
+            outcome = read_metadata_candidate(path, eligible=eligible)
             candidates.append(outcome.reason)
-            return outcome.meta
+            return outcome
 
         with monkeypatch.context() as controlled:
             controlled.setattr(
                 _resume_cluster, "read_session_meta", copied_classification
             )
-            controlled.setitem(
-                client.app.dependency_overrides,
-                local_metadata_reader,
-                lambda: controlled_candidate,
+            controlled.setattr(
+                _preflight_metadata, "read_metadata_candidate", observed_candidate
             )
             optimized = client.post("/api/sessions/retired-source/resume/preflight")
             assert optimized.status_code == 200

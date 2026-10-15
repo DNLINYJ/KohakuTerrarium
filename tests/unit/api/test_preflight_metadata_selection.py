@@ -6,9 +6,10 @@ from functools import partial
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException, Request
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+import kohakuterrarium.api.routes.persistence.preflight_metadata as preflight_metadata
 import kohakuterrarium.api.routes.persistence.resume as route
 import kohakuterrarium.api.routes.persistence.resume_cluster as cluster
 import kohakuterrarium.session.metadata_candidate as candidate
@@ -24,6 +25,7 @@ from kohakuterrarium.session.metadata_candidate import (
     MetadataReadError,
     read_metadata_candidate,
 )
+from kohakuterrarium.session.memory import SessionMemory
 from kohakuterrarium.session.readonly import read_session_meta
 from kohakuterrarium.session.resource_gate import GATE, ResourceReleaseError, try_fast
 from kohakuterrarium.session.store import SessionStore
@@ -50,6 +52,14 @@ def setup(tmp_path, monkeypatch):
         counts[result.reason] += 1
         return result.meta
 
+    def observed_candidate(path, *, eligible=False):
+        result = read_metadata_candidate(path, eligible=eligible)
+        counts[result.reason] += 1
+        return result
+
+    monkeypatch.setattr(
+        preflight_metadata, "read_metadata_candidate", observed_candidate
+    )
     monkeypatch.setattr(
         cluster, "read_session_meta", partial(copied, label="classification")
     )
@@ -109,7 +119,9 @@ def test_prerequisite_nonresource_failure_keeps_original_http_status(
 
 
 @pytest.mark.parametrize("manifest", [False, True])
-def test_request_selection_defaults_legacy_and_does_not_leak(setup, manifest):
+def test_default_best_effort_matches_legacy_without_dependency_override(
+    setup, manifest
+):
     app, client, path, counts, selected = setup
     if manifest:
         with closing(SessionStore(path)) as store:
@@ -134,35 +146,47 @@ def test_request_selection_defaults_legacy_and_does_not_leak(setup, manifest):
                 "send": [],
             }
     before = path.read_bytes()
-    assert local_metadata_reader() is None
+    app.dependency_overrides[local_metadata_reader] = lambda: None
     baseline = client.post("/api/sessions/saved/resume/preflight")
     assert baseline.status_code == 200
     counts.clear()
 
-    def select(request: Request):
-        return selected if request.headers.get("x-test-candidate") == "1" else None
-
-    app.dependency_overrides[local_metadata_reader] = select
-    response = client.post(
-        "/api/sessions/saved/resume/preflight", headers={"x-test-candidate": "1"}
-    )
+    app.dependency_overrides.pop(local_metadata_reader)
+    response = client.post("/api/sessions/saved/resume/preflight")
     assert response.status_code == 200
     assert response.json() == baseline.json()
     assert counts == {"classification": 2, "version": 1, "ok": 1 if manifest else 2}
     counts.clear()
     normal = client.post("/api/sessions/saved/resume/preflight")
     assert normal.json() == baseline.json()
-    assert counts == {"classification": 2, "version": 1}
+    assert counts == {"classification": 2, "version": 1, "ok": 1 if manifest else 2}
     counts.clear()
     replaced = client.post(
         "/api/sessions/saved/resume/preflight",
         json={"pwd": str(path.parent)},
-        headers={"x-test-candidate": "1"},
     )
     assert replaced.status_code == 200
     assert replaced.json()["ready"] is True
     assert counts == {"classification": 2, "version": 1, "ok": 2}
     assert path.read_bytes() == before
+    assert not GATE.snapshot(path).registered
+
+
+@pytest.mark.parametrize("owner_kind", ["store", "memory"])
+def test_default_reader_falls_back_for_live_resources_then_returns_to_fast(
+    setup, owner_kind
+):
+    app, client, path, counts, _ = setup
+    with closing(
+        SessionStore(path) if owner_kind == "store" else SessionMemory(str(path))
+    ):
+        response = client.post("/api/sessions/saved/resume/preflight")
+        assert response.status_code == 200 and response.json()["ready"]
+        assert counts == {"classification": 2, "version": 1, "legacy_enrolled": 2}
+    counts.clear()
+    response = client.post("/api/sessions/saved/resume/preflight")
+    assert response.status_code == 200 and response.json()["ready"]
+    assert counts == {"classification": 2, "version": 1, "ok": 2}
     assert not GATE.snapshot(path).registered
 
 
@@ -188,21 +212,24 @@ def test_real_cleanup_failure_reaches_http_without_retry(setup, monkeypatch, fau
         def close(self):
             raise OSError("decoder release failed")
 
-    def selected(path):
+    def faulted_candidate(path, *, eligible=False):
+        assert eligible
         counts["selected"] += 1
         with monkeypatch.context() as scoped:
             if fault == "source":
                 scoped.setattr(candidate.sqlite3, "connect", connect)
             else:
                 scoped.setattr(candidate, "KVault", Decoder)
-            return read_metadata_candidate(path, eligible=True).meta
+            return read_metadata_candidate(path, eligible=eligible)
 
     def service():
         counts["service"] += 1
         raise AssertionError("local preflight must not create a runtime")
 
     app.dependency_overrides[get_service_factory] = lambda: service
-    app.dependency_overrides[local_metadata_reader] = lambda: selected
+    monkeypatch.setattr(
+        preflight_metadata, "read_metadata_candidate", faulted_candidate
+    )
     try:
         result = client.post("/api/sessions/saved/resume/preflight")
         assert result.status_code == (503 if fault == "source" else 500)
@@ -254,10 +281,10 @@ def test_failure_is_structured_and_never_ready(setup, stage, status, code, fail_
 def test_remote_and_cluster_never_invoke_local_reader(setup, monkeypatch):
     app, client, path, counts, _ = setup
 
-    def fail(path):
+    def fail(*args, **kwargs):
         raise AssertionError("local metadata reader reached from remote branch")
 
-    app.dependency_overrides[local_metadata_reader] = lambda: fail
+    monkeypatch.setattr(preflight_metadata, "read_metadata_candidate", fail)
     app.dependency_overrides[get_service_factory] = lambda: lambda: SimpleNamespace(
         host=object()
     )
