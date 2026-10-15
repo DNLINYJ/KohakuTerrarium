@@ -6,7 +6,7 @@ from functools import partial
 from types import SimpleNamespace
 
 import pytest
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 
 import kohakuterrarium.api.routes.persistence.resume as route
@@ -25,7 +25,7 @@ from kohakuterrarium.session.metadata_candidate import (
     read_metadata_candidate,
 )
 from kohakuterrarium.session.readonly import read_session_meta
-from kohakuterrarium.session.resource_gate import GATE, ResourceReleaseError
+from kohakuterrarium.session.resource_gate import GATE, ResourceReleaseError, try_fast
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium.graph_manifest import MANIFEST_KEY
 
@@ -60,6 +60,52 @@ def setup(tmp_path, monkeypatch):
         yield app, client, path, counts, selected
     finally:
         client.close()
+
+
+@pytest.mark.parametrize("selected", [False, True])
+def test_preexisting_uncertainty_rejects_repeated_requests_before_local_reader(
+    setup, selected
+):
+    app, client, path, counts, reader = setup
+    if selected:
+        app.dependency_overrides[local_metadata_reader] = lambda: reader
+
+    def forbidden_runtime():
+        raise AssertionError("quarantined request must not create a runtime")
+
+    app.dependency_overrides[get_service_factory] = lambda: forbidden_runtime
+    lease = try_fast(path, eligible=True).lease
+    assert lease is not None
+    lease.finish(source_released=False)
+    for _ in range(2):
+        response = client.post("/api/sessions/saved/resume/preflight")
+        assert response.status_code == 503
+        assert response.json() == {
+            "detail": {
+                "code": "session_metadata_resource_unavailable",
+                "message": "Session metadata resources are unavailable",
+            }
+        }
+        assert str(path) not in response.text
+        assert GATE.snapshot(path).new_uncertain
+        assert not counts
+    missing = client.post("/api/sessions/missing/resume/preflight")
+    assert missing.status_code == 404
+
+
+def test_prerequisite_nonresource_failure_keeps_original_http_status(
+    setup, monkeypatch
+):
+    _, client, _, counts, _ = setup
+
+    def denied(*args):
+        raise HTTPException(409, detail="existing conflict")
+
+    monkeypatch.setattr(route, "canonical_resume_path", denied)
+    response = client.post("/api/sessions/saved/resume/preflight")
+    assert response.status_code == 409
+    assert response.json() == {"detail": "existing conflict"}
+    assert not counts
 
 
 @pytest.mark.parametrize("manifest", [False, True])

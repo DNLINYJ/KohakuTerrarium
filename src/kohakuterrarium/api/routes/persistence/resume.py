@@ -97,10 +97,12 @@ async def preflight_resume(
             status_code=422,
             detail="pwd and workspace_overrides are mutually exclusive",
         )
-    path = await asyncio.to_thread(resolve_session_path_in, session_name, session_dir)
+    path = await read_local_preflight(
+        resolve_session_path_in, session_name, session_dir
+    )
     if path is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    path = await asyncio.to_thread(canonical_resume_path, path, session_dir)
+    path = await read_local_preflight(canonical_resume_path, path, session_dir)
     requested_members = req.members if req is not None and req.members else None
     saved_members = await asyncio.to_thread(_read_saved_cluster_members, path)
     primary_sid = await asyncio.to_thread(

@@ -50,7 +50,7 @@ from kohakuterrarium.api.routes.persistence.preflight_metadata import (
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.readonly import read_session_meta
 from kohakuterrarium.session.metadata_candidate import read_metadata_candidate
-from kohakuterrarium.session.resource_gate import GATE, acquire_legacy
+from kohakuterrarium.session.resource_gate import GATE, acquire_legacy, try_fast
 from kohakuterrarium.studio.persistence.store import resolve_session_path_in
 from kohakuterrarium.api.routes.catalog import _deps as _catalog_deps
 from kohakuterrarium.bootstrap import agent_init as _agent_init
@@ -2057,6 +2057,25 @@ terrarium:
         assert resp.status_code == 200
         resp = client.delete(f"/api/sessions/{terra_b}")
         assert resp.status_code == 200
+
+        quarantined_path = session_dir / "quarantined.kohakutr"
+        quarantined = SessionStore(quarantined_path)
+        try:
+            quarantined.init_meta("quarantined", "agent", "", str(tmp_path), ["alice"])
+        finally:
+            quarantined.close(update_status=False)
+        reservation = try_fast(quarantined_path, eligible=True)
+        assert reservation.lease is not None
+        reservation.lease.finish(source_released=False)
+        for _ in range(2):
+            resp = client.post("/api/sessions/quarantined/resume/preflight")
+            assert resp.status_code == 503
+            assert (
+                resp.json()["detail"]["code"] == "session_metadata_resource_unavailable"
+            )
+            assert "ready" not in resp.json()
+            assert GATE.snapshot(quarantined_path).new_uncertain
+        assert client.post("/api/sessions/absent/resume/preflight").status_code == 404
 
     def test_terrarium_hotplug_and_runtime_graph_workflow(
         self, client: TestClient, creature_dir: Path, scripted_llm: ScriptedLLM
