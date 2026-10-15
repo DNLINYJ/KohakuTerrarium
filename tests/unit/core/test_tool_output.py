@@ -7,6 +7,8 @@ from copy import deepcopy
 from pathlib import Path
 from urllib.parse import unquote
 
+import pytest
+
 from kohakuterrarium.core.tool_output import (
     NormalizedToolOutput,
     OutputStats,
@@ -393,17 +395,46 @@ class TestNormalizeMultimodal:
         # Falls back to placeholder.
         assert n.metadata.get("data_urls_elided") == 1
 
-    def test_filepart_base64_redacted(self):
-        parts = [FilePart(name="x.bin", data_base64="x" * 50)]
-        n = normalize_tool_output(parts, max_output=10_000)
-        assert any(
-            isinstance(p, TextPart) and "elided (50 chars)" in p.text for p in n.output
+    @pytest.mark.parametrize("binary", [False, True])
+    def test_filepart_original_survives_normalization_with_display_only_elision(
+        self, tmp_path, binary
+    ):
+        raw = b"\x00\xffBINARY_REPORT"
+        file = {
+            "name": "report.bin" if binary else "report.txt",
+            "mime": "application/octet-stream" if binary else "text/plain",
+            "encoding": "base64" if binary else "utf-8",
+            "is_inline": True,
+            "vendor": {"token": "keep"},
+        }
+        file.update(
+            {"data_base64": base64.b64encode(raw).decode()}
+            if binary
+            else {"content": "report text"}
         )
-
-    def test_filepart_with_content_passthrough(self):
-        parts = [FilePart(name="x.txt", content="ok")]
-        n = normalize_tool_output(parts, max_output=10_000)
-        assert any(isinstance(p, FilePart) and p.content == "ok" for p in n.output)
+        parts = [{"type": "file", "file": file, "extension": {"source": ["tool"]}}]
+        original = deepcopy(parts)
+        normalized = normalize_tool_output(parts, max_output=1)
+        assert [part.to_dict() for part in normalized.output] == original
+        store = SessionStore(tmp_path / "file.kohakutr")
+        try:
+            store.append_event(
+                "agent",
+                "tool_result",
+                {"output": [part.to_dict() for part in normalized.output]},
+            )
+            store.flush()
+            restored = store.get_events("agent")[0]["output"]
+            assert restored == original
+            if binary:
+                assert base64.b64decode(restored[0]["file"]["data_base64"]) == raw
+                assert "elided" in normalized.stats.preview
+                assert file["data_base64"] not in normalized.stats.preview
+            else:
+                assert restored[0]["file"]["content"] == "report text"
+            assert parts == original
+        finally:
+            store.close()
 
 
 # ── materialize_image_part standalone ────────────────────────────

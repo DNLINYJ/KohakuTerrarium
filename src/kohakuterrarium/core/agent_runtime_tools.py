@@ -171,6 +171,11 @@ class AgentRuntimeToolsMixin:
         if failed_exit and not error:
             error = f"Tool exited with code {exit_code}"
         content = render_content_text(event.content)
+        structured_result = (
+            content_parts_to_dicts(event.content)
+            if isinstance(event.content, list)
+            else content
+        )
         _, label = _make_job_label(job_id)
         activity_done, activity_error = (
             ("subagent_done", "subagent_error")
@@ -204,7 +209,7 @@ class AgentRuntimeToolsMixin:
                     "interrupted": interrupted,
                     "cancelled": cancelled,
                     "final_state": final_state,
-                    "result": content,
+                    "result": content if is_subagent else structured_result,
                     "tools_used": tools_used,
                     "turns": sa_meta.get("turns", 0),
                     "duration": sa_meta.get("duration", 0),
@@ -236,11 +241,6 @@ class AgentRuntimeToolsMixin:
             )
         else:
             result_metadata = context.get("result_metadata", {})
-            structured_result = (
-                content_parts_to_dicts(event.content)
-                if isinstance(event.content, list)
-                else content
-            )
             metadata = {
                 "job_id": job_id,
                 "result": structured_result,

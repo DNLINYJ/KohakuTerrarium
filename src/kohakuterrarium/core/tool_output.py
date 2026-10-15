@@ -298,7 +298,7 @@ def normalize_tool_output(
             parts.append(replacement)
         elif isinstance(part, FilePart):
             has_media = has_media or _is_media_file_part(part)
-            parts.append(_normalize_file_part(part))
+            parts.append(part)
         else:
             parts.append(part)
 
@@ -455,15 +455,6 @@ def _truncate_text_parts(
             "omitted_text_bytes": omitted,
         },
     )
-
-
-def _normalize_file_part(part: FilePart) -> ContentPart:
-    if part.data_base64:
-        label = part.name or part.path or "file"
-        return TextPart(
-            text=f"[file: {label}; base64 content elided ({len(part.data_base64)} chars)]"
-        )
-    return part
 
 
 def _render_image_placeholder(part: ImagePart) -> str:

@@ -220,10 +220,11 @@ class _SlowBackgroundTool(BaseTool):
     """BACKGROUND tool: yields after a short sleep so the controller
     must promote it and pick the result up on a later turn."""
 
-    def __init__(self, *, gated=False, output=None):
+    def __init__(self, *, gated=False, output=None, error=None):
         super().__init__()
         self.calls = 0
         self.output = output
+        self.error = error
         self.gated = gated
         self.started = asyncio.Event()
         self.release = asyncio.Event()
@@ -252,7 +253,9 @@ class _SlowBackgroundTool(BaseTool):
                 "background-finished"
                 if self.output is None
                 else copy.deepcopy(self.output)
-            )
+            ),
+            error=self.error,
+            exit_code=2 if self.error else 0,
         )
 
 
@@ -370,7 +373,24 @@ class _VersionedMediaTool(BaseTool):
                     },
                     "extension": {"payload": [version]},
                 },
-                FilePart(name="same.txt", content=f"FILE_{version}", is_inline=True),
+                (
+                    {
+                        "type": "file",
+                        "file": {
+                            "name": "same.bin",
+                            "mime": "application/octet-stream",
+                            "data_base64": base64.b64encode(b"\x00\xffFILE_B").decode(),
+                            "encoding": "base64",
+                            "is_inline": True,
+                            "vendor": {"version": version},
+                        },
+                        "extension": {"source": ["tool"]},
+                    }
+                    if version == "B"
+                    else FilePart(
+                        name="same.txt", content=f"FILE_{version}", is_inline=True
+                    )
+                ),
             ]
         )
 
@@ -819,12 +839,11 @@ async def _exercise_direct_media_history(tmp_path, monkeypatch):
         assert parts[1]["image_url"]["provider_token"] == f"token_{version}"
         assert parts[1]["extension"] == {"payload": [version]}
         if prepared:
-            assert [part["type"] for part in parts] == [
-                "text",
-                "image_url",
-                "text",
-                "text",
-            ]
+            assert [part["type"] for part in parts] == (
+                ["text", "image_url", "text"]
+                if version == "B"
+                else ["text", "image_url", "text", "text"]
+            )
             assert (
                 base64.b64decode(
                     resolve_artifact_url(parts[1]["image_url"]["url"]).split(",", 1)[1]
@@ -836,12 +855,30 @@ async def _exercise_direct_media_history(tmp_path, monkeypatch):
                 for part in parts[2:]
                 if part.get("text", "").startswith("Attached file: same.txt\nPath: ")
             ]
-            assert len(file_markers) == 1, parts
-            path = Path(file_markers[0].split("Path: ", 1)[1])
-            assert path.read_bytes() == f"FILE_{version}".encode()
+            if version == "B":
+                assert file_markers == []
+                assert parts[2]["text"].startswith("[File read failed: same.bin:")
+                assert "binary" in parts[2]["text"].lower()
+                assert base64.b64encode(b"\x00\xffFILE_B").decode() not in str(parts)
+            else:
+                assert len(file_markers) == 1, parts
+                path = Path(file_markers[0].split("Path: ", 1)[1])
+                assert path.read_bytes() == f"FILE_{version}".encode()
         else:
             assert [part["type"] for part in parts] == ["text", "image_url", "file"]
-            assert parts[2]["file"]["content"] == f"FILE_{version}"
+            if version == "B":
+                assert parts[2]["file"]["name"] == "same.bin"
+                assert parts[2]["file"]["mime"] == "application/octet-stream"
+                assert parts[2]["file"]["encoding"] == "base64"
+                assert parts[2]["file"]["is_inline"] is True
+                assert parts[2]["file"]["vendor"] == {"version": "B"}
+                assert parts[2]["extension"] == {"source": ["tool"]}
+                assert (
+                    base64.b64decode(parts[2]["file"]["data_base64"])
+                    == b"\x00\xffFILE_B"
+                )
+            else:
+                assert parts[2]["file"]["content"] == f"FILE_{version}"
         return parts
 
     def assert_result_state(agent, llm, version, call_id, expected_parts=None):
@@ -851,6 +888,11 @@ async def _exercise_direct_media_history(tmp_path, monkeypatch):
         )
         if expected_parts is not None:
             assert parts == expected_parts
+        if version == "B":
+            assert any(
+                Path(path).read_bytes() == b"\x00\xffFILE_B"
+                for path in agent.controller._inline_file_paths
+            )
         return copy.deepcopy(parts)
 
     async with Terrarium(session_dir=tmp_path / "result-media") as engine:
@@ -1127,7 +1169,10 @@ async def _exercise_settled_media_history(tmp_path):
             },
             {"type": "text", "text": "settled tail"},
         ]
-        background = _SlowBackgroundTool(gated=True, output=background_payload)
+        error = "diagnostic failure" if notify else None
+        background = _SlowBackgroundTool(
+            gated=True, output=background_payload, error=error
+        )
         background.config.notify_controller_on_background_complete = notify
         media_llm = _HistoryReplayLLM(
             True,
@@ -1250,6 +1295,12 @@ async def _exercise_settled_media_history(tmp_path):
                 for event in raw_results
                 if event["type"] == "tool_result" and event.get("call_id") == job.job_id
             )
+            assert result_event["exit_code"] == (2 if error else 0)
+            if error:
+                assert result_event["error"] == error
+                assert result_event["final_state"] == "error"
+                assert result_event["interrupted"] is False
+                assert result_event["cancelled"] is False
             saved_parts = copy.deepcopy(result_event["output"])
             assert [part["type"] for part in saved_parts] == [
                 "text",
