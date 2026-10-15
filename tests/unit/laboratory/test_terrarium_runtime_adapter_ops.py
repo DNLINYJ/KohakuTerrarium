@@ -10,6 +10,8 @@ test-builder's `_FakeAgent` lacks the production agent surface.
 
 from types import SimpleNamespace
 
+import pytest
+
 from kohakuterrarium.errors import ConflictError
 
 from kohakuterrarium.laboratory._internal.app import AppMessage
@@ -271,7 +273,8 @@ class TestChatOps:
         finally:
             await adapter._engine.shutdown()
 
-    async def test_regenerate_forwards_turn_args_to_agent(self):
+    @pytest.mark.parametrize("request_id", [None, "supplied-regenerate"])
+    async def test_regenerate_forwards_turn_args_to_agent(self, request_id):
         adapter = await _make_adapter()
         try:
             creature = adapter._engine.get_creature("alice")
@@ -279,6 +282,7 @@ class TestChatOps:
 
             async def _regen(*, turn_index, branch_view, request_id=None):
                 calls.append((turn_index, branch_view, request_id))
+                creature.agent._branch_execution_error = (request_id, "missing media")
 
             creature.agent = SimpleNamespace(
                 is_running=False, regenerate_last_response=_regen
@@ -290,6 +294,7 @@ class TestChatOps:
                         "creature_id": "alice",
                         "turn_index": 3,
                         "branch_view": "v",
+                        "request_id": request_id,
                     },
                 )
             )
@@ -298,7 +303,10 @@ class TestChatOps:
             assert out["branch_id"] == 0
             assert out["request_id"]
             # The turn/branch selectors are passed through verbatim.
-            assert calls == [(3, "v", None)]
+            assert calls == [(3, "v", out["request_id"])]
+            assert out["execution_error"] == "missing media"
+            if request_id:
+                assert out["request_id"] == request_id
         finally:
             await adapter._engine.shutdown()
 
@@ -339,13 +347,17 @@ class TestChatOps:
         finally:
             await adapter._engine.shutdown()
 
-    async def test_edit_message_returns_edited_flag(self):
+    @pytest.mark.parametrize("request_id", [None, "supplied-edit"])
+    async def test_edit_message_returns_edited_flag(self, request_id):
         adapter = await _make_adapter()
         try:
             creature = adapter._engine.get_creature("alice")
 
             async def _edit(msg_idx, content, **kw):
-                # Echo back a truthy result only for the expected index.
+                creature.agent._branch_execution_error = (
+                    kw["request_id"],
+                    "missing media",
+                )
                 return msg_idx == 2
 
             creature.agent = SimpleNamespace(is_running=False, edit_and_rerun=_edit)
@@ -356,16 +368,19 @@ class TestChatOps:
                         "creature_id": "alice",
                         "msg_idx": 2,
                         "content": "fixed",
+                        "request_id": request_id,
                     },
                 )
             )
-            # Successful edit echoes the canonical ``edited`` flag plus
-            # the ``status: edited`` marker the remote_service shim
-            # uses to detect "new-style" replies. Stub agent has no
-            # ``_turn_index`` / ``_branch_id`` attributes, so those
-            # keys are absent.
             assert out["status"] == "completed"
             assert out["request_id"]
+            assert creature.agent._branch_execution_error == (
+                out["request_id"],
+                "missing media",
+            )
+            assert out["execution_error"] == "missing media"
+            if request_id:
+                assert out["request_id"] == request_id
         finally:
             await adapter._engine.shutdown()
 

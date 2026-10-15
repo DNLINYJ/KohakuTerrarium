@@ -1606,7 +1606,10 @@ class TestLaboratoryAdapterDirect:
             client = ClientConnector(cfg, InProcTransport())
             engine = Terrarium(session_dir=str(tmp_path / "evt-sess"))
             await client.start()
-            TerrariumRuntimeAdapter(engine, client)
+            attacher = WorkerSessionAttacher(
+                engine, client, session_dir=tmp_path / "evt-sess"
+            )
+            TerrariumRuntimeAdapter(engine, client, session_attacher=attacher)
             TerrariumEventsAdapter(engine, client)
 
             for _ in range(20):
@@ -1641,6 +1644,63 @@ class TestLaboratoryAdapterDirect:
                 # forwards provider chunks verbatim rather than buffering
                 # them through the text parser.
                 assert "streamed-reply" in "".join(chunks), f"got chunks: {chunks!r}"
+                worker = engine.get_creature(info.creature_id)
+                missing = [
+                    {"type": "text", "text": "keep the admitted branch"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": (tmp_path / "missing.png").as_uri()},
+                    },
+                ]
+                store = worker.agent.session_store
+                user_index = next(
+                    index
+                    for index, message in enumerate(
+                        worker.agent.controller.conversation.get_messages()
+                    )
+                    if message.role == "user"
+                )
+                calls_before = worker.agent.llm.call_count
+                edited = await remote.edit_message(
+                    info.creature_id, user_index, missing, turn_index=1
+                )
+                regenerated = await remote.regenerate(info.creature_id, turn_index=1)
+                assert edited["request_id"] != regenerated["request_id"]
+                assert edited["branch_id"] < regenerated["branch_id"]
+                for result in (edited, regenerated):
+                    assert result["status"] == "completed"
+                    assert (
+                        "Required local media is unavailable"
+                        in result["execution_error"]
+                    )
+                    admitted = next(
+                        event
+                        for event in store.get_events(worker.config.name)
+                        if event["type"] == "user_message"
+                        and event.get("request_id") == result["request_id"]
+                    )
+                    assert admitted["branch_id"] == result["branch_id"]
+                    assert admitted["content"] == missing
+                assert worker.agent._branch_id == regenerated["branch_id"]
+                assert worker.agent._branch_execution_error == (
+                    regenerated["request_id"],
+                    regenerated["execution_error"],
+                )
+                assert worker.agent.llm.call_count == calls_before
+                repaired = await remote.edit_message(
+                    info.creature_id,
+                    user_index,
+                    "recovered",
+                    turn_index=1,
+                    request_id="supplied-recovery",
+                )
+                assert repaired["request_id"] == "supplied-recovery"
+                assert "execution_error" not in repaired
+                assert worker.agent.llm.call_count == calls_before + 1
+                assert any(
+                    message.get("content") == "recovered"
+                    for message in worker.agent.llm.call_log[-1]
+                )
                 await _safe(coord.shutdown())
             finally:
                 await _safe(client.stop())
