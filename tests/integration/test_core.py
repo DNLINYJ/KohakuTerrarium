@@ -220,9 +220,10 @@ class _SlowBackgroundTool(BaseTool):
     """BACKGROUND tool: yields after a short sleep so the controller
     must promote it and pick the result up on a later turn."""
 
-    def __init__(self, *, gated=False):
+    def __init__(self, *, gated=False, output=None):
         super().__init__()
         self.calls = 0
+        self.output = output
         self.gated = gated
         self.started = asyncio.Event()
         self.release = asyncio.Event()
@@ -246,7 +247,13 @@ class _SlowBackgroundTool(BaseTool):
             await self.release.wait()
         else:
             await asyncio.sleep(0.05)
-        return ToolResult(output="background-finished")
+        return ToolResult(
+            output=(
+                "background-finished"
+                if self.output is None
+                else copy.deepcopy(self.output)
+            )
+        )
 
 
 class _FailingTool(BaseTool):
@@ -3096,6 +3103,233 @@ class TestCoreIntegration:
         finally:
             await post_cold.stop()
             post_store.close()
+
+        for notify in (True, False):
+            settled_dir = tmp_path / f"settled-media-{notify}"
+            monkeypatch.setenv("KT_SESSION_DIR", str(settled_dir))
+            background_payload = [
+                {
+                    "type": "text",
+                    "text": "settled caption",
+                    "extension": {"tag": "caption"},
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,U0VUVExFRF9JTUFHRQ==",
+                        "detail": "high",
+                        "provider_token": "settled",
+                    },
+                    "meta": {
+                        "source_name": "same.png",
+                        "source_type": "generated",
+                        "vendor": {"id": "settled"},
+                    },
+                },
+                {
+                    "type": "file",
+                    "file": {
+                        "name": "same.txt",
+                        "content": "SETTLED_FILE",
+                        "is_inline": True,
+                    },
+                    "extension": {"tag": "file"},
+                },
+                {"type": "text", "text": "settled tail"},
+            ]
+            background = _SlowBackgroundTool(gated=True, output=background_payload)
+            background.config.notify_controller_on_background_complete = notify
+            media_llm = _HistoryReplayLLM(
+                True,
+                plan=[
+                    [NativeToolCall("bg_media", "slowbg", "{}")],
+                    "launched",
+                    "later",
+                    *(["completion feedback"] if notify else []),
+                    "sibling",
+                    "original continued",
+                    "sibling continued",
+                    "excluded call",
+                    "excluded continued",
+                ],
+            )
+
+            def assert_settled_media(agent, llm, expected, excluded=False):
+                calls = [
+                    call
+                    for message in llm.last_messages
+                    for call in message.get("tool_calls") or []
+                    if call["id"] == "bg_media"
+                ]
+                prepared = [
+                    message
+                    for message in llm.last_messages
+                    if message.get("tool_call_id") == "bg_media"
+                ]
+                stored = [
+                    message
+                    for message in agent.controller.conversation.to_messages()
+                    if message.get("tool_call_id") == "bg_media"
+                ]
+                if excluded:
+                    assert calls == prepared == stored == []
+                    assert "SETTLED_FILE" not in str(llm.last_messages)
+                    assert "settled caption" not in str(llm.last_messages)
+                    return
+                assert [
+                    (
+                        call["id"],
+                        call["function"]["name"],
+                        call["function"]["arguments"],
+                    )
+                    for call in calls
+                ] == [("bg_media", "slowbg", "{}")]
+                assert len(stored) == len(prepared) == 1
+                assert stored[0]["name"] == prepared[0]["name"] == "slowbg"
+                assert stored[0]["content"] == expected
+                parts = prepared[0]["content"]
+                assert [part["type"] for part in parts] == [
+                    "text",
+                    "image_url",
+                    "text",
+                    "text",
+                    "text",
+                ]
+                assert parts[0] == expected[0]
+                assert parts[1] == expected[1]
+                assert parts[-1] == expected[-1]
+                assert (
+                    base64.b64decode(
+                        resolve_artifact_url(parts[1]["image_url"]["url"]).split(
+                            ",", 1
+                        )[1]
+                    )
+                    == b"SETTLED_IMAGE"
+                )
+                marker = next(
+                    part["text"]
+                    for part in parts
+                    if part.get("text", "").startswith(
+                        "Attached file: same.txt\nPath: "
+                    )
+                )
+                assert (
+                    Path(marker.split("Path: ", 1)[1]).read_bytes() == b"SETTLED_FILE"
+                )
+
+            async with Terrarium(session_dir=settled_dir) as engine:
+                node = await engine.add_creature(
+                    AgentConfig(
+                        name="settledmedia", system_prompt="plain", tool_format="native"
+                    ),
+                    llm=media_llm,
+                    tools=[background],
+                    io="headless",
+                    start=True,
+                )
+                media_agent = node.agent
+                media_agent.controller.config.include_job_status = False
+                await node.run("launch media", timeout=8)
+                await asyncio.wait_for(background.started.wait(), 2)
+                job = media_agent.executor.get_running_jobs()[0]
+                task = media_agent.executor._tasks[job.job_id]
+                if notify:
+                    await node.run("later turn", timeout=8)
+                    async with node.attach() as stream:
+                        background.release.set()
+                        while True:
+                            activity = await asyncio.wait_for(anext(stream), 8)
+                            if (
+                                isinstance(activity, Activity)
+                                and activity.kind == "processing_end"
+                            ):
+                                break
+                    completion = media_agent._turn_completion
+                    if completion is not None:
+                        await asyncio.wait_for(asyncio.shield(completion), 8)
+                else:
+                    background.release.set()
+                    await asyncio.wait_for(task, 8)
+                    await node.run("later turn", timeout=8)
+                await asyncio.wait_for(task, 8)
+                await media_agent._session_output.drain()
+                assert media_agent.executor.get_running_jobs() == []
+                assert not media_agent.is_processing
+                assert background.calls == 1
+                raw_results = media_agent.session_store.get_events("settledmedia")
+                result_event = next(
+                    event
+                    for event in raw_results
+                    if event["type"] == "tool_result"
+                    and event.get("call_id") == job.job_id
+                )
+                saved_parts = copy.deepcopy(result_event["output"])
+                assert [part["type"] for part in saved_parts] == [
+                    "text",
+                    "image_url",
+                    "file",
+                    "text",
+                ]
+                assert saved_parts[0] == background_payload[0]
+                assert saved_parts[2:] == background_payload[2:]
+                assert saved_parts[1]["meta"]["vendor"] == {"id": "settled"}
+                assert saved_parts[1]["image_url"]["provider_token"] == "settled"
+                original_view = dict(live_branch_path(media_agent))
+                if notify:
+                    await media_agent.regenerate_last_response(turn_index=2)
+                else:
+                    await media_agent.regenerate_last_response()
+                sibling_view = dict(live_branch_path(media_agent))
+                assert_settled_media(media_agent, media_llm, saved_parts)
+                await media_agent.inject_input(
+                    "original continuation", branch_view=original_view
+                )
+                assert_settled_media(media_agent, media_llm, saved_parts)
+                await media_agent.inject_input(
+                    "sibling continuation", branch_view=sibling_view
+                )
+                assert_settled_media(media_agent, media_llm, saved_parts)
+                await media_agent.regenerate_last_response(turn_index=1)
+                excluded_view = dict(live_branch_path(media_agent))
+                await media_agent.inject_input(
+                    "exclude continuation", branch_view=excluded_view
+                )
+                assert_settled_media(media_agent, media_llm, saved_parts, excluded=True)
+                assert background.calls == 1
+                background_path = media_agent.session_store.path
+                settled_events = copy.deepcopy(
+                    media_agent.session_store.get_events("settledmedia")
+                )
+
+            cold_bg_llm = ScriptedLLM(
+                ["cold original", "cold sibling", "cold excluded"]
+            )
+            restored_bg, bg_store = resume_agent(
+                background_path, io_mode="plain", llm=cold_bg_llm
+            )
+            never_rerun = _SlowBackgroundTool(output=background_payload)
+            restored_bg.add_tool(never_rerun)
+            try:
+                restored_bg.controller.config.include_job_status = False
+                await restored_bg.start()
+                for label, view, excluded in [
+                    ("original", original_view, False),
+                    ("sibling", sibling_view, False),
+                    ("excluded", excluded_view, True),
+                ]:
+                    await restored_bg.inject_input(f"cold {label}", branch_view=view)
+                    assert_settled_media(
+                        restored_bg, cold_bg_llm, saved_parts, excluded=excluded
+                    )
+                assert never_rerun.calls == 0
+                assert background.calls == 1
+                assert (
+                    bg_store.get_events("settledmedia")[: len(settled_events)]
+                    == settled_events
+                )
+            finally:
+                await restored_bg.stop()
+                bg_store.close()
 
     async def test_inject_event_and_unified_trigger_model(self, make_creature):
         """The unified ``TriggerEvent`` model: a non-user-input event
