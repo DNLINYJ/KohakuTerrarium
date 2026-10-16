@@ -79,17 +79,22 @@
       <!-- Edit mode -->
       <div v-if="editing" class="message-edit-form flex flex-col gap-2.5">
         <div v-if="editAttachments.length" class="flex flex-wrap gap-2">
-          <div v-for="(attachment, idx) in editAttachments" :key="attachment.id || attachment.name + ':' + idx" class="flex items-center gap-2 px-2.5 py-1 rounded-lg bg-iolite/8 dark:bg-iolite/12 border border-iolite/20 text-xs">
+          <div v-for="(attachment, idx) in editAttachments" :key="attachment.id || attachment.name + ':' + idx" class="message-edit-attachment flex items-center gap-2 px-2.5 py-1 rounded-lg bg-iolite/8 dark:bg-iolite/12 border border-iolite/20 text-xs">
             <span :class="attachment.kind === 'image' ? 'i-carbon-image text-iolite dark:text-iolite-light' : 'i-carbon-document text-aquamarine'" />
             <span class="text-warm-700 dark:text-warm-200 max-w-52 truncate">{{ attachment.name }}</span>
-            <button class="text-warm-400 hover:text-coral" :disabled="editSaving" @click="removeEditAttachment(idx)">
+            <input :data-edit-target="String(idx)" type="file" :accept="attachment.kind === 'image' ? 'image/*' : undefined" class="hidden" :disabled="editSaving" @change="(e) => onEditFileChange(e, attachment.kind)" />
+            <button class="text-warm-400 hover:text-iolite dark:hover:text-iolite-light" :aria-label="t('chat.replaceAttachment', { name: attachment.name })" :disabled="editSaving" @click="($event) => $event.currentTarget.previousElementSibling?.click()">
+              <span class="i-carbon-renew" />
+            </button>
+            <button class="text-warm-400 hover:text-coral" :aria-label="t('chat.removeAttachment', { name: attachment.name })" :disabled="editSaving" @click="removeEditAttachment(idx)">
               <span class="i-carbon-close" />
             </button>
           </div>
         </div>
+        <p v-if="editTextRestricted" data-testid="edit-text-restricted" class="text-xs text-warm-500 dark:text-warm-400">{{ t("chat.editMergedTextDisabled") }}</p>
         <div class="message-edit-input-row flex gap-2 pl-2 pr-3 py-2 rounded-xl bg-warm-50 dark:bg-warm-800 border border-warm-200 dark:border-warm-700 focus-within:border-iolite/40 dark:focus-within:border-iolite-light/30 transition-colors items-end">
-          <input ref="editImageInputEl" type="file" accept="image/*" class="hidden" @change="(e) => onEditFileChange(e, 'image')" />
-          <input ref="editFileInputEl" type="file" class="hidden" @change="(e) => onEditFileChange(e, 'file')" />
+          <input ref="editImageInputEl" data-edit-role="add-image" type="file" accept="image/*" class="hidden" @change="(e) => onEditFileChange(e, 'image')" />
+          <input ref="editFileInputEl" data-edit-role="add-file" type="file" class="hidden" @change="(e) => onEditFileChange(e, 'file')" />
           <div class="message-edit-attach flex items-center gap-0 shrink-0 mb-0.5">
             <button class="w-10 h-10 sm:w-7 sm:h-7 flex items-center justify-center rounded-md transition-colors shrink-0 text-warm-400 hover:text-aquamarine dark:hover:text-aquamarine hover:bg-aquamarine/10 disabled:opacity-50" title="Attach file" aria-label="Attach file" :disabled="editSaving" @click="editFileInputEl?.click()">
               <span class="i-carbon-add text-sm sm:text-xs" />
@@ -98,12 +103,12 @@
               <span class="i-carbon-image text-sm sm:text-xs" />
             </button>
           </div>
-          <textarea ref="editTextareaEl" v-model="editText" class="message-edit-textarea message-edit-inline" :rows="Math.min(16, Math.max(6, editText.split('\n').length))" :disabled="editSaving" @keydown.meta.enter="confirmEdit" @keydown.ctrl.enter="confirmEdit" @keydown.esc="cancelEdit" />
+          <textarea ref="editTextareaEl" v-model="editText" class="message-edit-textarea message-edit-inline" :rows="Math.min(16, Math.max(6, editText.split('\n').length))" :disabled="editSaving" :readonly="editTextRestricted" @keydown.meta.enter="confirmEdit" @keydown.ctrl.enter="confirmEdit" @keydown.esc="cancelEdit" />
         </div>
         <div class="flex flex-wrap items-center gap-2 text-xs">
           <span class="text-warm-400 dark:text-warm-500 mr-auto">Ctrl/Cmd+Enter to rerun · Esc to cancel</span>
           <button class="px-2.5 py-1 rounded hover:bg-warm-100 dark:hover:bg-warm-800 disabled:opacity-50" :disabled="editSaving" @click="cancelEdit">Cancel</button>
-          <button class="px-2.5 py-1 rounded bg-sapphire text-white hover:bg-sapphire-shadow disabled:opacity-60" aria-label="Save and rerun" :disabled="editSaving || branchOperationBusy || (!editText.trim() && editAttachments.length === 0)" @click="confirmEdit">
+          <button class="px-2.5 py-1 rounded bg-sapphire text-white hover:bg-sapphire-shadow disabled:opacity-60" aria-label="Save and rerun" :disabled="editSaving || branchOperationBusy || (!editText.trim() && editAttachments.length === 0 && !editTextRestricted)" @click="confirmEdit">
             {{ editSaving ? "Starting..." : "Save & Rerun" }}
           </button>
         </div>
@@ -353,7 +358,7 @@ const senderHomeNode = computed(() => resolveHomeNode(props.message))
 const siteChipNode = computed(() => (renderSiteChip ? renderSiteChip(senderHomeNode.value) : null))
 
 // ── Message actions (copy / edit / regenerate / branch navigators) ──
-const { editing, editText, editAttachments, editTextareaEl, editImageInputEl, editFileInputEl, editSaving, editError, branchOperationBusy, branchOperationError, copyMessage, copyAssistantText, startEdit, cancelEdit, onEditFileChange, removeEditAttachment, confirmEdit, regenerate, hasUserGroups, hasPrevUserGroup, hasNextUserGroup, goToPrevUserGroup, goToNextUserGroup, hasAssistantBranches, hasPrevAssistantBranch, hasNextAssistantBranch, goToPrevAssistantBranch, goToNextAssistantBranch } = useMessageRowActions({ props, chat, messageTab, writeClipboard, t })
+const { editing, editText, editAttachments, editTextRestricted, editTextareaEl, editImageInputEl, editFileInputEl, editSaving, editError, branchOperationBusy, branchOperationError, copyMessage, copyAssistantText, startEdit, cancelEdit, onEditFileChange, removeEditAttachment, confirmEdit, regenerate, hasUserGroups, hasPrevUserGroup, hasNextUserGroup, goToPrevUserGroup, goToNextUserGroup, hasAssistantBranches, hasPrevAssistantBranch, hasNextAssistantBranch, goToPrevAssistantBranch, goToNextAssistantBranch } = useMessageRowActions({ props, chat, messageTab, writeClipboard, t })
 </script>
 
 <style scoped>

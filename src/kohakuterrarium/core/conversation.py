@@ -15,6 +15,7 @@ from kohakuterrarium.llm.message import (
     TextPart,
     create_message,
     messages_to_dicts,
+    normalize_content_parts,
 )
 from kohakuterrarium.core.conversation_sanitize import (  # noqa: F401
     _is_empty_content,
@@ -85,6 +86,7 @@ class Conversation:
         Returns:
             The created Message object
         """
+        content = normalize_content_parts(content)
         msg = create_message(role, content, **kwargs)  # type: ignore
         self._messages.append(msg)
 

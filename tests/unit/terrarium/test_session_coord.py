@@ -9,6 +9,7 @@ import pytest
 from kohakuterrarium.core.config_types import AgentConfig
 
 
+from kohakuterrarium.session.history import replay_conversation
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium import session_coord as sc
 from kohakuterrarium.terrarium.autosession import close_attached_stores
@@ -52,6 +53,102 @@ class TestCopyEventsInto:
                 "bye",
             ]
             assert sc.copy_events_into(src, dst) == 0
+        finally:
+            src.close()
+            dst.close()
+
+    @pytest.mark.parametrize("shared", [0, 2, 4])
+    def test_copy_remaps_canonical_anchors_including_shared_prefix(
+        self, tmp_path, shared
+    ):
+        src = SessionStore(tmp_path / "canonical.kohakutr")
+        dst = SessionStore(tmp_path / "destination.kohakutr")
+        try:
+            stamp = {"turn_index": 1, "branch_id": 1, "parent_branch_path": []}
+            src.append_event("alice", "user_message", {"content": "question"}, **stamp)
+            _, anchor = src.append_event("alice", "assistant_round_start", {}, **stamp)
+            src.append_event(
+                "alice", "text_chunk", {"content": "stale display"}, **stamp
+            )
+            message = {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "post-hook"},
+                    {
+                        "type": "file",
+                        "file": {"name": "report.txt", "content": "canonical-only"},
+                        "extension": {"nested": ["keep"]},
+                    },
+                ],
+                "provider_state": {"signature": "keep"},
+            }
+            src.append_event(
+                "alice",
+                "assistant_message",
+                {"round_start_event_id": anchor, "message": message},
+                **stamp,
+            )
+            dst.append_event("other", "text_chunk", {"content": "offset"})
+            originals = src.get_events("alice")
+            for raw in originals[:shared]:
+                data = {
+                    key: value
+                    for key, value in raw.items()
+                    if key not in {"event_id", "type"}
+                }
+                if raw["type"] == "assistant_message":
+                    data["round_start_event_id"] = dst.get_events("alice")[1][
+                        "event_id"
+                    ]
+                dst.append_event("alice", raw["type"], data)
+            assert sc.copy_events_into(src, dst) == len(originals) - shared
+            copied = dst.get_events("alice")
+            assert copied[3]["round_start_event_id"] == copied[1]["event_id"]
+            assert copied[1]["event_id"] != anchor
+            assert replay_conversation(copied, branch_view={1: 1}) == [
+                {"role": "user", "content": "question"},
+                message,
+            ]
+            assert sc.copy_events_into(src, dst) == 0
+            assert dst.get_events("alice") == copied
+            assert src.get_events("alice") == originals
+        finally:
+            src.close()
+            dst.close()
+
+    def test_unresolved_round_anchor_cannot_bind_a_destination_id_collision(
+        self, tmp_path
+    ):
+        src = SessionStore(tmp_path / "malformed.kohakutr")
+        dst = SessionStore(tmp_path / "destination.kohakutr")
+        try:
+            src.append_event("alice", "user_message", {"content": "question"})
+            src.append_event("alice", "assistant_round_start", {})
+            src.append_event("alice", "text_chunk", {"content": "legacy fallback"})
+            src.append_event(
+                "alice",
+                "assistant_message",
+                {
+                    "round_start_event_id": 4,
+                    "message": {
+                        "role": "assistant",
+                        "content": "must not replace fallback",
+                    },
+                },
+            )
+            for _ in range(2):
+                dst.append_event("other", "activity:thinking", {})
+            assert sc.copy_events_into(src, dst) == 4
+            copied = dst.get_events("alice")
+            assert copied[1]["event_id"] == 4
+            assert copied[-1]["round_start_event_id"] is None
+            assert replay_conversation(copied) == [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "legacy fallback"},
+            ]
+            assert sc.copy_events_into(src, dst) == 0
+            assert dst.get_events("alice") == copied
+            assert src.get_events("alice")[-1]["round_start_event_id"] == 4
         finally:
             src.close()
             dst.close()

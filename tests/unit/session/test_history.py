@@ -67,6 +67,212 @@ class TestPathMatches:
 
 
 class TestReplayConversation:
+    def test_canonical_round_replaces_display_and_precedes_early_tool_result(self):
+        canonical = {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "post-hook"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,YQ=="},
+                    "extension": {"keep": True},
+                },
+                {"type": "file", "file": {"name": "out.txt", "content": "saved"}},
+            ],
+            "provider_extension": {"token": "signed"},
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "echo", "arguments": "{}"},
+                }
+            ],
+        }
+        events = [
+            {"event_id": 1, "type": "user_message", "content": "question"},
+            {"event_id": 2, "type": "assistant_round_start"},
+            {"event_id": 3, "type": "text_chunk", "content": "pre-hook"},
+            {
+                "event_id": 4,
+                "type": "assistant_image",
+                "url": "https://display.invalid/image",
+            },
+            {
+                "event_id": 5,
+                "type": "tool_call",
+                "call_id": "c1",
+                "name": "echo",
+                "args": {},
+            },
+            {
+                "event_id": 6,
+                "type": "tool_result",
+                "call_id": "c1",
+                "name": "echo",
+                "output": [{"type": "text", "text": "result"}],
+            },
+            {
+                "event_id": 7,
+                "type": "assistant_message",
+                "round_start_event_id": 2,
+                "message": canonical,
+            },
+        ]
+        expected = [
+            {"role": "user", "content": "question"},
+            canonical,
+            {
+                "role": "tool",
+                "content": [{"type": "text", "text": "result"}],
+                "tool_call_id": "c1",
+                "name": "echo",
+            },
+        ]
+        assert replay_conversation(normalize_tool_call_events(events)) == expected
+        assert replay_conversation(events) == expected
+
+    def test_legacy_image_is_replayed_without_display_placeholder(self):
+        events = [
+            {"type": "text_chunk", "content": "caption"},
+            {
+                "type": "assistant_image",
+                "url": "https://images.invalid/a.png",
+                "detail": "high",
+                "source_name": "a.png",
+                "source_type": "generated",
+            },
+        ]
+        assert replay_conversation(events) == [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "caption"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "https://images.invalid/a.png",
+                            "detail": "high",
+                        },
+                        "meta": {"source_name": "a.png", "source_type": "generated"},
+                    },
+                ],
+            }
+        ]
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            None,
+            {},
+            {"role": "user", "content": "wrong"},
+            {"role": "assistant", "content": 123},
+            {"role": "assistant", "content": "x", "tool_calls": "wrong"},
+        ],
+    )
+    def test_malformed_canonical_keeps_recoverable_stream(self, payload):
+        events = [
+            {"event_id": 1, "type": "assistant_round_start"},
+            {"event_id": 2, "type": "text_chunk", "content": "recoverable"},
+            {
+                "event_id": 3,
+                "type": "assistant_message",
+                "round_start_event_id": 1,
+                "message": payload,
+            },
+        ]
+        assert replay_conversation(normalize_tool_call_events(events)) == [
+            {"role": "assistant", "content": "recoverable"}
+        ]
+
+    def test_interrupted_new_image_round_does_not_modify_completed_assistant(self):
+        events = [
+            {"event_id": 1, "type": "assistant_round_start"},
+            {
+                "event_id": 2,
+                "type": "assistant_message",
+                "round_start_event_id": 1,
+                "message": {"role": "assistant", "content": "A"},
+            },
+            {"event_id": 3, "type": "assistant_round_start"},
+            {
+                "event_id": 4,
+                "type": "assistant_image",
+                "url": "https://images.invalid/B",
+            },
+        ]
+        messages = replay_conversation(events)
+        assert len(messages) == 2
+        assert messages[0] == {"role": "assistant", "content": "A"}
+        assert (
+            messages[1]["content"][0]["image_url"]["url"] == "https://images.invalid/B"
+        )
+
+    def test_empty_signed_canonical_round_does_not_duplicate_reasoning_echo(self):
+        message = {"role": "assistant", "content": ""}
+        state = signed_state(
+            message, [{"text": "", "thoughtSignature": "signature"}], "model", "scope"
+        )
+        message[STATE_KEY] = state
+        events = [
+            {"event_id": 1, "type": "assistant_round_start"},
+            {
+                "event_id": 2,
+                "type": "assistant_message",
+                "round_start_event_id": 1,
+                "message": message,
+            },
+            {"event_id": 3, "type": "assistant_reasoning", STATE_KEY: state},
+        ]
+        assert replay_conversation(events) == [message]
+
+    def test_nullable_canonical_tool_calls_remains_replayable(self):
+        message = {"role": "assistant", "content": "answer", "tool_calls": None}
+        events = [
+            {"event_id": 1, "type": "assistant_round_start"},
+            {
+                "event_id": 2,
+                "type": "assistant_message",
+                "round_start_event_id": 1,
+                "message": message,
+            },
+        ]
+        assert replay_conversation(normalize_tool_call_events(events)) == [message]
+
+    def test_equal_legacy_signed_states_in_distinct_user_turns_do_not_collapse(self):
+        message = {"role": "assistant", "content": ""}
+        state = signed_state(
+            message, [{"text": "", "thoughtSignature": "signature"}], "model", "scope"
+        )
+        events = [
+            {"type": "user_message", "content": "A"},
+            {"type": "assistant_reasoning", STATE_KEY: state},
+            {"type": "user_message", "content": "B"},
+            {"type": "assistant_reasoning", STATE_KEY: state},
+        ]
+        messages = replay_conversation(events)
+        assert [message["role"] for message in messages] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+        ]
+        assert messages[1][STATE_KEY] == messages[3][STATE_KEY] == state
+
+    def test_legacy_interleaved_text_and_images_keep_one_round_order(self):
+        events = [
+            {"type": "text_chunk", "content": "before"},
+            {"type": "assistant_image", "url": "https://images.invalid/a.png"},
+            {"type": "text_chunk", "content": "after"},
+        ]
+        messages = replay_conversation(events)
+        assert len(messages) == 1
+        assert [part["type"] for part in messages[0]["content"]] == [
+            "text",
+            "image_url",
+            "text",
+        ]
+        assert messages[0]["content"][2]["text"] == "after"
+
     def test_empty_events(self):
         assert replay_conversation([]) == []
 

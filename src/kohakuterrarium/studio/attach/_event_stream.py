@@ -281,6 +281,8 @@ class StreamOutput(OutputModule):
         dispatch them directly.
         """
         match event.type:
+            case "assistant_round_start" | "assistant_message":
+                pass
             case "model_recovery":
                 self._put({"type": "model_recovery", **event.payload})
             case "text":
@@ -297,8 +299,14 @@ class StreamOutput(OutputModule):
                 # not bypass the awaiting_background flag.
                 await self.on_processing_end()
             case "user_input":
-                # User input is echoed by the attachment loop to avoid duplicate frames.
-                pass
+                if event.payload.get("request_id"):
+                    self._put(
+                        {
+                            "type": "user_input",
+                            "content": event.content,
+                            **event.payload,
+                        }
+                    )
             case "assistant_image":
                 payload = event.payload
                 self.on_assistant_image(
@@ -404,6 +412,7 @@ _STREAM_METADATA_KEYS = (
     "turn_index",
     "branch_id",
     "pending_id",
+    "request_id",
     "final_state",
     # File-mutating tools may include a preview for immediate canvas rendering.
     "canvas_preview",

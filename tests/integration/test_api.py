@@ -38,11 +38,13 @@ import os
 from collections.abc import Iterator
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from kohakuterrarium.api.app import create_app
-from kohakuterrarium.api.deps import set_service
+from kohakuterrarium.api.deps import get_service_legacy, set_service
+from kohakuterrarium.llm.openai import OpenAIProvider
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.readonly import read_session_meta
 from kohakuterrarium.studio.persistence.store import resolve_session_path_in
@@ -838,7 +840,29 @@ class TestApiIntegration:
             info = ws.receive_json()
             assert info["activity_type"] == "session_info"
             assert info["agent_name"] == "alice"
-            reply = _stream_turn(ws, "hello creature")
+            ws.send_json(
+                {
+                    "type": "input",
+                    "content": "hello creature",
+                    "event_id": "m1b-initial",
+                }
+            )
+            frames = []
+            while True:
+                frame = ws.receive_json()
+                frames.append(frame)
+                if frame.get("type") == "idle":
+                    break
+            assert any(
+                frame.get("type") == "user_input"
+                and frame.get("pending_id") == "m1b-initial"
+                for frame in frames
+            )
+            reply = "".join(
+                frame.get("content", "")
+                for frame in frames
+                if frame.get("type") == "text"
+            )
         assert reply == _REPLY_ONE
         assert scripted_llm.call_count == 1
 
@@ -897,6 +921,182 @@ class TestApiIntegration:
             json={"content": "x", "user_position": 999},
         )
         assert resp.status_code == 409
+        parts = [
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/png;base64,YQ==",
+                    "vendor": "retained",
+                },
+                "meta": {"source_name": "original.png", "custom": "kept"},
+            },
+            {"type": "text", "text": "", "vendor": {"state": "empty"}},
+            {
+                "type": "file",
+                "file": {
+                    "name": "duplicate.txt",
+                    "content": "FILE-A",
+                    "mime": "text/plain",
+                    "is_inline": True,
+                },
+            },
+            {
+                "type": "file",
+                "file": {
+                    "name": "duplicate.txt",
+                    "content": "FILE-B",
+                    "mime": "text/plain",
+                    "is_inline": True,
+                },
+            },
+        ]
+        original_events = client.get(f"{base}/history").json()["events"]
+        with client.websocket_connect(ws_url) as ws:
+            ws.receive_json()
+            edited = client.post(
+                f"{base}/messages/0/edit",
+                json={"content": parts, "user_position": 0, "request_id": "m1b-edit"},
+            )
+            assert edited.status_code == 200, edited.text
+            body = edited.json()
+            assert body["request_id"] == "m1b-edit"
+            assert body["execution_error"] is None
+            edit_frames = []
+            while True:
+                frame = ws.receive_json()
+                edit_frames.append(frame)
+                if frame.get("type") == "processing_end":
+                    break
+            assert any(
+                frame.get("type") == "user_input"
+                and frame.get("request_id") == "m1b-edit"
+                and frame.get("content") == parts
+                for frame in edit_frames
+            ), edit_frames
+        after_edit = client.get(f"{base}/history").json()["events"]
+        assert after_edit[: len(original_events)] == original_events
+        edited_root = next(
+            event
+            for event in after_edit
+            if event.get("type") == "user_message"
+            and event.get("request_id") == "m1b-edit"
+        )
+        assert edited_root["content"] == parts
+        prepared = next(
+            message["content"]
+            for message in reversed(scripted_llm.call_log[-1])
+            if message["role"] == "user"
+        )
+        assert prepared[0] == parts[0]
+        assert prepared[1] == parts[1]
+        attachment_paths = [
+            Path(part["text"].split("Path: ", 1)[1])
+            for part in prepared[2:]
+            if part.get("type") == "text" and part["text"].startswith("Attached file:")
+        ]
+        assert len(attachment_paths) == 2, prepared
+        file_a, file_b = attachment_paths
+        assert file_a != file_b
+        assert file_a.read_bytes() == b"FILE-A"
+        assert file_b.read_bytes() == b"FILE-B"
+        rerun = client.post(
+            f"{base}/regenerate",
+            json={
+                "target": {
+                    key: edited_root[key]
+                    for key in ("event_id", "turn_index", "branch_id")
+                },
+                "request_id": "m1b-rerun",
+            },
+        )
+        assert rerun.status_code == 200, rerun.text
+        assert rerun.json()["request_id"] == "m1b-rerun"
+        assert rerun.json()["execution_error"] is None
+        rerun_events = client.get(f"{base}/history").json()["events"]
+        assert (
+            next(
+                event
+                for event in rerun_events
+                if event.get("type") == "user_message"
+                and event.get("request_id") == "m1b-rerun"
+            )["content"]
+            == parts
+        )
+
+        transport_requests = []
+
+        async def reject_request(request):
+            transport_requests.append(request)
+            raise AssertionError("Missing media must fail before HTTP transport")
+
+        async def missing_media_edit_provider():
+            agent = get_service_legacy().engine.get_creature(creature_id).agent
+            provider = OpenAIProvider(api_key="test", model="test")
+            previous_client = provider._client
+            provider._client = previous_client.with_options(
+                http_client=httpx.AsyncClient(
+                    transport=httpx.MockTransport(reject_request)
+                )
+            )
+            await previous_client.close()
+            agent.controller.llm = provider
+            return provider
+
+        provider = client.portal.call(missing_media_edit_provider)
+        try:
+            missing = [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": (tmp_path / "missing.png").as_uri()},
+                }
+            ]
+            failed = client.post(
+                f"{base}/messages/0/edit",
+                json={
+                    "content": missing,
+                    "user_position": 0,
+                    "request_id": "m1b-missing",
+                },
+            )
+            assert failed.status_code == 200, failed.text
+            assert failed.json()["status"] == "completed"
+            assert (
+                "Required local media is unavailable"
+                in failed.json()["execution_error"]
+            )
+            assert failed.json()["request_id"] == "m1b-missing"
+            assert transport_requests == []
+            anonymous = client.post(
+                f"{base}/messages/0/edit", json={"content": missing, "user_position": 0}
+            )
+            assert anonymous.status_code == 200, anonymous.text
+            assert anonymous.json()["request_id"] != "m1b-missing"
+            assert (
+                "Required local media is unavailable"
+                in anonymous.json()["execution_error"]
+            )
+            failed_page = client.get(f"{base}/history").json()
+            assert failed_page["is_processing"] is False
+            assert failed_page["events"][: len(rerun_events)] == rerun_events
+            assert (
+                next(
+                    event
+                    for event in failed_page["events"]
+                    if event.get("type") == "user_message"
+                    and event.get("request_id") == "m1b-missing"
+                )["content"]
+                == missing
+            )
+        finally:
+
+            async def restore_provider():
+                get_service_legacy().engine.get_creature(
+                    creature_id
+                ).agent.controller.llm = scripted_llm
+                await provider.close()
+
+            client.portal.call(restore_provider)
+
         # Rewind the conversation to message index 1 (keeps the system
         # message at index 0 intact).
         resp = client.post(f"{base}/messages/1/rewind")

@@ -85,6 +85,10 @@ class LLMError(KTError):
     """LLM provider construction or call failure."""
 
 
+class MediaReferenceError(LLMError):
+    """Required local media could not be prepared for a provider request."""
+
+
 class LLMNotConfiguredError(LLMError, ValueError):
     """No usable LLM could be resolved from the available configuration."""
 

@@ -373,6 +373,7 @@ async def attach_io(
                 "source": target_creature.name,
                 "content": content,
                 "event_id": pending_id,
+                "pending_id": pending_id,
                 "ts": time.time(),
             }
             log.append(user_evt)

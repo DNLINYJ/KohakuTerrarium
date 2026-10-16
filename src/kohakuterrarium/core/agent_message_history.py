@@ -4,6 +4,8 @@ import re
 from collections.abc import Callable
 from typing import Any
 
+from kohakuterrarium.core.branch_conversation import build_branch_conversation
+from kohakuterrarium.core.conversation import Conversation
 from kohakuterrarium.core.conversation_elide import (
     ELISION_MARKER,
     TOOL_FEEDBACK_KIND,
@@ -14,6 +16,7 @@ from kohakuterrarium.core.message_locator import (
     user_message_indices_for_content,
     user_message_indices_for_turn,
 )
+from kohakuterrarium.core.settled_identity import pending_snapshot_jobs
 from kohakuterrarium.core.snapshot_history import (
     prepare_snapshot,
     replayed_compact_state,
@@ -224,12 +227,7 @@ def include_settled_tool_results(
     *,
     covered_event_ids: set[int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Attach completed results to live calls without rewriting settled pairs.
-
-    Background results are stamped with the live turn at completion. A later
-    sibling of that later turn would otherwise drop the result and sanitize the
-    ancestor call away. Already-paired live results keep their original order.
-    """
+    """Attach completed results to retained calls without rewriting settled pairs."""
     live_events = [
         event
         for event in events
@@ -271,8 +269,7 @@ def include_settled_tool_results(
             and eid in live_event_ids
             and identity not in late_results
         ):
-            # Result is live but recorded after a later user turn; move it
-            # next to the call so pairing survives sanitizer.
+            # Live results recorded in later turns are paired at their call.
             call_turn = next(
                 (
                     ev.get("turn_index")
@@ -339,10 +336,9 @@ def snapshot_needs_settled_tool_replay(
     if not events:
         return False
     live_ids = select_live_event_ids(events, branch_view=branch_view)
+    covered_ids = compact_covered_event_ids(events, branch_view)
     projected = include_settled_tool_results(
-        events,
-        live_ids,
-        covered_event_ids=compact_covered_event_ids(events, branch_view),
+        events, live_ids, covered_event_ids=covered_ids
     )
     needed: dict[str, set[str]] = {}
     provider_ids: dict[str, str] = {}
@@ -357,11 +353,12 @@ def snapshot_needs_settled_tool_replay(
             if provider_id:
                 provider_ids[job_id] = provider_id
                 alias_owners.setdefault(provider_id, set()).add(job_id)
+    pending_jobs = pending_snapshot_jobs(snapshot or [], alias_owners)
     for event in projected:
-        if not event.get("_settled_from_call"):
+        if event.get("type") != "tool_result" or event.get("event_id") in covered_ids:
             continue
         job_id = str(event.get("call_id") or event.get("job_id") or "")
-        if not job_id:
+        if not job_id or job_id not in alias_owners:
             continue
         names = {
             job_id,
@@ -369,6 +366,8 @@ def snapshot_needs_settled_tool_replay(
             str(event.get("tool_call_id") or ""),
         }
         names.discard("")
+        if not event.get("_settled_from_call") and job_id not in pending_jobs:
+            continue
         needed[job_id] = names
         for name in names:
             alias_owners.setdefault(name, set()).add(job_id)
@@ -497,46 +496,22 @@ def reload_conversation_under_branch_view(
     return prepared
 
 
-def apply_prepared_branch_view(agent: Any, prepared: dict[str, Any]) -> None:
+def apply_prepared_branch_view(
+    agent: Any, prepared: dict[str, Any], *, candidate: Conversation | None = None
+) -> None:
     """Install a prepared subtree onto the live agent."""
     messages = prepared["messages"]
     selected = prepared["selected"]
+    conversation = agent.controller.conversation
+    if candidate is None:
+        candidate = build_branch_conversation(conversation, messages)
     agent._context_cutoff_event_id = prepared.get("context_cutoff_event_id", 0)
     manager = getattr(agent, "compact_manager", None)
     if manager is not None:
         state = prepared.get("compact_state") or replayed_compact_state(messages)
         manager._compact_count = state["compact_count"]
         manager._last_compact_time = state["last_compact_time"]
-    conversation = agent.controller.conversation
-    existing_system = [
-        message for message in conversation.get_messages() if message.role == "system"
-    ]
-    conversation._messages.clear()
-    conversation._messages.extend(existing_system)
-    for message in messages:
-        role = message.get("role")
-        if role == "system":
-            continue
-        extra: dict = {}
-        for key in ("tool_calls", "tool_call_id", "name", "metadata"):
-            if message.get(key):
-                extra[key] = message[key]
-        extra_fields = {
-            key: value
-            for key, value in message.items()
-            if key
-            not in {
-                "role",
-                "content",
-                "tool_calls",
-                "tool_call_id",
-                "name",
-                "metadata",
-            }
-        }
-        if extra_fields:
-            extra["extra_fields"] = extra_fields
-        conversation.append(role, message.get("content", ""), **extra)
+    conversation.adopt_contents(candidate)
 
     controller = agent.controller
     config = getattr(controller, "config", None)

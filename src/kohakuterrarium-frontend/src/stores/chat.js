@@ -141,10 +141,12 @@ function _attentionEdgeSummary(data, streamedText) {
 }
 
 function normalizeMessageContent(content) {
-  const contentParts = normalizeContentParts(content)
+  const rawContent = Array.isArray(content) ? JSON.parse(JSON.stringify(content)) : content
+  const contentParts = normalizeContentParts(rawContent)
   return {
     content: typeof content === "string" ? content : extractTextContent(content),
     contentParts,
+    rawContent,
   }
 }
 
@@ -197,10 +199,8 @@ function _insertReasoningSegments(message, rawSegments, idPrefix = "reasoning_")
 }
 
 function contentSignature(content) {
-  if (typeof content === "string") return `text:${content}`
-  const normalized = normalizeContentParts(content)
-  if (!normalized) return ""
-  return JSON.stringify(normalized)
+  if (typeof content === "string") return JSON.stringify([{ type: "text", text: content }])
+  return Array.isArray(content) ? JSON.stringify(content) : ""
 }
 
 // ── Per-tab message indexes (module-level by design) ──
@@ -299,23 +299,6 @@ export function _parseSlashCommand(content) {
   return { command: match[1].toLowerCase(), args: match[2] || "" }
 }
 
-function textSignature(content) {
-  // Coarser comparator used as a fallback by ``_handleUserInputInjected``
-  // when the strict ``contentSignature`` comparison fails. Strips
-  // multimodal parts and trims whitespace so a queue entry whose
-  // ``contentParts`` slightly differs from the backend's drained
-  // ``data.content`` (extra image part, mismatched dict-vs-typed
-  // shape, trailing whitespace) still matches by the text the user
-  // actually typed. Returns ``""`` when no text content present.
-  if (typeof content === "string") return content.trim()
-  if (!Array.isArray(content)) return ""
-  return content
-    .filter((p) => p && typeof p === "object" && p.type === "text")
-    .map((p) => String(p.text || "").trim())
-    .join("\n")
-    .trim()
-}
-
 function toolResultPayload(result, data = {}) {
   // Backend flattens whitelisted metadata fields onto the top level
   // of the WS frame (see ``_STREAM_METADATA_KEYS`` in
@@ -369,6 +352,7 @@ export function _convertHistory(messages, options = {}) {
         role: "user",
         content: normalized.content,
         contentParts: normalized.contentParts,
+        rawContent: normalized.rawContent,
         timestamp: "",
         ...(paged ? { _historyKey: [id], _historyKeys: [id] } : {}),
       })
@@ -389,6 +373,7 @@ export function _convertHistory(messages, options = {}) {
         _fallbackReasoning: !Array.isArray(msg._kt_assistant_segments) ? extractReasoning(msg) : [],
         content: normalized.content,
         contentParts: normalized.contentParts,
+        rawContent: normalized.rawContent,
         timestamp: "",
         tool_calls: tcs.length ? tcs : undefined,
         ...(paged ? { _historyKey: [id], _historyKeys: [id] } : {}),
@@ -1093,7 +1078,8 @@ function _replayPreparedEvents(messages, prepared, tab = "") {
         role: "user",
         content: normalized.content,
         contentParts: normalized.contentParts,
-        eventId: typeof evt.pending_id === "string" ? evt.pending_id : undefined,
+        rawContent: normalized.rawContent,
+        eventId: evt.pending_id || evt.request_id || undefined,
         timestamp: "",
         locator:
           t === "user_message" && typeof evt.event_id === "number"
@@ -1127,7 +1113,8 @@ function _replayPreparedEvents(messages, prepared, tab = "") {
         role: "user",
         content: normalized.content,
         contentParts: normalized.contentParts,
-        eventId: typeof evt.pending_id === "string" ? evt.pending_id : undefined,
+        rawContent: normalized.rawContent,
+        eventId: evt.pending_id || evt.request_id || undefined,
         turnIndex: typeof evt?.turn_index === "number" ? evt.turn_index : null,
         injectedMidTurn: true,
         timestamp: "",
@@ -1480,6 +1467,7 @@ function _replayPreparedEvents(messages, prepared, tab = "") {
         sender: evt.sender || "",
         content: normalized.content,
         contentParts: normalized.contentParts,
+        rawContent: normalized.rawContent,
         timestamp: "",
       }
       addHistoryKey(channelMessage, evt)
@@ -2078,8 +2066,6 @@ const _chatStoreOptions = {
     queuedMessagesByTab: {},
     /** @type {number} Monotonic token to ignore stale history/WS callbacks after instance switches */
     _instanceGeneration: 0,
-    /** @type {Record<string, number>} Recent user message signatures for cross-tab dedupe */
-    _recentUserInputs: {},
     /** @type {Record<string, {active: boolean, expectedBranchByTurn?: Record<string, number>}>} Tabs needing canonical replay after regen/edit streaming finishes */
     _branchResyncPendingByTab: {},
     /** @type {Record<string, number>} Debounce timers for post-branch history resync */
@@ -2378,7 +2364,6 @@ const _chatStoreOptions = {
       this.queuedMessagesByTab = {}
       this.processingByTab = {}
       this.modelRecoveryByTab = {}
-      this._recentUserInputs = {}
       this._branchResyncPendingByTab = {}
       this._streamingBranchByTab = {}
       this._pendingBranchPathByTab = {}
@@ -2771,7 +2756,6 @@ const _chatStoreOptions = {
       const now = Date.now()
       const contentParts = typeof text === "string" ? [{ type: "text", text }] : text
       const normalized = normalizeMessageContent(contentParts)
-      const signature = contentSignature(contentParts)
       // Client-minted stable id so a message that gets buffered mid-turn
       // can be edited / cancelled by id (UXI-08a). The backend echoes it
       // as the pending id; the ``input_queued`` ack confirms the slot.
@@ -2781,11 +2765,12 @@ const _chatStoreOptions = {
         role: "user",
         content: normalized.content,
         contentParts: normalized.contentParts,
+        rawContent: normalized.rawContent,
         eventId,
+        _inputEchoPending: true,
         timestamp: new Date(now).toISOString(),
       }
 
-      this._recentUserInputs[`${tab}:${signature}`] = now
       if (this.processingByTab[tab]) {
         // Don't put in main chat — hold in this tab's queue, shown
         // above the input box. The queue is per-tab so a busy stream
@@ -3427,8 +3412,7 @@ const _chatStoreOptions = {
       const contentParts =
         typeof newContent === "string" ? [{ type: "text", text: newContent }] : newContent
       const normalized = normalizeMessageContent(contentParts)
-      msg.content = normalized.content
-      msg.contentParts = normalized.contentParts
+      Object.assign(msg, normalized)
       if (this._ws?.readyState === WebSocket.OPEN) {
         this._ws.send(
           JSON.stringify({
@@ -4232,7 +4216,7 @@ const _chatStoreOptions = {
      * branch metadata were missing (callers can still proceed; the
      * navigator will catch up on resync).
      */
-    _injectOptimisticBranch(tab, { turnIndex, branchId, content }) {
+    _injectOptimisticBranch(tab, { turnIndex, branchId, content, requestId }) {
       if (!tab || typeof turnIndex !== "number" || typeof branchId !== "number") {
         return false
       }
@@ -4265,6 +4249,7 @@ const _chatStoreOptions = {
       const userInput = {
         type: "user_input",
         content,
+        request_id: requestId,
         event_id: baseId,
         turn_index: turnIndex,
         branch_id: branchId,
@@ -4274,6 +4259,7 @@ const _chatStoreOptions = {
       const userMessage = {
         type: "user_message",
         content,
+        request_id: requestId,
         event_id: baseId - 1,
         turn_index: turnIndex,
         branch_id: branchId,
@@ -4554,11 +4540,13 @@ const _chatStoreOptions = {
       const predictedBranch = typeof knownLatestBranch === "number" ? knownLatestBranch + 1 : null
       let optimisticApplied = false
       if (typeof resolvedTurnIndex === "number" && predictedBranch != null) {
-        const originalContent = targetUserMsg?.contentParts || targetUserMsg?.content || ""
+        const originalContent =
+          targetUserMsg?.rawContent ?? targetUserMsg?.contentParts ?? targetUserMsg?.content ?? ""
         const injected = this._injectOptimisticBranch(tab, {
           turnIndex: resolvedTurnIndex,
           branchId: predictedBranch,
           content: originalContent,
+          requestId: owner.requestId,
         })
         if (injected) {
           if (!this.branchViewByTab[tab]) this.branchViewByTab[tab] = {}
@@ -4667,7 +4655,16 @@ const _chatStoreOptions = {
           this._scheduleBranchResync(tab)
         }
         if (!this._branchOpOwned(owner)) return this._branchOpSuperseded(tab)
-        return this._branchOperationResult(true, tab, this.branchOperationByTab[tab])
+        if (regenResponse?.execution_error) {
+          this.processingByTab[tab] = false
+          this._failBranchOperation(tab, regenResponse.execution_error)
+        }
+        return this._branchOperationResult(
+          true,
+          tab,
+          this.branchOperationByTab[tab],
+          regenResponse?.execution_error || null,
+        )
       } catch (e) {
         if (!this._branchOpOwned(owner)) return this._branchOpSuperseded(tab)
         console.warn("Failed to regenerate:", e)
@@ -4772,8 +4769,10 @@ const _chatStoreOptions = {
         const normalized = normalizeMessageContent(newContent)
         const editedRow = {
           ...original,
+          eventId: owner.requestId,
           content: normalized.content,
           contentParts: normalized.contentParts,
+          rawContent: normalized.rawContent,
         }
         msgs.splice(messageIdx, msgs.length - messageIdx, editedRow)
         if (tab) this._rebuildMessageIndexes(tab)
@@ -4783,6 +4782,7 @@ const _chatStoreOptions = {
           turnIndex,
           branchId: predictedBranch,
           content: newContent,
+          requestId: owner.requestId,
         })
         if (injected) {
           if (!this.branchViewByTab[tab]) this.branchViewByTab[tab] = {}
@@ -4888,7 +4888,16 @@ const _chatStoreOptions = {
           this._scheduleBranchResync(tab)
         }
         if (!this._branchOpOwned(owner)) return this._branchOpSuperseded(tab)
-        return this._branchOperationResult(true, tab, this.branchOperationByTab[tab])
+        if (editResponse?.execution_error) {
+          this.processingByTab[tab] = false
+          this._failBranchOperation(tab, editResponse.execution_error)
+        }
+        return this._branchOperationResult(
+          true,
+          tab,
+          this.branchOperationByTab[tab],
+          editResponse?.execution_error || null,
+        )
       } catch (e) {
         if (!this._branchOpOwned(owner)) return this._branchOpSuperseded(tab)
         console.warn("Failed to edit message:", e)
@@ -5436,29 +5445,59 @@ const _chatStoreOptions = {
       return null
     },
 
+    _inputEchoIdentity(data) {
+      return (
+        data.pending_id ||
+        data.request_id ||
+        (typeof data.event_id === "string" ? data.event_id : null)
+      )
+    },
+
+    _inputEchoMatch(rows, data, queued = false) {
+      const identity = this._inputEchoIdentity(data)
+      if (identity) return rows.findIndex((row) => row.role === "user" && row.eventId === identity)
+      const target = contentSignature(data.content)
+      const candidates = rows
+        .map((row, index) => ({ row, index }))
+        .filter(
+          ({ row }) =>
+            row.role === "user" &&
+            (queued || row._inputEchoPending) &&
+            (queued || !row._inputEchoConfirmed) &&
+            contentSignature(row.rawContent ?? row.contentParts ?? row.content) === target,
+        )
+      return candidates.length === 1 ? candidates[0].index : -1
+    },
+
     _handleUserInput(source, data) {
       if (!source || !this.messagesByTab[source]) return
-      // Branch isolation: a user_input echo for a non-viewed branch
-      // (e.g. another tab branched while this tab was on branch 1)
-      // must not push into the visible message list.
       if (!this._frameMatchesViewedBranch(source, data)) return
       const normalized = normalizeMessageContent(data.content)
-      const signature = `${source}:${contentSignature(data.content)}`
       const now = Date.now()
-      const seenAt = this._recentUserInputs[signature] || 0
-      if (now - seenAt < 2000) return
-      const msgs = this.messagesByTab[source]
-      const last = msgs[msgs.length - 1]
-      if (last?.role === "user" && last.content === normalized.content) {
-        this._recentUserInputs[signature] = now
+      const rows = this.messagesByTab[source]
+      const queue = this.queuedMessagesByTab[source] || []
+      const queuedIndex = this._inputEchoMatch(queue, data, true)
+      if (queuedIndex >= 0) {
+        Object.assign(queue[queuedIndex], normalized, { _inputEchoConfirmed: true })
         return
       }
-      this._recentUserInputs[signature] = now
-      this._addMsg(source, {
-        id: `u_sync_${now}`,
-        role: "user",
+      const idx = this._inputEchoMatch(rows, data)
+      const fields = {
         content: normalized.content,
         contentParts: normalized.contentParts,
+        rawContent: normalized.rawContent,
+        eventId: this._inputEchoIdentity(data) || (idx >= 0 ? rows[idx].eventId : undefined),
+        _inputEchoConfirmed: true,
+      }
+      if (idx >= 0) {
+        Object.assign(rows[idx], fields)
+        this._historyMutationSeqByTab[source] = (this._historyMutationSeqByTab[source] || 0) + 1
+        return
+      }
+      this._addMsg(source, {
+        id: data.event_id != null ? `u_sync_${data.event_id}` : `u_sync_${_newRequestId()}`,
+        role: "user",
+        ...fields,
         timestamp: data.timestamp || new Date((data.ts || now / 1000) * 1000).toISOString(),
       })
     },
@@ -5474,27 +5513,7 @@ const _chatStoreOptions = {
       if (!source) return
       if (!this.messagesByTab[source]) return
       const queue = this.queuedMessagesByTab[source] || []
-      const target = contentSignature(data.content || "")
-      const targetText = textSignature(data.content || "")
-      // Try strict JSON signature match first (catches the common
-      // case where FE queued contentParts exactly match the backend's
-      // drained content). Fall back to a text-only comparator so a
-      // queue entry whose shape diverged from the backend's drained
-      // form (e.g. backend emitted a plain string while FE queued a
-      // content-parts list) still pops the right entry instead of
-      // sticking the banner forever AND appending a phantom bubble.
-      let idx =
-        typeof data.pending_id === "string"
-          ? queue.findIndex((message) => message.eventId === data.pending_id)
-          : -1
-      if (idx === -1) {
-        idx = queue.findIndex((m) => contentSignature(m.contentParts || m.content || "") === target)
-      }
-      if (idx === -1 && targetText) {
-        idx = queue.findIndex(
-          (m) => textSignature(m.contentParts || m.content || "") === targetText,
-        )
-      }
+      const idx = this._inputEchoMatch(queue, data, true)
       if (idx !== -1) {
         // Snapshot a fresh object before splicing — mutating + reusing
         // the reactive proxy that just left ``queuedMessagesByTab`` has
@@ -5512,26 +5531,23 @@ const _chatStoreOptions = {
         this._addMsg(source, {
           id: original.id,
           role: "user",
-          content: original.content,
-          contentParts: original.contentParts,
-          eventId: original.eventId,
+          ...normalizeMessageContent(data.content),
+          eventId: this._inputEchoIdentity(data) || original.eventId,
+          _inputEchoConfirmed: true,
+          _inputEchoPending: false,
           timestamp: original.timestamp,
           injectedMidTurn: true,
         })
         return
       }
-      // Programmatic / trigger injection — no FE counterpart.
-      const normalized = normalizeMessageContent(data.content || "")
-      const now = Date.now()
-      this._closeStreamingAssistant(source)
-      this._addMsg(source, {
-        id: `u_inj_${now}`,
-        role: "user",
-        content: normalized.content,
-        contentParts: normalized.contentParts,
-        timestamp: data.timestamp || new Date((data.ts || now / 1000) * 1000).toISOString(),
-        injectedMidTurn: true,
-      })
+      const existing = this._inputEchoMatch(this.messagesByTab[source], data)
+      if (existing < 0) this._closeStreamingAssistant(source)
+      this._handleUserInput(source, data)
+      const identity = this._inputEchoIdentity(data)
+      const row = identity
+        ? this.messagesByTab[source].find((item) => item.eventId === identity)
+        : this.messagesByTab[source].at(-1)
+      if (row) row.injectedMidTurn = true
     },
 
     _closeStreamingAssistant(source) {
@@ -5570,6 +5586,7 @@ const _chatStoreOptions = {
           sender: data.sender,
           content: normalized.content,
           contentParts: normalized.contentParts,
+          rawContent: normalized.rawContent,
           timestamp: data.timestamp,
         }
         existing.push(pushed)
@@ -5586,6 +5603,7 @@ const _chatStoreOptions = {
         sender: data.sender,
         content: normalized.content,
         contentParts: normalized.contentParts,
+        rawContent: normalized.rawContent,
         timestamp: data.timestamp,
       })
 
@@ -5608,7 +5626,11 @@ const _chatStoreOptions = {
       for (const msg of queue) {
         delete msg.queued
         delete msg.queuedTab
-        msgs.push(msg)
+        const existing = msg.eventId
+          ? msgs.find((row) => row.role === "user" && row.eventId === msg.eventId)
+          : null
+        if (existing) Object.assign(existing, msg)
+        else msgs.push(msg)
       }
       this.queuedMessagesByTab[source] = []
     },
@@ -5878,7 +5900,6 @@ const _chatStoreOptions = {
       this.branchViewByTab = {}
       this.branchOperationByTab = {}
       this.branchOperationErrorByTab = {}
-      this._recentUserInputs = {}
       this._branchResyncPendingByTab = {}
       this._streamingBranchByTab = {}
       this._pendingBranchPathByTab = {}

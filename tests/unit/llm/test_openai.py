@@ -12,6 +12,7 @@ import pytest
 from openai import APIStatusError
 from PIL import Image
 
+from kohakuterrarium.errors import LLMError
 from kohakuterrarium.llm import openai as provider_module
 from kohakuterrarium.llm.openai import OpenAIProvider
 from kohakuterrarium.llm.recovery import RetryPolicy
@@ -77,6 +78,46 @@ def _success(streaming):
 
 
 class TestContentRejection:
+    @pytest.mark.parametrize("streaming", [False, True])
+    @pytest.mark.parametrize("filename", ["missing.png", "invalid_image.png"])
+    async def test_missing_local_image_fails_before_transport(
+        self, tmp_path, streaming, filename
+    ):
+        requests = []
+
+        async def respond(request):
+            requests.append(request)
+            return _success(streaming)
+
+        url = (tmp_path / filename).as_uri()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "inspect"},
+                    {"type": "image_url", "image_url": {"url": url}},
+                ],
+            }
+        ]
+        async with OpenAIProvider(api_key="test", model="test") as provider:
+            await _attach_transport(provider, respond)
+            repairs = []
+            provider.on_context_repair(repairs.append)
+            with pytest.raises(LLMError, match="Required local media is unavailable"):
+                if streaming:
+                    _ = [chunk async for chunk in provider.chat(messages)]
+                else:
+                    await provider.chat_complete(messages)
+            assert requests == []
+            assert repairs == []
+            assert messages[0]["content"][1]["image_url"]["url"] == url
+            if streaming:
+                text = "".join([chunk async for chunk in provider.chat(MESSAGES)])
+            else:
+                text = (await provider.chat_complete(MESSAGES)).content
+            assert text == "ok"
+            assert len(requests) == 1
+
     @pytest.mark.parametrize("streaming", [False, True])
     async def test_rejected_tool_image_is_removed_and_the_model_told(self, streaming):
         requests = []

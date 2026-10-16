@@ -6,6 +6,10 @@ from typing import Any, AsyncIterator
 
 from kohakuterrarium.llm.base import ChatResponse
 from kohakuterrarium.llm.message import Message
+from kohakuterrarium.llm.media_reference import (
+    current_media_session_path,
+    resolve_session_image_urls,
+)
 
 
 @dataclass
@@ -46,12 +50,17 @@ class ScriptedLLM:
         self,
         messages: list[Message] | list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Normalize message objects into dictionaries for call logs."""
-        if not messages:
-            return []
-        if isinstance(messages[0], dict):
-            return messages  # type: ignore
-        return [msg.to_dict() for msg in messages]  # type: ignore
+        """Normalize request messages and prepare session-owned images for call logs."""
+        normalized = (
+            messages
+            if not messages or isinstance(messages[0], dict)
+            else [msg.to_dict() for msg in messages]
+        )
+        if (session_path := current_media_session_path()) is not None:
+            normalized = resolve_session_image_urls(
+                normalized, session_path=session_path
+            )
+        return normalized
 
     def _find_entry(self, messages: list[dict[str, Any]]) -> ScriptEntry:
         """Select the next unused matching entry or sequential fallback."""

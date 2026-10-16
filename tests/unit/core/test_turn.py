@@ -12,10 +12,20 @@ Pins the headline contracts:
 """
 
 import asyncio
+import json
+
+import httpx
 
 import pytest
 
-from kohakuterrarium.errors import AgentNotRunningError, TurnError, TurnTimeoutError
+from types import SimpleNamespace
+
+from kohakuterrarium.errors import (
+    AgentNotRunningError,
+    ConflictError,
+    TurnError,
+    TurnTimeoutError,
+)
 from kohakuterrarium.core.agent import Agent
 from kohakuterrarium.core.config_types import AgentConfig, InputConfig, OutputConfig
 from kohakuterrarium.core.events import TriggerEvent
@@ -25,7 +35,12 @@ from kohakuterrarium.core.turn import (
     TextChunk,
     TurnEnded,
 )
+from kohakuterrarium.llm.message import ImagePart, TextPart
+from kohakuterrarium.llm.openai import OpenAIProvider
+from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
+from kohakuterrarium.terrarium.service import _completed_branch_result
+from kohakuterrarium.terrarium.remote_service import _branch_mutation_result
 
 
 def _drive_event(delivery_id="d-1", *, corr_key="delivery_id"):
@@ -64,6 +79,84 @@ async def _build(tmp_path, llm, **kw):
 
 
 class TestRun:
+    async def test_accepted_missing_media_records_failed_turn_without_transport(
+        self, tmp_path
+    ):
+        requests = []
+
+        async def respond(request):
+            requests.append(json.loads(request.content))
+            chunk = {
+                "id": "reply",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "test",
+                "choices": [
+                    {"index": 0, "delta": {"content": "ok"}, "finish_reason": None}
+                ],
+            }
+            return httpx.Response(
+                200,
+                text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+                headers={"content-type": "text/event-stream"},
+            )
+
+        provider = OpenAIProvider(api_key="test", model="test")
+        previous = provider._client
+        provider._client = previous.with_options(
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        )
+        await previous.close()
+        agent = await _build(tmp_path, provider)
+        store = SessionStore(tmp_path / "media-error.kohakutr")
+        agent.attach_session_store(store)
+        parts = [
+            TextPart(text="inspect"),
+            ImagePart(url=(tmp_path / "invalid_image.png").as_uri()),
+        ]
+        try:
+            result = await agent.run_event(
+                TriggerEvent(type="user_input", content=parts), raise_on_error=False
+            )
+            assert result.status == "error"
+            assert "Required local media is unavailable" in result.error
+            assert requests == []
+            recorded = store.get_events(agent.config.name)
+            user = next(e for e in recorded if e["type"] == "user_message")
+            assert user["content"] == [p.to_dict() for p in parts]
+            assert any(e["type"] == "processing_error" for e in recorded)
+            assert not any(e["type"] == "text_chunk" for e in recorded)
+            assert agent.controller.conversation.get_messages()[-1].has_images()
+            await agent.edit_and_rerun(-1, parts, turn_index=1, request_id="edit-media")
+            outcome = _completed_branch_result(agent, "edit-media")
+            assert outcome["status"] == "completed"
+            assert "Required local media is unavailable" in outcome["execution_error"]
+            assert (
+                _branch_mutation_result(outcome)["execution_error"]
+                == outcome["execution_error"]
+            )
+            edited_users = [
+                e
+                for e in store.get_events(agent.config.name)
+                if e["type"] == "user_message"
+                and e["branch_id"] == outcome["branch_id"]
+            ]
+            assert edited_users[0]["request_id"] == "edit-media"
+            assert edited_users[0]["content"] == [p.to_dict() for p in parts]
+            assert requests == []
+            await agent.edit_and_rerun(
+                -1, "valid after clear", turn_index=1, request_id="edit-good"
+            )
+            success = _completed_branch_result(agent, "edit-good")
+            assert success.get("execution_error") is None
+            assert len(requests) == 1
+            assert "invalid_image.png" not in json.dumps(requests[0])
+            assert store.get_events(agent.config.name)[: len(recorded)] == recorded
+        finally:
+            await agent.stop()
+            await provider.close()
+            store.close()
+
     async def test_ok_turn_returns_result(self, tmp_path):
         agent = await _build(tmp_path, ScriptedLLM(["The grade is 87."]))
         try:
@@ -243,3 +336,111 @@ class TestAttach:
             assert collected == []
         finally:
             await agent.stop()
+
+
+class TestAcceptedBranchExecutionError:
+    """Accepted edit/rerun keeps the branch and reports execution_error."""
+
+    def test_request_id_free_completed_result_omits_unbound_error(self):
+        agent = SimpleNamespace(
+            _parent_branch_path=(),
+            _branch_execution_error=(None, "stale boom"),
+            _turn_index=1,
+            _branch_id=2,
+        )
+        out = _completed_branch_result(agent, None)
+        assert out["status"] == "completed"
+        assert "execution_error" not in out
+
+    async def test_regenerate_turn_index_binds_request_id_on_provider_error(
+        self, tmp_path
+    ):
+        agent = await _build(tmp_path, _ExplodingLLM([]))
+        store = SessionStore(tmp_path / "regen-error.kohakutr")
+        agent.attach_session_store(store)
+        try:
+            result = await agent.run("hello", raise_on_error=False)
+            assert result.status == "error"
+            await agent.regenerate_last_response(turn_index=1, request_id="retry-1")
+            outcome = _completed_branch_result(agent, "retry-1")
+            assert outcome["status"] == "completed"
+            assert "provider exploded" in outcome["execution_error"]
+            assert outcome["request_id"] == "retry-1"
+            assert _completed_branch_result(agent, None).get("execution_error") is None
+            agent.controller.llm = ScriptedLLM(["recovered"])
+            await agent.regenerate_last_response(turn_index=1, request_id="retry-good")
+            success = _completed_branch_result(agent, "retry-good")
+            assert success.get("execution_error") is None
+        finally:
+            await agent.stop()
+            store.close()
+
+    async def test_paused_regenerate_still_rejects_before_accepting(self, tmp_path):
+        agent = await _build(tmp_path, ScriptedLLM(["ok"]))
+        store = SessionStore(tmp_path / "paused-regen.kohakutr")
+        agent.attach_session_store(store)
+        try:
+            await agent.run("hello")
+            branch_before = (agent._turn_index, agent._branch_id)
+            agent._paused = True
+            with pytest.raises(ConflictError, match="paused"):
+                await agent.regenerate_last_response(
+                    turn_index=1, request_id="retry-paused"
+                )
+            assert (agent._turn_index, agent._branch_id) == branch_before
+        finally:
+            await agent.stop()
+            store.close()
+
+    @pytest.mark.parametrize(
+        "seam, message",
+        [
+            ("_begin_batch", "begin exploded"),
+            ("push_event", "push exploded"),
+            ("_finalize_processing", "finalize exploded"),
+        ],
+    )
+    async def test_lifecycle_failure_binds_accepted_rerun_request(
+        self, tmp_path, seam, message
+    ):
+        agent = await _build(tmp_path, ScriptedLLM(["ok", "again", "recovered"]))
+        store = SessionStore(tmp_path / f"{seam}-error.kohakutr")
+        agent.attach_session_store(store)
+        try:
+            assert (await agent.run("hello")).ok
+            accepted_turn = agent._turn_index
+            accepted_branch = agent._branch_id
+            if seam == "push_event":
+                original = agent.controller.push_event
+
+                async def boom(event):
+                    raise RuntimeError(message)
+
+                agent.controller.push_event = boom
+            else:
+                original = getattr(agent, seam)
+
+                async def boom(*args, **kwargs):
+                    raise RuntimeError(message)
+
+                setattr(agent, seam, boom)
+            await agent.edit_and_rerun(
+                -1, "hello again", turn_index=1, request_id="edit-life"
+            )
+            outcome = _completed_branch_result(agent, "edit-life")
+            assert outcome["status"] == "completed"
+            assert message in outcome["execution_error"]
+            assert outcome["turn_index"] == accepted_turn
+            assert outcome["branch_id"] > accepted_branch
+            if seam == "push_event":
+                agent.controller.push_event = original
+            else:
+                setattr(agent, seam, original)
+            await agent.edit_and_rerun(
+                -1, "hello recovered", turn_index=1, request_id="edit-ok"
+            )
+            success = _completed_branch_result(agent, "edit-ok")
+            assert success.get("execution_error") is None
+        finally:
+            await agent.stop()
+            store.close()

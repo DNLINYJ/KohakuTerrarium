@@ -275,7 +275,10 @@ class TestSubmitWaitFor:
         assert artifact["url"].startswith(
             "/api/sessions/session-1/artifacts/generated_images/"
         )
-        assert list((tmp_path / "generated_images").glob("*.png"))
+        artifact_file = tmp_path / artifact["relative_path"]
+        assert artifact_file.parent.parent == tmp_path / "generated_images"
+        assert artifact_file.suffix == ".png"
+        assert artifact_file.read_bytes() == b"IMAGE"
 
     async def test_tool_media_policy_skips_persistence_and_reaches_metadata(
         self, tmp_path

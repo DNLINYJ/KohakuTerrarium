@@ -6,6 +6,7 @@ import hashlib
 import re
 import tempfile
 from contextlib import aclosing
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator
@@ -26,6 +27,11 @@ from kohakuterrarium.core.controller_plugins import (
     register_controller_command,
     run_post_llm_call_chain,
 )
+from kohakuterrarium.core.controller_messages import (
+    begin_assistant,
+    end_assistant,
+    _merge_text_and_parts,
+)
 from kohakuterrarium.core.conversation import Conversation, ConversationConfig
 from kohakuterrarium.core.events import EventType, TriggerEvent
 from kohakuterrarium.core.controller_context import (
@@ -34,11 +40,19 @@ from kohakuterrarium.core.controller_context import (
     tool_feedback_metadata,
 )
 from kohakuterrarium.core.executor import Executor
+from kohakuterrarium.core.inline_upload import materialize_upload
 from kohakuterrarium.core.job import JobResult, JobStatus, JobStore
 from kohakuterrarium.core.registry import Registry
 from kohakuterrarium.core.tool_output import materialize_image_part
+from kohakuterrarium.errors import InvalidRequestError
 from kohakuterrarium.llm.base import LLMProvider
-from kohakuterrarium.llm.message import ContentPart, FilePart, ImagePart, TextPart
+from kohakuterrarium.llm.message import (
+    ContentPart,
+    FilePart,
+    ImagePart,
+    TextPart,
+    content_part_from_dict,
+)
 from kohakuterrarium.llm.tools import build_provider_native_tools, build_tool_schemas
 from kohakuterrarium.modules.tool.doc_mode import DEFAULT_DOC_MODE
 from kohakuterrarium.modules.plugin.base import ToolVisibility
@@ -61,17 +75,27 @@ logger = get_logger(__name__)
 _FILE_PLACEHOLDER_RE = re.compile(r"\[\[file:(?P<ref>[^\]]+)\]\]")
 
 
-def _merge_text_and_parts(
-    text: str, structured_parts: list[ContentPart]
-) -> str | list[ContentPart]:
-    """Combine streamed text with structured parts (text-first list)."""
-    if not structured_parts:
-        return text
-    merged: list[ContentPart] = []
-    if text:
-        merged.append(TextPart(text=text))
-    merged.extend(structured_parts)
-    return merged
+def _file_part_from_item(item: Any) -> FilePart | None:
+    if isinstance(item, FilePart):
+        return item
+    if isinstance(item, dict) and item.get("type") == "file":
+        return content_part_from_dict(item)
+    return None
+
+
+def _file_ref_index(
+    ref: str, n: int, names: dict[str, list[int]], paths: dict[str, list[int]]
+) -> int | None:
+    if ref.isdecimal():
+        digits = "".join(str(int(digit)) for digit in ref).lstrip("0") or "0"
+        if len(digits) > len(str(n)):
+            return None
+        idx = int(digits)
+        return idx if idx < n else None
+    hits = list(dict.fromkeys([*names.get(ref, ()), *paths.get(ref, ())]))
+    if len(hits) > 1:
+        raise InvalidRequestError(f"Ambiguous file reference: {ref}")
+    return hits[0] if hits else None
 
 
 def _schema_allowed(
@@ -172,11 +196,10 @@ class Controller:
         # content shares the graph's session lifecycle.
         self.session_store: Any = None
 
-        # Browser uploads arrive as bytes rather than usable local paths. Keep
-        # one controller-owned materialization alive for the active session so
-        # provider retries and later tool calls see the same exact file.
+        # Controller-owned upload copies and every path authorized for this session.
         self._inline_temp_dir: Any = None
         self._inline_file_cache: dict[str, str] = {}
+        self._inline_file_paths: set[str] = set()
 
         # Event queue
         self._event_queue: asyncio.Queue[TriggerEvent] = asyncio.Queue()
@@ -196,6 +219,8 @@ class Controller:
         # Post-LLM rewrites use the same router as streamed output so attached
         # consumers observe a coherent assistant turn.
         self.output_router: Any = None
+        # Capture the Message returned by append, not a later conversation tail.
+        self._completed_assistant_message = None
 
         # Injections remain pending until the next round so every pre-LLM hook
         # receives the same augmented message list.
@@ -356,55 +381,21 @@ class Controller:
     def _build_turn_context(
         self, events: list[TriggerEvent]
     ) -> tuple[str | list[ContentPart], str]:
-        """
-        Build user message content from events plus job status.
-
-        Combines job status context and event content (multimodal-aware)
-        into final user content for the conversation.
-
-        Returns:
-            Tuple of (user_content, combined_text). combined_text is the
-            text-only portion, used to detect empty messages in native mode.
-        """
-        text_context_parts: list[str] = []
-        image_context_parts: list[ImagePart] = []
-        file_context_parts: list[FilePart] = []
-
-        if self.config.include_job_status:
-            job_context = self.job_store.format_context()
-            if job_context:
-                text_context_parts.append(job_context)
-
-        # Add event content (may be multimodal)
-        event_content = self._format_events_for_context(events)
-
-        if isinstance(event_content, str):
-            text_context_parts.append(event_content)
-        else:
-            # Multimodal content: extract text and keep non-text parts
-            for part in event_content:
-                if isinstance(part, TextPart):
-                    text_context_parts.append(part.text)
-                elif isinstance(part, ImagePart):
-                    image_context_parts.append(part)
-                elif isinstance(part, FilePart):
-                    file_context_parts.append(part)
-
-        combined_text = "\n\n".join(text_context_parts)
-
-        if image_context_parts or file_context_parts:
-            user_content: str | list[ContentPart] = [TextPart(text=combined_text)]
-            user_content.extend(image_context_parts)
-            user_content.extend(file_context_parts)
-        else:
-            user_content = combined_text
-
-        return user_content, combined_text
+        """Build user content; combined_text is only for empty-input detection."""
+        job = self.job_store.format_context() if self.config.include_job_status else ""
+        content = self._format_events_for_context(events)
+        if isinstance(content, str):
+            combined = "\n\n".join([job, content] if job else [content])
+            return combined, combined
+        parts: list[ContentPart] = ([TextPart(text=job)] if job else []) + list(content)
+        combined = "\n\n".join(p.text for p in parts if isinstance(p, TextPart))
+        return parts, combined
 
     def _chat_with_recovery(
         self, messages: list[dict], **kwargs: Any
     ) -> AsyncIterator[str]:
         """Bind this controller's output router to its model request."""
+        kwargs["media_session_path"] = getattr(self.session_store, "path", None)
         return chat_with_recovery(self.llm, self.output_router, messages, **kwargs)
 
     async def _run_native_completion(
@@ -498,7 +489,9 @@ class Controller:
         # execution event. Background handlers may append a tool placeholder as
         # soon as the event is yielded, and provider protocols require that result
         # to follow the assistant message which introduced its tool_call_id.
-        self.conversation.append("assistant", final_content, **append_kwargs)
+        self._completed_assistant_message = self.conversation.append(
+            "assistant", final_content, **append_kwargs
+        )
 
         for event in pending_native_events:
             yield event
@@ -640,23 +633,20 @@ class Controller:
         else:
             return None
 
-        name = Path((part.name or "attachment").replace("\\", "/")).name
-        full_safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", name) or "attachment"
-        suffix = Path(full_safe_name).suffix[:20]
-        stem = full_safe_name[: -len(suffix)] if suffix else full_safe_name
-        safe_name = f"{stem[:100]}{suffix}"
-        digest = hashlib.sha256(raw).hexdigest()
-        cache_key = f"{digest}:{full_safe_name}"
-        path = self._inline_file_cache.get(cache_key)
-        if path is None or not Path(path).is_file():
-            if self._inline_temp_dir is None:
-                self._inline_temp_dir = tempfile.TemporaryDirectory(
-                    prefix="kohakuterrarium-attachments-"
-                )
-            target = Path(self._inline_temp_dir.name) / f"{digest[:16]}-{safe_name}"
-            target.write_bytes(raw)
-            path = str(target)
-            self._inline_file_cache[cache_key] = path
+        name = part.name or "attachment"
+        cache_key = f"{hashlib.sha256(raw).hexdigest()}:{name}"
+        if self._inline_temp_dir is None:
+            self._inline_temp_dir = tempfile.TemporaryDirectory(
+                prefix="kohakuterrarium-attachments-"
+            )
+        path = materialize_upload(
+            raw,
+            name,
+            self._inline_temp_dir.name,
+            self._inline_file_cache.get(cache_key),
+        )
+        self._inline_file_cache[cache_key] = path
+        self._inline_file_paths.add(path)
 
         guard = getattr(self.executor, "_path_guard", None) if self.executor else None
         if guard is not None and hasattr(guard, "allow_session_path"):
@@ -667,9 +657,10 @@ class Controller:
         """Revoke and remove every controller-owned live-session attachment."""
         guard = getattr(self.executor, "_path_guard", None) if self.executor else None
         if guard is not None and hasattr(guard, "revoke_session_path"):
-            for path in self._inline_file_cache.values():
+            for path in self._inline_file_paths:
                 guard.revoke_session_path(path)
         self._inline_file_cache.clear()
+        self._inline_file_paths.clear()
         if self._inline_temp_dir is not None:
             self._inline_temp_dir.cleanup()
             self._inline_temp_dir = None
@@ -733,81 +724,98 @@ class Controller:
                 resolved_messages.append(msg)
                 continue
 
-            raw_parts = []
-            file_parts = []
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "file":
-                    file_data = item.get("file", {})
-                    file_parts.append(
-                        FilePart(
-                            path=file_data.get("path"),
-                            name=file_data.get("name"),
-                            content=file_data.get("content"),
-                            mime=file_data.get("mime"),
-                            data_base64=file_data.get("data_base64"),
-                            encoding=file_data.get("encoding"),
-                            is_inline=bool(file_data.get("is_inline", False)),
-                        )
-                    )
-                else:
-                    raw_parts.append(item)
-
+            file_parts: list[FilePart] = []
+            file_idx_at: dict[int, int] = {}
+            name_hits: dict[str, list[int]] = {}
+            path_hits: dict[str, list[int]] = {}
+            for i, item in enumerate(content):
+                fp = _file_part_from_item(item)
+                if fp is None:
+                    continue
+                idx = len(file_parts)
+                file_parts.append(fp)
+                file_idx_at[i] = idx
+                if fp.name:
+                    name_hits.setdefault(fp.name, []).append(idx)
+                if fp.path:
+                    path_hits.setdefault(fp.path, []).append(idx)
             if not file_parts:
                 resolved_messages.append(msg)
                 continue
 
-            resolved_parts: list[ContentPart] = []
-            file_map: dict[str, list[ContentPart]] = {}
-            for idx, fp in enumerate(file_parts):
-                resolved = await self._resolve_file_part(fp)
-                file_map[str(idx)] = resolved
-                if fp.name:
-                    file_map[fp.name] = resolved
-                if fp.path:
-                    file_map[fp.path] = resolved
-
-            inserted = False
-            for item in raw_parts:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    text = item.get("text", "")
-                    pos = 0
-                    for match in _FILE_PLACEHOLDER_RE.finditer(text):
-                        if match.start() > pos:
-                            resolved_parts.append(
-                                TextPart(text=text[pos : match.start()])
-                            )
-                        ref = match.group("ref")
-                        replacement = file_map.get(ref)
-                        if replacement:
-                            resolved_parts.extend(replacement)
-                            inserted = True
-                        else:
-                            resolved_parts.append(TextPart(text=match.group(0)))
-                        pos = match.end()
-                    if pos < len(text):
-                        resolved_parts.append(TextPart(text=text[pos:]))
-                elif isinstance(item, dict) and item.get("type") == "image_url":
-                    img = item.get("image_url", {})
-                    meta = item.get("meta") or {}
-                    resolved_parts.append(
-                        ImagePart(
-                            url=img.get("url", ""),
-                            detail=img.get("detail", "low"),
-                            source_type=meta.get("source_type"),
-                            source_name=meta.get("source_name"),
+            ref_index: dict[str, int | None] = {}
+            referenced: set[int] = set()
+            for item in content:
+                if isinstance(item, TextPart):
+                    text = item.text
+                elif isinstance(item, dict) and item.get("type") == "text":
+                    text = item.get("text") or ""
+                else:
+                    continue
+                for match in _FILE_PLACEHOLDER_RE.finditer(text):
+                    ref = match.group("ref")
+                    if ref not in ref_index:
+                        ref_index[ref] = _file_ref_index(
+                            ref, len(file_parts), name_hits, path_hits
                         )
-                    )
+                    hit = ref_index[ref]
+                    if hit is not None:
+                        referenced.add(hit)
 
-            if not inserted:
-                for fp in file_parts:
-                    resolved_parts.extend(
-                        file_map.get(fp.name)
-                        or file_map.get(fp.path or "")
-                        or file_map.get(str(file_parts.index(fp)), [])
+            resolved_by_idx: dict[int, list[ContentPart]] = {}
+            for idx, fp in enumerate(file_parts):
+                resolved_by_idx[idx] = await self._resolve_file_part(fp)
+
+            resolved_parts: list[ContentPart | dict[str, Any]] = []
+            for i, item in enumerate(content):
+                if i in file_idx_at:
+                    idx = file_idx_at[i]
+                    if idx not in referenced:
+                        resolved_parts.extend(resolved_by_idx[idx])
+                    continue
+                if isinstance(item, ImagePart):
+                    resolved_parts.append(item)
+                    continue
+                if isinstance(item, dict) and item.get("type") == "image_url":
+                    resolved_parts.append(deepcopy(item))
+                    continue
+                if isinstance(item, TextPart):
+                    text = item.text
+                elif isinstance(item, dict) and item.get("type") == "text":
+                    text = item.get("text") or ""
+                else:
+                    continue
+                original_part = item.to_dict() if isinstance(item, TextPart) else item
+                if not _FILE_PLACEHOLDER_RE.search(text):
+                    resolved_parts.append(deepcopy(original_part))
+                    continue
+                pos = 0
+                for match in _FILE_PLACEHOLDER_RE.finditer(text):
+                    if match.start() > pos:
+                        resolved_parts.append(
+                            {
+                                **deepcopy(original_part),
+                                "text": text[pos : match.start()],
+                            }
+                        )
+                    hit = ref_index.get(match.group("ref"))
+                    if hit is None:
+                        resolved_parts.append(
+                            {**deepcopy(original_part), "text": match.group(0)}
+                        )
+                    else:
+                        resolved_parts.extend(resolved_by_idx[hit])
+                    pos = match.end()
+                if pos < len(text):
+                    resolved_parts.append(
+                        {**deepcopy(original_part), "text": text[pos:]}
                     )
 
             resolved_msg = dict(msg)
-            resolved_msg["content"] = [part.to_dict() for part in resolved_parts]
+            resolved_msg["content"] = [
+                part if isinstance(part, dict) else part.to_dict()
+                for part in resolved_parts
+            ]
             resolved_messages.append(resolved_msg)
         return resolved_messages
 
@@ -884,6 +892,8 @@ class Controller:
 
         logger.info("Generating response...")
 
+        await begin_assistant(self)
+
         if self._is_native_mode:
             tool_schemas = self._get_native_tool_schemas()
             async for event in self._run_native_completion(messages, tool_schemas):
@@ -902,7 +912,7 @@ class Controller:
                         source_name=part.source_name,
                         revised_prompt=getattr(part, "revised_prompt", None),
                     )
-            self.conversation.append(
+            self._completed_assistant_message = self.conversation.append(
                 "assistant",
                 _merge_text_and_parts(self._last_assistant_content, structured),
                 extra_fields=(
@@ -914,6 +924,7 @@ class Controller:
         # the canonical assistant message rather than only the streamed copy.
         if self.plugins:
             await run_post_llm_call_chain(self, messages)
+        await end_assistant(self)
 
     def register_command(
         self, command_name: str, cmd: Command, override: bool = False

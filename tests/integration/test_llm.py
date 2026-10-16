@@ -28,13 +28,15 @@ Why these collaborators are real:
     reset so resolution is deterministic with no installed packages.
 """
 
-import base64
 import asyncio
-from collections import deque
+import base64
 import io
 import json
 import random
 import time
+from collections import deque
+from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -44,8 +46,11 @@ from PIL import Image
 from websockets import serve
 
 from kohakuterrarium import Terrarium
+from kohakuterrarium.errors import MediaReferenceError
 from kohakuterrarium.core.agent_budget_recovery import apply_context_repair
+from kohakuterrarium.core.controller import Controller, ControllerConfig
 from kohakuterrarium.core.conversation import Conversation
+from kohakuterrarium.core.events import create_user_input_event
 from kohakuterrarium.llm import antigravity_auth as agy_auth
 from kohakuterrarium.session.history import (
     replay_conversation,
@@ -1768,10 +1773,20 @@ class TestLlmIntegration:
                     )
                 )
                 await initial_client.close()
-                with pytest.raises(APIStatusError, match="allowed-local-media-path"):
+                repairs = []
+                chat_provider.on_context_repair(repairs.append)
+                with pytest.raises(
+                    MediaReferenceError, match="Required local media is unavailable"
+                ):
                     await chat_provider.chat_complete(chat_messages)
+                assert chat_requests == []
+                assert repairs == []
+                assert messages_to_dicts(chat_messages) == original_wire
+                valid_messages = [UserMessage(chat_messages[0].content[:-1])]
+                with pytest.raises(APIStatusError, match="allowed-local-media-path"):
+                    await chat_provider.chat_complete(valid_messages)
                 assert len(chat_requests) == 1
-                response = await chat_provider.chat_complete(chat_messages)
+                response = await chat_provider.chat_complete(valid_messages)
                 assert response.content == "same red square"
                 assert len(chat_requests) == 3
                 assert chat_requests[0] == chat_requests[1] == chat_requests[2]
@@ -2032,6 +2047,83 @@ class TestLlmIntegration:
                 await responses_provider.chat_complete(budget_history)
             ).content == "bounded"
             assert budget_requests[2]["input"] == budget_requests[1]["input"]
+
+            session_store = SessionStore(
+                tmp_path / "custom-input-root" / "selected.kohakutr"
+            )
+            try:
+                session_store.write_artifact("current.png", image_bytes)
+                local_url = "/api/sessions/selected/artifacts/current.png"
+                missing_url = "/api/sessions/selected/artifacts/missing.png"
+                normal_read = Path.read_bytes
+                for scenario, role, urls, expected_images, should_fail in (
+                    (
+                        "budget-missing-old",
+                        "user",
+                        [missing_url] + [local_url] * 59,
+                        50,
+                        False,
+                    ),
+                    ("budget-valid", "user", [local_url] * 100, 50, False),
+                    ("assistant-unused", "assistant", [missing_url] * 40, 0, False),
+                    ("required-missing", "user", [missing_url], 0, True),
+                ):
+                    controller = Controller(
+                        responses_provider, ControllerConfig(include_job_status=False)
+                    )
+                    controller.session_store = session_store
+                    controller.conversation.append(
+                        role, [ImagePart(url=url) for url in urls]
+                    )
+                    originals = deepcopy(controller.conversation.to_messages())
+                    requests_before = len(budget_requests)
+                    reads = []
+
+                    def counted_read(path):
+                        if path.suffix == ".png" and ".artifacts" in str(path):
+                            reads.append(path)
+                        return normal_read(path)
+
+                    with monkeypatch.context() as request_patch:
+                        request_patch.setattr(Path, "read_bytes", counted_read)
+                        await controller.push_event(create_user_input_event("continue"))
+                        if should_fail:
+                            with pytest.raises(
+                                MediaReferenceError,
+                                match="Required local media is unavailable",
+                            ):
+                                async for _ in controller.run_once():
+                                    pass
+                        else:
+                            async for _ in controller.run_once():
+                                pass
+                    if should_fail:
+                        assert len(budget_requests) == requests_before
+                        continue
+                    assert len(budget_requests) == requests_before + 1, scenario
+                    sent_images = [
+                        part
+                        for item in budget_requests[-1]["input"]
+                        for part in item.get("content", [])
+                        if part.get("type") == "input_image"
+                    ]
+                    assert len(sent_images) == expected_images, scenario
+                    assert len(reads) == expected_images, scenario
+                    assert all(
+                        path == session_store.artifacts_dir / "current.png"
+                        for path in reads
+                    )
+                    assert all(
+                        base64.b64decode(part["image_url"].split(",", 1)[1])
+                        == image_bytes
+                        for part in sent_images
+                    )
+                    assert (
+                        controller.conversation.to_messages()[: len(originals)]
+                        == originals
+                    )
+            finally:
+                session_store.close()
 
             # Refused images leave the request and the host conversation alike.
             host = Conversation()
@@ -2305,9 +2397,7 @@ class TestLlmIntegration:
                             ],
                         }
                     ]
-                    # Deleting a previously sent file changes the request prefix.
-                    # Neither WS provider may replay the stale local URL or use
-                    # the previous response's image-bearing cached context.
+                    # Required missing media fails before a WS submission.
                     source.unlink()
                     ws_history.extend(
                         [
@@ -2316,9 +2406,19 @@ class TestLlmIntegration:
                         ]
                     )
                     saved_history = json.dumps(ws_history)
-                    assert [chunk async for chunk in ws_provider.chat(ws_history)] == [
-                        "continued"
+                    with pytest.raises(
+                        MediaReferenceError, match="Required local media is unavailable"
+                    ):
+                        _ = [chunk async for chunk in ws_provider.chat(ws_history)]
+                    assert len(ws_submissions) == 5
+                    assert json.dumps(ws_history) == saved_history
+                    without_file = [
+                        {**ws_history[0], "content": [ws_history[0]["content"][0]]},
+                        *ws_history[1:],
                     ]
+                    assert [
+                        chunk async for chunk in ws_provider.chat(without_file)
+                    ] == ["continued"]
                     assert len(ws_submissions) == 6
                     assert "previous_response_id" not in ws_submissions[5]
                     assert ws_submissions[5]["input"][0]["content"] == [

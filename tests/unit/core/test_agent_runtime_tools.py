@@ -13,7 +13,9 @@ from kohakuterrarium.core.agent_runtime_tools import (
 from kohakuterrarium.core.backgroundify import BackgroundifyHandle
 from kohakuterrarium.core.event_inbox import EventInbox
 from kohakuterrarium.core.events import EventType, TriggerEvent
-from kohakuterrarium.llm.message import ImagePart
+from kohakuterrarium.llm.message import FilePart, ImagePart, TextPart
+from kohakuterrarium.session.output import SessionOutput
+from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.parsing.events import (
     CommandResultEvent,
     SubAgentCallEvent,
@@ -350,10 +352,18 @@ class TestOnBgComplete:
         assert queued[0].event is evt
         assert queued[0].future is None
 
-    async def test_tool_done_renders_multimodal_output_preview(self):
+    @pytest.mark.parametrize("error", [None, "diagnostic failure"])
+    async def test_completed_tool_retains_structured_output_and_separate_status(
+        self, tmp_path, error
+    ):
         a = _make_mixin()
         artifact_url = "/api/sessions/graph_1/artifacts/generated_images/image.jpeg"
-        event_parts = [ImagePart(url=artifact_url, source_name="image.jpeg")]
+        event_parts = [
+            TextPart(text="diagnostic caption"),
+            ImagePart(url=artifact_url, source_name="image.jpeg"),
+            FilePart(name="report.txt", content="DIAGNOSTIC_FILE", is_inline=True),
+            TextPart(text="diagnostic tail"),
+        ]
         canvas_preview = {
             "kind": "image",
             "file_path": "/work/image.jpeg",
@@ -367,26 +377,54 @@ class TestOnBgComplete:
             job_id="grok_image_gen_abc",
             content=event_parts,
             context={
+                "error": error,
+                "exit_code": 2 if error else 0,
                 "result_metadata": {
                     "canvas_preview": canvas_preview,
                     "session_metadata": {
                         "artifacts": [{"kind": "image", "url": artifact_url}]
                     },
-                }
+                },
             },
         )
 
         a._on_bg_complete(evt)
 
         kind, _detail, metadata = a.output_router.activity_calls[0]
-        assert kind == "tool_done"
-        assert artifact_url in metadata["output_preview"]
-        assert metadata["result"] == [part.to_dict() for part in event_parts]
-        assert metadata["output"] == event_parts
-        assert metadata["canvas_preview"] == canvas_preview
-        assert metadata["tool_metadata"] == {
-            "artifacts": [{"kind": "image", "url": artifact_url}]
-        }
+        assert kind == ("tool_error" if error else "tool_done")
+        expected = [part.to_dict() for part in event_parts]
+        assert metadata["result"] == expected
+        if error:
+            assert metadata["error"] == error
+            assert metadata["final_state"] == "error"
+            assert "canvas_preview" not in metadata
+        else:
+            assert artifact_url in metadata["output_preview"]
+            assert metadata["output"] == event_parts
+            assert metadata["canvas_preview"] == canvas_preview
+            assert metadata["tool_metadata"] == {
+                "artifacts": [{"kind": "image", "url": artifact_url}]
+            }
+        store = SessionStore(tmp_path / "completed.kohakutr")
+        try:
+            out = SessionOutput("alice", store, a)
+            out.on_activity_with_metadata(kind, _detail, metadata)
+            await out.drain()
+            result = next(
+                event
+                for event in store.get_events("alice")
+                if event["type"] == "tool_result"
+            )
+            assert result["output"] == expected
+            assert result["exit_code"] == (2 if error else 0)
+            if error:
+                assert result["error"] == error
+                assert result["interrupted"] is False
+                assert result["cancelled"] is False
+                assert result["final_state"] == "error"
+            assert evt.content == event_parts
+        finally:
+            store.close()
 
     @pytest.mark.parametrize("result_metadata", [None, [], "invalid", {}])
     async def test_tool_done_without_mapping_metadata(self, result_metadata):
@@ -473,7 +511,10 @@ class TestOnBgComplete:
         evt = TriggerEvent(
             type=EventType.TOOL_COMPLETE,
             job_id="bash_x",
-            content="bad",
+            content=[
+                TextPart(text="partial failure"),
+                ImagePart(url="https://example.invalid/diagnostic.png"),
+            ],
             context={"exit_code": 2},
         )
 
@@ -482,13 +523,14 @@ class TestOnBgComplete:
         kind, _detail, metadata = a.output_router.activity_calls[0]
         assert kind == "tool_error"
         assert metadata["exit_code"] == 2
+        assert metadata["result"] == [part.to_dict() for part in evt.content]
 
     async def test_interrupted_flag(self):
         a = _make_mixin()
         evt = TriggerEvent(
             type=EventType.TOOL_COMPLETE,
             job_id="bash_x",
-            content="",
+            content=[TextPart(text="partial interrupted output")],
             context={"error": "x", "interrupted": True},
         )
         a._on_bg_complete(evt)
@@ -496,13 +538,14 @@ class TestOnBgComplete:
             c[2] for c in a.output_router.activity_calls if c[0] == "tool_error"
         )
         assert meta["final_state"] == "interrupted"
+        assert meta["result"] == [part.to_dict() for part in evt.content]
 
     async def test_cancelled_flag(self):
         a = _make_mixin()
         evt = TriggerEvent(
             type=EventType.TOOL_COMPLETE,
             job_id="bash_x",
-            content="",
+            content=[TextPart(text="partial cancelled output")],
             context={"error": "x", "cancelled": True},
         )
         a._on_bg_complete(evt)
@@ -510,6 +553,7 @@ class TestOnBgComplete:
             c[2] for c in a.output_router.activity_calls if c[0] == "tool_error"
         )
         assert meta["final_state"] == "cancelled"
+        assert meta["result"] == [part.to_dict() for part in evt.content]
 
     async def test_subagent_error(self):
         a = _make_mixin()

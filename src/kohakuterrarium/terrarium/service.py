@@ -43,6 +43,7 @@ from kohakuterrarium.terrarium.service_dto import (
     BranchMutationResult,
     CreatureInfo,
     _channel_message_to_dict,
+    completed_branch_result as _completed_branch_result,
     creature_to_info,
 )
 from kohakuterrarium.terrarium.creature_ops import (
@@ -89,19 +90,6 @@ from kohakuterrarium.terrarium.topology import (
 )
 
 _normalize_command_args = normalize_command_args
-
-
-def _completed_branch_result(
-    agent: Any, request_id: str | None
-) -> BranchMutationResult:
-    parent_path = getattr(agent, "_parent_branch_path", ()) or ()
-    return {
-        "status": "completed",
-        "request_id": request_id or uuid.uuid4().hex,
-        "turn_index": int(getattr(agent, "_turn_index", 0)),
-        "branch_id": int(getattr(agent, "_branch_id", 0)),
-        "parent_branch_path": [list(pair) for pair in parent_path],
-    }
 
 
 @runtime_checkable
@@ -759,6 +747,7 @@ class LocalTerrariumService(
         target: UserMessageSelector | None = None,
     ) -> BranchMutationResult:
         agent = self._agent(creature_id)
+        request_id = request_id or uuid.uuid4().hex
         kwargs = {
             "turn_index": turn_index,
             "branch_view": branch_view,
@@ -782,6 +771,7 @@ class LocalTerrariumService(
         target: UserMessageSelector | None = None,
     ) -> BranchMutationResult:
         agent = self._agent(creature_id)
+        request_id = request_id or uuid.uuid4().hex
         kwargs = {
             "turn_index": turn_index,
             "user_position": user_position,

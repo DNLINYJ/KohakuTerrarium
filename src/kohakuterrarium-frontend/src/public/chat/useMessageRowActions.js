@@ -4,11 +4,12 @@ import { ElMessage } from "element-plus"
 import { useMessageEditDraft } from "../../components/chat/shared/messageEditDrafts"
 
 import {
-  buildMessageParts,
+  buildEditedMessageParts,
   contentToEditableDraft,
   formatBytes,
   MAX_ATTACHMENT_BYTES,
   MAX_IMAGE_BYTES,
+  validateAttachment,
 } from "@/utils/chatAttachments"
 import { useMessageActions } from "./messageActions.js"
 
@@ -83,7 +84,15 @@ export function useMessageRowActions({ props, chat, messageTab, writeClipboard, 
     () => JSON.stringify([targetKey(), logicalKey(props.message)]),
     targetKey,
   )
-  const { editing, editText, editAttachments, editSaving, editError } = draft
+  const {
+    editing,
+    editText,
+    editAttachments,
+    editSourceContent,
+    editTextRestricted,
+    editSaving,
+    editError,
+  } = draft
   const editTextareaEl = ref(null)
   const editImageInputEl = ref(null)
   const editFileInputEl = ref(null)
@@ -126,11 +135,25 @@ export function useMessageRowActions({ props, chat, messageTab, writeClipboard, 
   }
 
   function startEdit() {
-    const draft = contentToEditableDraft(props.message.contentParts || props.message.content)
-    editText.value = draft.text
-    editAttachments.value = draft.attachments
+    const sourceContent =
+      props.message.rawContent ?? props.message.contentParts ?? props.message.content
+    if (
+      Array.isArray(sourceContent) &&
+      sourceContent.some((part) => !["text", "image_url", "file"].includes(part?.type))
+    ) {
+      editError.value = t("chat.editUnsupportedParts")
+      return
+    }
+    editError.value = ""
+    const next = contentToEditableDraft(sourceContent)
+    editSourceContent.value = next.sourceContent
+    editTextRestricted.value = !!next.textRestricted
+    editText.value = next.text
+    editAttachments.value = next.attachments
     editing.value = true
-    nextTick(() => editTextareaEl.value?.focus())
+    nextTick(() => {
+      if (!editTextRestricted.value) editTextareaEl.value?.focus()
+    })
   }
 
   function cancelEdit(event) {
@@ -139,32 +162,69 @@ export function useMessageRowActions({ props, chat, messageTab, writeClipboard, 
     editing.value = false
     editText.value = ""
     editAttachments.value = []
+    editSourceContent.value = null
+    editTextRestricted.value = false
   }
 
-  function _pushEditAttachment(file, kind) {
-    const limit = kind === "image" ? MAX_IMAGE_BYTES : MAX_ATTACHMENT_BYTES
-    if (file.size > limit) {
+  function _attachmentError(error) {
+    if (!error) return
+    if (error.code === "too-large") {
       ElMessage.error(
-        `${file.name} is too large (${formatBytes(file.size)} > ${formatBytes(limit)})`,
+        `${error.name} is too large (${formatBytes(error.size)} > ${formatBytes(error.limit)})`,
       )
-      return false
+    } else if (error.code === "not-image") {
+      ElMessage.error(`${error.name} is not an image file`)
     }
-    if (kind === "image" && file.type && !file.type.startsWith("image/")) {
-      ElMessage.error(`${file.name} is not an image file`)
-      return false
+  }
+
+  function _makeEditAttachment(file, kind, originalIndex) {
+    const error = validateAttachment(file, kind)
+    if (error) {
+      _attachmentError(error)
+      return null
     }
-    editAttachments.value.push({
-      id: `new_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    const attachment = {
+      id: `${originalIndex == null ? "new" : "replace"}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       file,
       name: file.name,
       kind,
-    })
+    }
+    if (Number.isInteger(originalIndex)) attachment.originalIndex = originalIndex
+    return attachment
+  }
+
+  function _pushEditAttachment(file, kind) {
+    const attachment = _makeEditAttachment(file, kind)
+    if (!attachment) return false
+    editAttachments.value.push(attachment)
+    return true
+  }
+
+  function replaceEditAttachment(index, file, kind) {
+    const current = editAttachments.value[index]
+    if (!current) return false
+    const originalIndex = Number.isInteger(current.originalIndex)
+      ? current.originalIndex
+      : undefined
+    const nextKind = kind || current.kind || "file"
+    const attachment = _makeEditAttachment(file, nextKind, originalIndex)
+    if (!attachment) return false
+    const copy = [...editAttachments.value]
+    copy[index] = attachment
+    editAttachments.value = copy
     return true
   }
 
   function onEditFileChange(e, kind = "file") {
+    const targetIndex = e.target?.dataset?.editTarget
     const files = Array.from(e.target.files || [])
-    for (const file of files) _pushEditAttachment(file, kind)
+    if (targetIndex != null && targetIndex !== "") {
+      const index = Number(targetIndex)
+      const file = files[0]
+      if (file) replaceEditAttachment(index, file, kind)
+    } else {
+      for (const file of files) _pushEditAttachment(file, kind)
+    }
     e.target.value = ""
   }
 
@@ -174,7 +234,11 @@ export function useMessageRowActions({ props, chat, messageTab, writeClipboard, 
 
   async function confirmEdit(event) {
     if (isComposingKey(event)) return
-    if (editSaving.value || (!editText.value.trim() && editAttachments.value.length === 0)) return
+    if (
+      editSaving.value ||
+      (!editText.value.trim() && editAttachments.value.length === 0 && !editTextRestricted.value)
+    )
+      return
     const retained = draft.retain()
     const state = retained.state
     const sourceMessage = props.message
@@ -187,7 +251,11 @@ export function useMessageRowActions({ props, chat, messageTab, writeClipboard, 
     const targetTurnIndex = sourceMessage.turnIndex
     const targetUserPosition = sourceMessage.userPosition
     const targetLatestBranch = sourceMessage.latestBranch
-    const capturedAttachments = [...state.editAttachments]
+    const capturedAttachments = state.editAttachments.map((item) => ({ ...item }))
+    const capturedText = state.editText
+    const capturedSource = Array.isArray(state.editSourceContent)
+      ? JSON.parse(JSON.stringify(state.editSourceContent))
+      : state.editSourceContent
     const viewIsCurrent = () =>
       alive &&
       ownsTarget() &&
@@ -219,7 +287,11 @@ export function useMessageRowActions({ props, chat, messageTab, writeClipboard, 
     state.editSaving = true
     state.editError = ""
     try {
-      const newContent = await buildMessageParts(state.editText, capturedAttachments)
+      const newContent = await buildEditedMessageParts(
+        capturedSource,
+        capturedText,
+        capturedAttachments,
+      )
       if (!viewIsCurrent()) return
       const index = resolveEditIndex()
       if (index == null || index < 0) return
@@ -239,6 +311,8 @@ export function useMessageRowActions({ props, chat, messageTab, writeClipboard, 
         state.editing = false
         state.editText = ""
         state.editAttachments = []
+        state.editSourceContent = null
+        state.editTextRestricted = false
         return
       }
       state.editing = true
@@ -337,6 +411,8 @@ export function useMessageRowActions({ props, chat, messageTab, writeClipboard, 
     editing,
     editText,
     editAttachments,
+    editSourceContent,
+    editTextRestricted,
     editTextareaEl,
     editImageInputEl,
     editFileInputEl,
@@ -350,6 +426,7 @@ export function useMessageRowActions({ props, chat, messageTab, writeClipboard, 
     startEdit,
     cancelEdit,
     onEditFileChange,
+    replaceEditAttachment,
     removeEditAttachment,
     confirmEdit,
     regenerate,

@@ -1,5 +1,7 @@
 import json
+import threading
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -9,6 +11,7 @@ from kohakuterrarium.llm import antigravity_auth as auth
 from kohakuterrarium.llm.antigravity_auth import AntigravityError, BorrowedCredential
 from kohakuterrarium.llm.antigravity_provider import AntigravityProvider
 from kohakuterrarium.llm.base import ToolSchema
+from kohakuterrarium.llm.media_reference import session_media_scope
 
 AGY_CLI_USER_AGENT = (
     "antigravity/cli/1.3.4 (aidev_client; os_type=windows; arch=amd64; "
@@ -39,6 +42,54 @@ def credentials(monkeypatch):
         "read_sources",
         lambda: [BorrowedCredential("test-access", time.time() + 3600, "test")],
     )
+
+
+async def test_local_image_read_runs_off_loop_with_session_context(
+    tmp_path, monkeypatch
+):
+    session = tmp_path / "own.kohakutr"
+    artifacts = session.with_suffix(".artifacts")
+    artifacts.mkdir()
+    (artifacts / "pic.png").write_bytes(b"PNG")
+    loop_thread = threading.get_ident()
+    original_read = Path.read_bytes
+    reads = []
+
+    def read(path):
+        if path.suffix == ".png":
+            reads.append(threading.get_ident())
+            assert threading.get_ident() != loop_thread
+        return original_read(path)
+
+    def respond(request):
+        if request.url.path.endswith("loadCodeAssist"):
+            return httpx.Response(200, json={"cloudaicompanionProject": "test-project"})
+        payload = json.loads(request.content)
+        assert payload["request"]["contents"][0]["parts"] == [
+            {"inlineData": {"mimeType": "image/png", "data": "UE5H"}}
+        ]
+        return httpx.Response(200, text=frame([{"text": "ok"}]))
+
+    monkeypatch.setattr(Path, "read_bytes", read)
+    provider = AntigravityProvider(
+        "gemini-3.8-flash", transport=httpx.MockTransport(respond)
+    )
+    with session_media_scope(session):
+        response = await provider.chat_complete(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "/api/sessions/own/artifacts/pic.png"},
+                        }
+                    ],
+                }
+            ]
+        )
+    assert response.content == "ok"
+    assert len(reads) == 1
 
 
 @pytest.mark.asyncio

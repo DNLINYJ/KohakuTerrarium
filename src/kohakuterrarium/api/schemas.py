@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class TerrariumCreate(BaseModel):
@@ -53,27 +53,37 @@ class RecipeApply(BaseModel):
 
 
 class TextPartPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     type: Literal["text"]
     text: str
 
 
 class ImageUrlPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     url: str
     detail: Literal["auto", "low", "high"] = "low"
 
 
 class ContentMetaPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     source_type: str | None = None
     source_name: str | None = None
 
 
 class ImagePartPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     type: Literal["image_url"]
     image_url: ImageUrlPayload
     meta: ContentMetaPayload | None = None
 
 
 class FilePayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     path: str | None = None
     name: str | None = None
     content: str | None = None
@@ -84,6 +94,8 @@ class FilePayload(BaseModel):
 
 
 class FilePartPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     type: Literal["file"]
     file: FilePayload
 
@@ -169,6 +181,7 @@ class BranchMutationResponse(BaseModel):
     """Completed regenerate/edit result shared by local and remote runtimes."""
 
     status: Literal["completed"]
+    execution_error: str | None = None
     request_id: str | None = None
     turn_index: int
     branch_id: int

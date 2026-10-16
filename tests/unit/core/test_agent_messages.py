@@ -8,7 +8,10 @@ import pytest
 
 import kohakuterrarium.core.agent_messages as agent_messages_module
 
-from kohakuterrarium.core.agent_message_history import replay_with_settled_tools
+from kohakuterrarium.core.agent_message_history import (
+    replay_with_settled_tools,
+    snapshot_needs_settled_tool_replay,
+)
 from kohakuterrarium.core.agent_messages import AgentMessagesMixin
 from kohakuterrarium.core.compact_splice import splice_conversation
 from kohakuterrarium.core.conversation import Conversation
@@ -596,6 +599,19 @@ class TestRegenerateNonTailTurn:
         # _rerun_from_last invoked via edit_and_rerun.
         assert agent._rerun_calls
 
+    async def test_regenerate_turn_index_forwards_request_id(self, agent):
+        agent._apply_user_input("u1")
+        agent._emit_assistant("a1")
+        agent._apply_user_input("u2")
+        agent._emit_assistant("a2")
+        await agent.regenerate_last_response(turn_index=1, request_id="retry-turn")
+        assert agent._rerun_calls[-1].context.get("request_id") == "retry-turn"
+        assert any(
+            event.get("request_id") == "retry-turn"
+            for event in agent.session_store.get_events(agent.config.name)
+            if event["type"] == "user_message"
+        )
+
 
 class TestReloadConversationUnderBranchView:
     async def test_no_store_no_op(self, agent):
@@ -825,6 +841,65 @@ def _evt(event_id, etype, turn, branch, **payload):
 
 
 class TestSettledToolReplay:
+    @pytest.mark.parametrize("pending", [False, True])
+    def test_same_turn_result_refresh_requires_a_retained_pending_slot(self, pending):
+        events = [
+            _evt(1, "user_message", 1, 1, content="launch"),
+            _evt(2, "tool_call", 1, 1, call_id="j1", tool_call_id="c1", name="media"),
+            _evt(
+                3,
+                "tool_result",
+                1,
+                1,
+                call_id="j1",
+                output=[{"type": "text", "text": "final"}],
+            ),
+        ]
+        snapshot = [{"role": "user", "content": "summary or retained history"}]
+        if pending:
+            snapshot.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": "c1",
+                    "content": "pending",
+                    "metadata": {"job_id": "j1", "tool_result_phase": "pending"},
+                }
+            )
+        assert snapshot_needs_settled_tool_replay(events, {1: 1}, snapshot) is pending
+
+    @pytest.mark.parametrize("explicit_job", [True, False])
+    def test_same_turn_pending_provider_alias_collision_does_not_invalidate_other_job(
+        self, explicit_job
+    ):
+        events = [
+            _evt(1, "user_message", 1, 1, content="launch"),
+            _evt(
+                2, "tool_call", 1, 1, call_id="jobA", tool_call_id="jobB", name="media"
+            ),
+            _evt(3, "tool_result", 1, 1, call_id="jobA", output="A finished"),
+            _evt(
+                4,
+                "tool_call",
+                1,
+                1,
+                call_id="jobB",
+                tool_call_id="providerB",
+                name="media",
+            ),
+        ]
+        metadata = {"tool_result_phase": "pending"}
+        if explicit_job:
+            metadata["job_id"] = "jobB"
+        snapshot = [
+            {
+                "role": "tool",
+                "tool_call_id": "jobB",
+                "content": "pending B",
+                "metadata": metadata,
+            }
+        ]
+        assert snapshot_needs_settled_tool_replay(events, {1: 1}, snapshot) is False
+
     def test_keeps_grouped_direct_calls(self):
         events = [
             _evt(1, "user_message", 1, 1, content="do two"),

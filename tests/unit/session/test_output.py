@@ -14,6 +14,7 @@ from kohakuterrarium.session.output import (
     _subagent_name,
     _token_metadata,
 )
+from kohakuterrarium.session.history import replay_conversation
 from kohakuterrarium.session.readonly_view import SessionReadView
 from kohakuterrarium.session.store import SessionStore
 
@@ -78,6 +79,111 @@ def _make(tmp_path, agent=None, *, capture_activity=True, prefix=None) -> tuple:
 
 
 # ── module-level helpers ─────────────────────────────────────────
+
+
+class TestAssistantRounds:
+    @pytest.mark.parametrize("fail_canonical", [False, True])
+    async def test_completed_canonical_retires_only_its_recovery_copy(
+        self, tmp_path, monkeypatch, fail_canonical
+    ):
+        store, out = _make(tmp_path, _FakeAgent())
+        append = store.append_event
+
+        def failing_append(namespace, event_type, data, **stamps):
+            if event_type == "text_chunk" or (
+                fail_canonical and event_type == "assistant_message"
+            ):
+                raise OSError("injected write failure")
+            return append(namespace, event_type, data, **stamps)
+
+        monkeypatch.setattr(store, "append_event", failing_append)
+        partial = "discarded-pre-hook-" * 40
+        try:
+            await out.emit(OutputEvent(type="assistant_round_start"))
+            await out.emit(OutputEvent(type="text", content=partial))
+            await out.emit(
+                OutputEvent(
+                    type="assistant_message",
+                    payload={
+                        "message": {"role": "assistant", "content": "final-post-hook"}
+                    },
+                )
+            )
+            await out.drain()
+            monkeypatch.setattr(store, "append_event", append)
+            resumed = SessionOutput("alice", store, _FakeAgent())
+            await resumed.drain()
+            messages = replay_conversation(store.get_events("alice"))
+            assert messages == [
+                {
+                    "role": "assistant",
+                    "content": partial if fail_canonical else "final-post-hook",
+                }
+            ]
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize("capture_activity", [True, False])
+    async def test_round_anchor_and_canonical_are_durable_detached_and_stamped(
+        self, tmp_path, capture_activity
+    ):
+        agent = _FakeAgent(turn=2, branch=3, path=[(1, 2)])
+        store, out = _make(
+            tmp_path, agent, capture_activity=capture_activity, prefix="host:alice"
+        )
+        message = {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,YQ==",
+                        "provider": "token",
+                    },
+                },
+                {"type": "text", "text": "final"},
+            ],
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "echo", "arguments": "{}"},
+                }
+            ],
+            "provider_state": {"key": ["value"]},
+        }
+        try:
+            await out.emit(OutputEvent(type="assistant_round_start"))
+            await out.emit(OutputEvent(type="text", content="streamed"))
+            await out.emit(
+                OutputEvent(type="assistant_message", payload={"message": message})
+            )
+            message["content"][1]["text"] = "mutated"
+            message["provider_state"]["key"].append("mutated")
+            agent._branch_id = 9
+            await out.drain()
+            events = store.get_events("host:alice")
+            start = next(
+                event for event in events if event["type"] == "assistant_round_start"
+            )
+            canonical = next(
+                event for event in events if event["type"] == "assistant_message"
+            )
+            assert canonical["round_start_event_id"] == start["event_id"]
+            assert canonical["message"]["content"][1]["text"] == "final"
+            assert canonical["message"]["provider_state"] == {"key": ["value"]}
+            assert canonical["message"]["tool_calls"][0]["id"] == "c1"
+            assert canonical["turn_index"] == 2
+            assert canonical["branch_id"] == 3
+            assert canonical["parent_branch_path"] == [[1, 2]]
+            types = [event["type"] for event in events]
+            assert (
+                types.index("assistant_round_start")
+                < types.index("text_chunk")
+                < types.index("assistant_message")
+            )
+        finally:
+            store.close()
 
 
 class TestParseDetail:

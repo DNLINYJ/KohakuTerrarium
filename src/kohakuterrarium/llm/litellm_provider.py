@@ -2,6 +2,7 @@
 Route framework chat requests through the LiteLLM SDK.
 """
 
+import asyncio
 from typing import Any, AsyncIterator
 
 import litellm
@@ -74,7 +75,9 @@ class LiteLLMProvider(BaseLLMProvider):
         provider_native_tools: list[Any] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
-        params = self._build_params(messages, tools=tools, stream=True, **kwargs)
+        params = await asyncio.to_thread(
+            self._build_params, messages, tools=tools, stream=True, **kwargs
+        )
         self._last_assistant_extra_fields = {}
         segments = TurnSegmentsBuilder()
         reasoning_text = ""
@@ -177,7 +180,9 @@ class LiteLLMProvider(BaseLLMProvider):
         messages: list[dict[str, Any]],
         **kwargs: Any,
     ) -> ChatResponse:
-        params = self._build_params(messages, stream=False, **kwargs)
+        params = await asyncio.to_thread(
+            self._build_params, messages, stream=False, **kwargs
+        )
         self._last_tool_calls = []
         self._last_assistant_extra_fields = {}
 

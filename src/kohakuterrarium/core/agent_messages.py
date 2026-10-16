@@ -30,8 +30,9 @@ from kohakuterrarium.core.compact_branch import (
     is_summary_message,
 )
 from kohakuterrarium.core.events import EventType, TriggerEvent
+from kohakuterrarium.core.settled_refresh import refresh_mutation_prefix
 from kohakuterrarium.errors import ConflictError
-from kohakuterrarium.llm.message import normalize_content_parts
+from kohakuterrarium.llm.message import content_parts_to_dicts, normalize_content_parts
 from kohakuterrarium.session.history import replay_conversation
 from kohakuterrarium.session.snapshot import save_agent_snapshot
 from kohakuterrarium.session.raw_history import (
@@ -113,6 +114,7 @@ class AgentMessagesMixin:
                 turn_index=turn_index,
                 user_position=user_position,
                 branch_view=branch_view,
+                request_id=request_id,
             )
             return
 
@@ -167,6 +169,7 @@ class AgentMessagesMixin:
         if last_user < 0:
             logger.warning("No user message to regenerate from")
             return False
+        last_user = refresh_mutation_prefix(self, last_user)
         removed = conv.truncate_from(last_user + 1)
         # Open a new branch of the current turn.
         self._branch_id = self._max_branch_id_for_turn(self._turn_index) + 1
@@ -195,7 +198,10 @@ class AgentMessagesMixin:
                 append_user_event_pair,
                 self.session_store,
                 self.config.name,
-                {"content": prev_content},
+                {
+                    "content": prev_content,
+                    **({"request_id": request_id} if request_id else {}),
+                },
                 self._turn_index,
                 self._branch_id,
                 ppath,
@@ -289,6 +295,8 @@ class AgentMessagesMixin:
                 user_position=user_position,
             )
             return False
+        resolved_idx = refresh_mutation_prefix(self, resolved_idx)
+        msgs = conv.get_messages()
         target = msgs[resolved_idx]
         if target.role != "user":
             logger.warning("Can only edit user messages", role=target.role)
@@ -367,7 +375,14 @@ class AgentMessagesMixin:
                 append_user_event_pair,
                 self.session_store,
                 self.config.name,
-                {"content": new_content},
+                {
+                    "content": (
+                        content_parts_to_dicts(new_content)
+                        if isinstance(new_content, list)
+                        else new_content
+                    ),
+                    **({"request_id": request_id} if request_id else {}),
+                },
                 self._turn_index,
                 self._branch_id,
                 ppath,
@@ -442,13 +457,7 @@ class AgentMessagesMixin:
         require_no_running_jobs(self)
 
     async def _rerun_from_last(self, new_user_content: str | list = "") -> None:
-        """Trigger an LLM turn from the current conversation state.
-
-        Empty content regenerates from the existing user message; non-empty
-        content records an edit. Normalization is required because downstream
-        context formatting recognizes content-part objects rather than raw
-        multimodal dictionaries.
-        """
+        """Trigger a regeneration or edit turn with normalized content parts."""
         edited = bool(new_user_content)
         normalised = normalize_content_parts(new_user_content)
         if normalised is None:
@@ -534,8 +543,7 @@ class AgentMessagesMixin:
         )
 
     def _max_branch_id_for_turn(self, turn_index: int) -> int:
-        """Return the largest ``branch_id`` recorded for ``turn_index``,
-        or ``0`` if no branch yet exists."""
+        """Return the largest persisted branch ID for a turn, or zero."""
         return _max_branch_id_for_turn(self, turn_index)
 
     def _user_message_content_for_turn(

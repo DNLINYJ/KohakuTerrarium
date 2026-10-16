@@ -64,6 +64,7 @@ class OpenTextSegment:
         self._buf = ""
         self._persisted_len = 0
         self._last_persist = time.monotonic()
+        self.generation = 0
 
     def append(self, chunk: str) -> None:
         """Extend the segment, persisting to the slot on the flush gate."""
@@ -73,6 +74,7 @@ class OpenTextSegment:
             len(self._buf) - self._persisted_len >= _FLUSH_CHARS
             or now - self._last_persist >= _FLUSH_SECONDS
         ):
+            self.generation += 1
             self._persist(self._buf)
             self._slot_active = True
             self._persisted_len = len(self._buf)
@@ -96,6 +98,11 @@ class OpenTextSegment:
         if self._slot_active:
             self._persist("", after=after)
             self._slot_active = False
+
+    def retire(self, *, after: Future) -> None:
+        """Clear a completed round's recovery copy after canonical durability."""
+        self._persist("", after=after)
+        self._slot_active = False
 
     def _reset(self) -> None:
         self._buf = ""

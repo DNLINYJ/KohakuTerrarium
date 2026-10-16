@@ -37,6 +37,10 @@ from kohakuterrarium.core.config_types import (
     OutputConfig,
 )
 from kohakuterrarium.modules.tool.base import ToolContext
+from kohakuterrarium.session.history import (
+    normalize_resumable_events,
+    replay_conversation,
+)
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.resume_target import resolve_resume_path
 from kohakuterrarium.studio.persistence.viewer.exchanges import build_exchanges_payload
@@ -909,6 +913,53 @@ class TestTerrariumIntegration:
             store.append_event(
                 name, "user_message", {"content": f"before {name}"}, turn_index=1
             )
+        canonical = {}
+        for name in ("alice", "carol"):
+            stamp = {"turn_index": 1, "branch_id": 1, "parent_branch_path": []}
+            _, anchor = store.append_event(name, "assistant_round_start", {}, **stamp)
+            store.append_event(
+                name, "text_chunk", {"content": "pre-hook display"}, **stamp
+            )
+            canonical[name] = {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": f"post-hook {name}"},
+                    {
+                        "type": "file",
+                        "file": {
+                            "name": f"{name}.txt",
+                            "content": f"canonical-only {name}",
+                        },
+                        "extension": {"nested": [name]},
+                    },
+                ],
+                "provider_state": {"signature": name},
+            }
+            store.append_event(
+                name,
+                "assistant_message",
+                {"round_start_event_id": anchor, "message": canonical[name]},
+                **stamp,
+            )
+
+        def assert_canonical_replay(current_store, name, after=False):
+            raw = current_store.get_events(name)
+            starts = [
+                event["event_id"]
+                for event in raw
+                if event["type"] == "assistant_round_start"
+            ]
+            end = next(event for event in raw if event["type"] == "assistant_message")
+            assert end["round_start_event_id"] == starts[0]
+            messages = replay_conversation(
+                normalize_resumable_events(raw),
+                branch_view={1: 1, 2: 1} if after else {1: 1},
+            )
+            expected = [{"role": "user", "content": f"before {name}"}, canonical[name]]
+            if after:
+                expected.append({"role": "user", "content": f"after {name}"})
+            assert messages == expected
+
         store.flush()
         events: list = []
         collector = await _events(service, events)
@@ -950,6 +1001,8 @@ class TestTerrariumIntegration:
         assert store_alice is not store_carol
         assert store_alice.meta["parent_session_ids"] == [gid]
         assert store_carol.meta["parent_session_ids"] == [gid]
+        assert_canonical_replay(store_alice, "alice")
+        assert_canonical_replay(store_carol, "carol")
         store_alice.append_event(
             "alice", "user_message", {"content": "after alice"}, turn_index=2
         )
@@ -990,6 +1043,8 @@ class TestTerrariumIntegration:
                 if event["type"] == "user_message"
             ] == [f"before {name}", f"after {name}"]
         assert merged_store.meta["format_version"] == 2
+        for name in ("alice", "carol"):
+            assert_canonical_replay(merged_store, name, after=True)
 
         # --- AUTO-SPLIT via disconnect (the other split trigger) -------
         # The merged graph has exactly one channel (``reunite``) joining
@@ -1012,6 +1067,8 @@ class TestTerrariumIntegration:
         assert post_store_alice is not post_store_carol
         assert post_store_alice.meta["parent_session_ids"] == [merged_store.session_id]
         assert post_store_carol.meta["parent_session_ids"] == [merged_store.session_id]
+        assert_canonical_replay(post_store_alice, "alice", after=True)
+        assert_canonical_replay(post_store_carol, "carol", after=True)
         # The post-split environments are distinct, freshly minted.
         assert (
             engine._environments[a3.graph_id] is not engine._environments[c3.graph_id]

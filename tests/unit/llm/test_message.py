@@ -101,6 +101,25 @@ class TestContentPartToDict:
 
 
 class TestContentPartFromDict:
+    def test_clearing_image_source_updates_wire_without_losing_custom_meta(self):
+        raw = {
+            "type": "image_url",
+            "image_url": {"url": "u"},
+            "meta": {
+                "source_name": "old.png",
+                "source_type": "attachment",
+                "custom": "keep",
+            },
+        }
+        part = content_part_from_dict(raw)
+        part.source_name = None
+        part.source_type = None
+        meta = part.to_dict()["meta"]
+        assert meta["source_name"] is None
+        assert meta["source_type"] is None
+        assert meta["custom"] == "keep"
+        assert raw["meta"]["source_name"] == "old.png"
+
     def test_text_round_trip(self):
         src = TextPart(text="round")
         rebuilt = content_part_from_dict(src.to_dict())

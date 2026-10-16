@@ -5,6 +5,12 @@ function clonePart(part) {
   return JSON.parse(JSON.stringify(part || {}))
 }
 
+function cloneContent(content) {
+  if (typeof content === "string") return content
+  if (!Array.isArray(content)) return content
+  return JSON.parse(JSON.stringify(content))
+}
+
 function partName(part) {
   if (part?.type === "image_url") {
     return part.meta?.source_name || part.meta?.revised_prompt || "image"
@@ -21,28 +27,169 @@ export function formatBytes(bytes) {
   return bytes + " B"
 }
 
-export function contentToEditableDraft(content) {
-  if (typeof content === "string") {
-    return { text: content, attachments: [] }
+const FILE_PLACEHOLDER_RE = /\[\[file:([^\]]+)\]\]/g
+export function parseFilePlaceholderOrdinal(ref, fileCount) {
+  if (!/^\p{Decimal_Number}+$/u.test(ref)) return null
+  let value = 0
+  for (const ch of ref) {
+    const code = ch.codePointAt(0)
+    let zero = code
+    while (/\p{Decimal_Number}/u.test(String.fromCodePoint(zero - 1))) zero--
+    value = value * 10 + ((code - zero) % 10)
+    if (value >= fileCount) return null
   }
-  if (!Array.isArray(content)) {
-    return { text: "", attachments: [] }
-  }
+  return value
+}
 
-  const text = content
+function placeholderRefsInTexts(texts) {
+  const refs = []
+  for (const text of texts) {
+    if (typeof text !== "string" || !text) continue
+    FILE_PLACEHOLDER_RE.lastIndex = 0
+    let match
+    while ((match = FILE_PLACEHOLDER_RE.exec(text))) refs.push(match[1])
+  }
+  return refs
+}
+
+function assertNumericPlaceholderBindings(oldTexts, newTexts, oldFiles, newFiles) {
+  const oldRefs = new Set(placeholderRefsInTexts(oldTexts))
+  const newRefs = new Set(placeholderRefsInTexts(newTexts))
+  const shared = [...oldRefs].filter((ref) => newRefs.has(ref))
+  const resolve = (ref, files) => {
+    const idx = parseFilePlaceholderOrdinal(ref, files.length)
+    return idx == null ? null : files[idx]
+  }
+  for (const ref of shared) {
+    if (resolve(ref, oldFiles) !== resolve(ref, newFiles)) {
+      throw new Error("Attachment changes would rebind an existing numeric file reference")
+    }
+  }
+}
+
+function isAttachmentPart(part) {
+  return part?.type === "image_url" || part?.type === "file"
+}
+
+function mergedTextFromContent(content) {
+  return content
     .filter((part) => part?.type === "text")
     .map((part) => part.text || "")
     .join("\n")
-  const attachments = content
-    .filter((part) => part?.type === "image_url" || part?.type === "file")
-    .map((part, index) => ({
-      id: `existing_${index}_${partName(part)}`,
+}
+
+export function contentToEditableDraft(content) {
+  if (typeof content === "string") {
+    return {
+      text: content,
+      attachments: [],
+      sourceContent: content,
+      textRestricted: false,
+    }
+  }
+  if (!Array.isArray(content)) {
+    return { text: "", attachments: [], sourceContent: content, textRestricted: false }
+  }
+
+  const sourceContent = cloneContent(content)
+  const textParts = sourceContent.filter((part) => part?.type === "text")
+  const attachments = []
+  sourceContent.forEach((part, originalIndex) => {
+    if (!isAttachmentPart(part)) return
+    attachments.push({
+      id: `existing_${originalIndex}_${partName(part)}`,
       name: partName(part),
       kind: part.type === "image_url" ? "image" : "file",
+      originalIndex,
       existingPart: clonePart(part),
-    }))
+    })
+  })
 
-  return { text, attachments }
+  return {
+    text: mergedTextFromContent(sourceContent),
+    attachments,
+    sourceContent,
+    textRestricted: textParts.length > 1,
+  }
+}
+
+export async function buildEditedMessageParts(sourceContent, draftText, attachments = []) {
+  if (typeof sourceContent === "string" || !Array.isArray(sourceContent)) {
+    return buildMessageParts(draftText, attachments)
+  }
+
+  const textParts = []
+  sourceContent.forEach((part, originalIndex) => {
+    if (part?.type === "text") textParts.push({ part, originalIndex })
+  })
+  const merged = mergedTextFromContent(sourceContent)
+  const textRestricted = textParts.length > 1
+  if (textRestricted && draftText !== merged) {
+    throw new Error("Merged text editing is disabled for multi-text messages")
+  }
+
+  const keptByOriginal = new Map()
+  const appended = []
+  for (const attachment of attachments) {
+    if (Number.isInteger(attachment?.originalIndex) && attachment.originalIndex >= 0) {
+      keptByOriginal.set(attachment.originalIndex, attachment)
+    } else {
+      appended.push(attachment)
+    }
+  }
+
+  const parts = []
+  const newFiles = []
+  for (let originalIndex = 0; originalIndex < sourceContent.length; originalIndex++) {
+    const part = sourceContent[originalIndex]
+    if (part?.type === "text") {
+      if (textRestricted) {
+        parts.push(clonePart(part))
+        continue
+      }
+      const next = clonePart(part)
+      next.text = typeof draftText === "string" ? draftText : part.text || ""
+      parts.push(next)
+      continue
+    }
+    if (isAttachmentPart(part)) {
+      const replacement = keptByOriginal.get(originalIndex)
+      if (!replacement) continue
+      let nextPart
+      if (replacement.existingPart && !replacement.file) {
+        nextPart = clonePart(replacement.existingPart)
+      } else {
+        nextPart = await attachmentToPart(replacement)
+      }
+      if (nextPart?.type === "file") newFiles.push(originalIndex)
+      parts.push(nextPart)
+      continue
+    }
+    parts.push(clonePart(part))
+  }
+  for (const attachment of appended) {
+    const part = await attachmentToPart(attachment)
+    if (part?.type === "file") newFiles.push(Symbol("new file"))
+    parts.push(part)
+  }
+  if (
+    !textRestricted &&
+    textParts.length === 0 &&
+    typeof draftText === "string" &&
+    draftText.trim()
+  ) {
+    parts.push({ type: "text", text: draftText })
+  }
+  const oldFiles = []
+  sourceContent.forEach((part, originalIndex) => {
+    if (part?.type === "file") oldFiles.push(originalIndex)
+  })
+  const oldTexts = sourceContent
+    .filter((part) => part?.type === "text")
+    .map((part) => part.text || "")
+  const newTexts = parts.filter((part) => part?.type === "text").map((part) => part.text || "")
+  assertNumericPlaceholderBindings(oldTexts, newTexts, oldFiles, newFiles)
+  return parts
 }
 
 export async function imageFileToPart(file) {

@@ -5,6 +5,8 @@ Artifacts live beside the session file under ``<session-stem>.artifacts/``.
 
 from pathlib import Path
 
+from kohakuterrarium.errors import InvalidRequestError, NotFoundError
+
 
 def resolve_artifact_relpath(filename: str) -> Path:
     """Reject traversal and absolute paths; return a clean relative path.
@@ -28,6 +30,23 @@ def artifacts_dir_for(session_path: Path) -> Path:
     target = session_path.parent / f"{session_path.stem}.artifacts"
     target.mkdir(parents=True, exist_ok=True)
     return target
+
+
+def resolve_artifact_file(artifacts: Path, filepath: str) -> Path:
+    """Resolve an existing artifact without allowing traversal or symlink escapes."""
+    if not filepath:
+        raise InvalidRequestError("empty filepath")
+    rel = Path(filepath)
+    if rel.is_absolute() or any(part in ("..", "") for part in rel.parts):
+        raise InvalidRequestError("invalid filepath")
+    candidate = (artifacts / rel).resolve()
+    try:
+        candidate.relative_to(artifacts.resolve())
+    except ValueError:
+        raise InvalidRequestError("path escapes artifacts")
+    if not candidate.is_file():
+        raise NotFoundError("artifact not found")
+    return candidate
 
 
 def write_artifact_bytes(artifacts_dir: Path, filename: str, data: bytes) -> Path:

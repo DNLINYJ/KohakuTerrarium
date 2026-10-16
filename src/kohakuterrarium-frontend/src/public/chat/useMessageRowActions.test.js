@@ -13,6 +13,7 @@ const { errorSpy } = vi.hoisted(() => ({ errorSpy: vi.fn() }))
 vi.mock("element-plus", () => ({ ElMessage: { error: errorSpy } }))
 
 import { useMessageRowActions } from "./useMessageRowActions"
+import { provideMessageEditDrafts } from "../../components/chat/shared/messageEditDrafts"
 
 function deferred() {
   let resolve
@@ -93,9 +94,16 @@ function mountActions({
       return () => h("div")
     },
   })
-  const wrapper = mount(Harness)
+  const show = ref(true)
+  const Provider = defineComponent({
+    setup() {
+      provideMessageEditDrafts()
+      return () => (show.value ? h(Harness) : null)
+    },
+  })
+  const wrapper = mount(Provider)
   mounted.push(wrapper)
-  return { wrapper, api }
+  return { wrapper, api, show }
 }
 
 describe("useMessageRowActions clipboard ownership", () => {
@@ -178,32 +186,37 @@ describe("useMessageRowActions edit lifecycle", () => {
     expect(api.editAttachments.value).toEqual([])
   })
 
-  it.each(["in-place locator", "branch locator", "closed tab", "ABA tab", "missing target"])(
-    "does not submit a prepared edit after %s replacement",
-    async (change) => {
-      const fileText = deferred()
-      const editMessage = vi.fn(async () => ({ ok: true }))
-      const { api } = mountActions({ editMessage })
-      api.startEdit()
-      api.editAttachments.value.push(fileAttachment(fileText))
-      const pending = api.confirmEdit()
-      if (change === "in-place locator") api.__props.message.locator.eventId = 9
-      if (change === "branch locator") api.__props.message.locator.branchId = 2
-      if (change === "closed tab") api.__chat.tabs = []
-      if (change === "ABA tab") {
-        api.__chat.tabs = []
-        api.__chat.tabs = ["main"]
-      }
-      if (change === "missing target")
-        api.__chat.messagesByTab.main = [
-          userMessage({ id: "neighbor", locator: { eventId: 9, turnIndex: 2, branchId: 1 } }),
-        ]
-      fileText.resolve("body")
-      await pending
-      expect(editMessage).not.toHaveBeenCalled()
-      expect(api.editSaving.value).toBe(false)
-    },
-  )
+  it.each([
+    "in-place locator",
+    "branch locator",
+    "closed tab",
+    "ABA tab",
+    "missing target",
+    "instance id",
+  ])("does not submit a prepared edit after %s replacement", async (change) => {
+    const fileText = deferred()
+    const editMessage = vi.fn(async () => ({ ok: true }))
+    const { api } = mountActions({ editMessage })
+    api.startEdit()
+    api.editAttachments.value.push(fileAttachment(fileText))
+    const pending = api.confirmEdit()
+    if (change === "in-place locator") api.__props.message.locator.eventId = 9
+    if (change === "branch locator") api.__props.message.locator.branchId = 2
+    if (change === "closed tab") api.__chat.tabs = []
+    if (change === "ABA tab") {
+      api.__chat.tabs = []
+      api.__chat.tabs = ["main"]
+    }
+    if (change === "missing target")
+      api.__chat.messagesByTab.main = [
+        userMessage({ id: "neighbor", locator: { eventId: 9, turnIndex: 2, branchId: 1 } }),
+      ]
+    if (change === "instance id") api.__chat._instanceId = "other"
+    fileText.resolve("body")
+    await pending
+    expect(editMessage).not.toHaveBeenCalled()
+    expect(api.editSaving.value).toBe(false)
+  })
 
   it("does not apply a late file read error after the host view changed", async () => {
     const owner = ref("A")
@@ -335,5 +348,288 @@ describe("useMessageRowActions edit lifecycle", () => {
     expect(editMessage).toHaveBeenCalledTimes(1)
     expect(api.editSaving.value).toBe(false)
     expect(api.editError.value).toBe("")
+  })
+})
+
+describe("useMessageRowActions order-preserving save", () => {
+  const originalParts = [
+    {
+      type: "image_url",
+      image_url: { url: "file:///tmp/before.png" },
+      meta: { source_name: "dup.png", vendor: "keep" },
+    },
+    { type: "text", text: "", extra: { keep: true } },
+    {
+      type: "file",
+      file: { name: "note.txt", path: "/workspace/note.txt", mime: "text/plain" },
+    },
+    { type: "text", text: "reserved", meta: { vendor: "x" } },
+    { type: "text", text: "second" },
+    {
+      type: "file",
+      file: { name: "note.txt", path: "/workspace/other.txt", mime: "text/plain" },
+    },
+  ]
+
+  function partsMessage(content) {
+    return userMessage({ content, contentParts: content })
+  }
+
+  it("saves a no-op as the exact original raw block list", async () => {
+    const editMessage = vi.fn(async () => ({ ok: true }))
+    const message = partsMessage(originalParts)
+    const { api } = mountActions({ message, editMessage, messagesByTab: { main: [message] } })
+    api.startEdit()
+    await api.confirmEdit()
+    expect(editMessage).toHaveBeenCalledTimes(1)
+    expect(editMessage.mock.calls[0][1]).toEqual(originalParts)
+    expect(originalParts[1].text).toBe("")
+  })
+
+  it("replaces a single text block in place without regrouping attachments", async () => {
+    const source = [
+      { type: "file", file: { name: "a.txt", path: "/a.txt" } },
+      { type: "text", text: "hello", extra: { keep: true } },
+      {
+        type: "image_url",
+        image_url: { url: "file:///tmp/pic.png" },
+        meta: { source_name: "pic.png" },
+      },
+    ]
+    const editMessage = vi.fn(async () => ({ ok: true }))
+    const message = partsMessage(source)
+    const { api } = mountActions({ message, editMessage, messagesByTab: { main: [message] } })
+    api.startEdit()
+    api.editText.value = "world"
+    await api.confirmEdit()
+    expect(editMessage.mock.calls[0][1]).toEqual([
+      { type: "file", file: { name: "a.txt", path: "/a.txt" } },
+      { type: "text", text: "world", extra: { keep: true } },
+      {
+        type: "image_url",
+        image_url: { url: "file:///tmp/pic.png" },
+        meta: { source_name: "pic.png" },
+      },
+    ])
+    expect(source[1].text).toBe("hello")
+  })
+
+  it("deletes/replaces by original occurrence and appends new attachments at the end", async () => {
+    const editMessage = vi.fn(async () => ({ ok: true }))
+    const message = partsMessage(originalParts)
+    const { api } = mountActions({ message, editMessage, messagesByTab: { main: [message] } })
+    api.startEdit()
+    expect(api.editAttachments.value.map((item) => item.originalIndex)).toEqual([0, 2, 5])
+    api.removeEditAttachment(1)
+    const replacement = new File(["NEW"], "replaced.png", { type: "image/png" })
+    Object.defineProperty(replacement, "size", { value: 3 })
+    api.replaceEditAttachment(0, replacement, "image")
+    const extra = new File(["TAIL"], "extra.txt", { type: "text/plain" })
+    Object.defineProperty(extra, "size", { value: 4 })
+    api.onEditFileChange({ target: { files: [extra], value: "x" } }, "file")
+    await api.confirmEdit()
+    const payload = editMessage.mock.calls[0][1]
+    expect(payload.map((part) => part.type)).toEqual([
+      "image_url",
+      "text",
+      "text",
+      "text",
+      "file",
+      "file",
+    ])
+    expect(payload[0].meta.source_name).toBe("replaced.png")
+    expect(payload[4].file.path).toBe("/workspace/other.txt")
+    expect(payload[5].file.content).toBe("TAIL")
+    expect(originalParts[2].file.path).toBe("/workspace/note.txt")
+  })
+
+  it("keeps sourceContent and original indices across an optimistic unmount/remount", async () => {
+    const gate = deferred()
+    const editMessage = vi.fn(() => gate.promise)
+    const message = partsMessage(originalParts)
+    const { api, show } = mountActions({
+      message,
+      editMessage,
+      messagesByTab: { main: [message] },
+    })
+    api.startEdit()
+    expect(api.editTextRestricted.value).toBe(true)
+    const pending = api.confirmEdit()
+    await nextTick()
+    show.value = false
+    await nextTick()
+    show.value = true
+    await nextTick()
+    expect(api.editing.value).toBe(true)
+    expect(api.editTextRestricted.value).toBe(true)
+    expect(api.editAttachments.value.map((item) => item.originalIndex)).toEqual([0, 2, 5])
+    gate.resolve({ ok: false, error: "offline" })
+    await pending
+    api.editText.value = "should not merge"
+    await api.confirmEdit()
+    expect(editMessage).toHaveBeenCalledTimes(1)
+    expect(api.editError.value).toMatch(/merged text/i)
+    expect(originalParts[4].text).toBe("second")
+  })
+
+  function filteredParts(content) {
+    return content.filter((part) => part && ["text", "image_url", "file"].includes(part.type))
+  }
+
+  function rawRow(rawContent) {
+    return userMessage({
+      content: rawContent
+        .filter((part) => part?.type === "text")
+        .map((part) => part.text || "")
+        .join("\n"),
+      contentParts: filteredParts(rawContent),
+      rawContent,
+    })
+  }
+
+  it("rejects editing unknown raw parts instead of silently dropping them", async () => {
+    const rawContent = [
+      {
+        type: "image_url",
+        image_url: { url: "file:///tmp/pic.png" },
+        meta: { source_name: "pic.png", vendor: "keep" },
+      },
+      { type: "unknown", payload: { raw: 1 }, meta: { vendor: "x" } },
+      { type: "text", text: "hello", extra: { keep: true } },
+      { type: "file", file: { name: "note.txt", path: "/workspace/note.txt" } },
+    ]
+    const editMessage = vi.fn(async () => ({ ok: true }))
+    const message = rawRow(rawContent)
+    expect(message.contentParts.map((part) => part.type)).toEqual(["image_url", "text", "file"])
+    const { api } = mountActions({ message, editMessage, messagesByTab: { main: [message] } })
+    api.startEdit()
+    expect(api.editing.value).toBe(false)
+    expect(api.editError.value).toBe("chat.editUnsupportedParts")
+    expect(editMessage).not.toHaveBeenCalled()
+    expect(message.rawContent).toEqual(rawContent)
+  })
+
+  it("appends an image-only caption and keeps it after deleting the sole image", async () => {
+    const rawContent = [
+      {
+        type: "image_url",
+        image_url: { url: "file:///tmp/only.png" },
+        meta: { source_name: "only.png" },
+      },
+    ]
+    const editMessage = vi.fn(async () => ({ ok: true }))
+    const message = rawRow(rawContent)
+    expect(message.contentParts).toEqual(rawContent)
+    const { api } = mountActions({ message, editMessage, messagesByTab: { main: [message] } })
+    api.startEdit()
+    api.editText.value = "a caption"
+    await api.confirmEdit()
+    expect(editMessage.mock.calls[0][1]).toEqual([
+      {
+        type: "image_url",
+        image_url: { url: "file:///tmp/only.png" },
+        meta: { source_name: "only.png" },
+      },
+      { type: "text", text: "a caption" },
+    ])
+
+    const deleted = vi.fn(async () => ({ ok: true }))
+    const second = rawRow(rawContent)
+    const { api: api2 } = mountActions({
+      message: second,
+      editMessage: deleted,
+      messagesByTab: { main: [second] },
+    })
+    api2.startEdit()
+    api2.removeEditAttachment(0)
+    api2.editText.value = "just text"
+    await api2.confirmEdit()
+    expect(deleted.mock.calls[0][1]).toEqual([{ type: "text", text: "just text" }])
+  })
+
+  it("ignores mutate/reorder of the live original after the draft snapshot is opened", async () => {
+    const rawContent = [
+      {
+        type: "image_url",
+        image_url: { url: "file:///tmp/pic.png" },
+        meta: { source_name: "pic.png", vendor: "keep" },
+      },
+      { type: "image_url", image_url: { url: "file:///tmp/second.png" }, meta: { vendor: "x" } },
+      { type: "text", text: "hello", extra: { keep: true } },
+      { type: "file", file: { name: "note.txt", path: "/workspace/note.txt" } },
+    ]
+    const editMessage = vi.fn(async () => ({ ok: true }))
+    const message = rawRow(rawContent)
+    const { api } = mountActions({ message, editMessage, messagesByTab: { main: [message] } })
+    api.startEdit()
+    const snapshot = api.editSourceContent.value
+    expect(snapshot).not.toBe(rawContent)
+    rawContent.reverse()
+    rawContent[0].file.path = "/mutated"
+    rawContent[3].meta.vendor = "mutated"
+    message.contentParts.reverse()
+    api.editText.value = "world"
+    await api.confirmEdit()
+    expect(editMessage.mock.calls[0][1]).toEqual([
+      {
+        type: "image_url",
+        image_url: { url: "file:///tmp/pic.png" },
+        meta: { source_name: "pic.png", vendor: "keep" },
+      },
+      { type: "image_url", image_url: { url: "file:///tmp/second.png" }, meta: { vendor: "x" } },
+      { type: "text", text: "world", extra: { keep: true } },
+      { type: "file", file: { name: "note.txt", path: "/workspace/note.txt" } },
+    ])
+    expect(snapshot[3].file.path).toBe("/workspace/note.txt")
+  })
+
+  it("captures a deep snapshot of sourceContent at confirm so later mutation cannot rewrite the save", async () => {
+    const rawContent = [
+      { type: "text", text: "hello" },
+      { type: "file", file: { name: "note.txt", path: "/workspace/note.txt" } },
+    ]
+    const gate = deferred()
+    const editMessage = vi.fn(async () => ({ ok: true }))
+    const message = rawRow(rawContent)
+    const { api } = mountActions({ message, editMessage, messagesByTab: { main: [message] } })
+    api.startEdit()
+    const extra = {
+      id: "new_async",
+      name: "late.txt",
+      kind: "file",
+      file: { name: "late.txt", type: "text/plain", size: 4, text: () => gate.promise },
+    }
+    api.editAttachments.value.push(extra)
+    const pending = api.confirmEdit()
+    api.editSourceContent.value.reverse()
+    api.editSourceContent.value[0].file.path = "/mutated-during-await"
+    gate.resolve("body")
+    await pending
+    const payload = editMessage.mock.calls[0][1]
+    expect(payload.map((part) => part.type)).toEqual(["text", "file", "file"])
+    expect(payload[0].text).toBe("hello")
+    expect(payload[1].file.path).toBe("/workspace/note.txt")
+    expect(payload[2].file.content).toBe("body")
+  })
+
+  it("surfaces a numeric placeholder rebind as a visible edit error and does not dispatch", async () => {
+    const source = [
+      { type: "text", text: "keep" },
+      { type: "file", file: { name: "dup.txt", path: "/workspace/a.txt", content: "FILE-A" } },
+      { type: "text", text: "see [[file:1]]" },
+      { type: "file", file: { name: "dup.txt", path: "/workspace/b.txt", content: "FILE-B" } },
+      { type: "file", file: { name: "dup.txt", path: "/workspace/c.txt", content: "FILE-C" } },
+    ]
+    const editMessage = vi.fn(async () => ({ ok: true }))
+    const message = partsMessage(source)
+    const { api } = mountActions({ message, editMessage, messagesByTab: { main: [message] } })
+    api.startEdit()
+    expect(api.editTextRestricted.value).toBe(true)
+    api.removeEditAttachment(0)
+    await api.confirmEdit()
+    expect(editMessage).not.toHaveBeenCalled()
+    expect(api.editing.value).toBe(true)
+    expect(api.editError.value).toMatch(/numeric file reference|placeholder/i)
+    expect(source[2].text).toBe("see [[file:1]]")
   })
 })

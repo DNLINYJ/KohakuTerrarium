@@ -18,6 +18,7 @@ from kohakuterrarium.session.output_activity import (
     _subagent_name as _subagent_name,  # noqa: F401
     _token_metadata as _token_metadata,  # noqa: F401
 )
+from kohakuterrarium.session.output_assistant import AssistantOutputMixin
 from kohakuterrarium.session.run_state import RunTracker
 from kohakuterrarium.session.snapshot import compact_state
 from kohakuterrarium.session.text_buffer import (
@@ -31,7 +32,7 @@ from kohakuterrarium.modules.output.event import OutputEvent
 logger = get_logger(__name__)
 
 
-class SessionOutput(SessionActivityMixin, OutputModule):
+class SessionOutput(AssistantOutputMixin, SessionActivityMixin, OutputModule):
     """Output module that records events to a SessionStore.
 
     Streamed text is coalesced into one durable segment and flushed at the
@@ -495,6 +496,10 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         corresponding output hooks.
         """
         match event.type:
+            case "assistant_round_start":
+                self._begin_assistant_round()
+            case "assistant_message":
+                self._finish_assistant_round(event.payload["message"])
             case "model_recovery":
                 pass
             case "text":

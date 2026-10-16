@@ -98,7 +98,7 @@ async def edit_creature_message(
 ):
     if isinstance(req.content, list):
         content: str | list[dict] = [
-            part.model_dump() if hasattr(part, "model_dump") else part
+            part.model_dump(exclude_unset=True) if hasattr(part, "model_dump") else part
             for part in req.content
         ]
     else:

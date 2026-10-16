@@ -11,7 +11,7 @@ tags:
 
 For readers persisting, resuming, or archiving agent runs.
 
-A session captures the operational state of a run (conversation, events, sub-agent conversations, channel history, scratchpad, jobs, resumable triggers, and config metadata) as a single `.kohakutr` file. You can stop a creature at any point and resume exactly where it left off.
+A session records a run's conversation, events, sub-agent conversations, channel history, scratchpad, job records, resumable triggers, and config metadata in a `.kohakutr` file. Resume reconstructs a creature from these records; it does not snapshot a running process or roll back external resources.
 
 Concept primer: [memory and compaction](../concepts/modules/memory-and-compaction.md), [session and environment](../concepts/modules/session-and-environment.md).
 
@@ -35,7 +35,25 @@ The format is append-only for event data and versioned through KohakuVault's aut
 
 ### Edit and regenerate after compaction
 
-Compaction changes the live prompt and writes a fast-resume snapshot, but it does not erase the append-only event log. Studio identifies editable user messages with the persisted `event_id`, `turn_index`, and `branch_id`. Save & Rerun and Regenerate rebuild the new branch from the selected message's original event prefix, ignoring compact summaries and snapshots. The previous branch and every later event remain available for branch navigation and resume. If the locator is missing, ambiguous, points to injected mid-turn input, or conflicts with the selected branch, the operation fails without changing history.
+Compaction changes the live prompt and writes a fast-resume snapshot, but it does not erase the append-only event log. Studio identifies editable user messages with the persisted `event_id`, `turn_index`, and `branch_id`. Save & Rerun and Regenerate build a new branch from the target history, reusing only summaries and snapshots whose source history remains compatible. Representations that depend on modified content are not reused. The previous branch and every later event remain available for branch navigation and resume. If the locator is missing, ambiguous, points to injected mid-turn input, or conflicts with the selected branch, the operation fails without changing history.
+
+### Multimodal edit, regenerate, and branch
+
+When history is stable, editing and regenerating a user turn rebuild its original text, image, and file parts from the event log. Regenerating reuses those parts; an edit supplies the new part list and opens a sibling branch. Continuing an older branch uses that branch's history and compatible snapshots, including after resume. In Studio, editing only the text retains attachments; deleting or replacing one affects only the new branch.
+
+Saved assistant messages and settled tool results retain their structured content and call/result pairing. A failed tool may return diagnostic media or partial files; its saved output remains structured, with error and exit status recorded separately. Replaying a settled result does not execute the tool again. Different generated image bytes use different artifact paths, so a new sibling does not overwrite the earlier generated image. A settled background result is available to compatible branches that retain its call, but not to a branch that excludes that call; saving a result does not itself continue an unselected branch.
+
+Inline bytes are immutable copies: data URLs and inline file contents, including binary `FilePart.data_base64`, are retained in saved history, so mutating a derived workspace copy of an extracted file does not change later replay. Binary files are not reduced to display placeholders before storage. Request preparation still uses the existing file reader and provider capabilities; saving bytes does not imply that every MIME type is readable by the model, and display previews continue to omit base64 payloads. Live workspace paths (`file://` and similar) remain dynamic and are reread from disk when a request is prepared.
+
+Generated artifacts live beside the session file in `<session>.artifacts/` (`generated_images/`, `generated_videos/`, `tool_outputs/`). An explicit `--session` path, programmatic `session=`, or `Terrarium(session_dir=...)` owns those artifacts even when `KT_SESSION_DIR` points at a different default directory. Outgoing provider requests resolve stored artifact URLs to data URLs at the provider boundary; the conversation snapshot keeps the compact session-relative reference. Local images are resolved only for the content the provider selects: images removed by an existing request budget, or from roles the provider does not send as images, do not need to be readable for that request.
+
+Known limits in this release:
+
+- Studio rejects inline edit of user messages that contain part types other than text, image, and file.
+- A user message with more than one text part can still be rerun, but Studio does not rewrite those texts as a single merged field.
+- Actual history switching, edit/regenerate, and rewind are rejected while a turn or compaction is active, or background work has not settled. Ordinary same-branch input keeps its existing queueing behavior; it does not become a history switch.
+- Snapshots restore stored messages and references, not missing artifact files, processes, or external side effects. Archive the session file together with its artifacts directory. Required missing local images fail request preparation instead of silently disappearing; remote URL availability is not guaranteed.
+- These guarantees cover the framework's existing text/image/file representations and the selected provider's capabilities. They do not promise lossless visual summaries or cross-provider history migration.
 
 ### Older session formats
 
@@ -57,12 +75,14 @@ automatically repair a previously migrated file.
 
 `<name>` is auto-generated from the creature/terrarium name plus a timestamp.
 `KT_SESSION_DIR` changes the root for CLI, Studio, and the web API; an explicit
-`--session <path>` wins for that run. Generated media uses predictable sibling
-paths: `generated_images/` for provider-generated images and
-`generated_videos/` for videos. Generic binary tool output remains under
-`tool_outputs/`. Existing artifact paths remain readable and are not migrated.
-Deleting session data does not delete its retained artifacts. Use
-`--no-session` to opt out of session persistence.
+`--session <path>` wins for that run. Generated media is stored beside the
+session file that owns the run — including a custom `session=` path or a
+`Terrarium(session_dir=...)` run — not under a global `KT_SESSION_DIR` when
+those differ. Predictable sibling paths: `generated_images/` for
+provider-generated images and `generated_videos/` for videos. Generic binary
+tool output remains under `tool_outputs/`. Existing artifact paths remain
+readable and are not migrated. Deleting session data does not delete its
+retained artifacts. Use `--no-session` to opt out of session persistence.
 
 ## What persists
 

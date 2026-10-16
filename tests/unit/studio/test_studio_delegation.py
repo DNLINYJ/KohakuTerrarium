@@ -200,7 +200,8 @@ class TestSessionsChatControlForward:
         result = await s.sessions.chat.regenerate(gid, "alice")
         # The facade preserves the authoritative service metadata.
         assert result["status"] == "completed"
-        assert agent.regenerate_args == (None, None, None)
+        assert result["request_id"]
+        assert agent.regenerate_args == (None, None, result["request_id"])
 
     async def test_edit_message_forwards_idx_and_content_and_returns_result(
         self, studio_engine
@@ -214,7 +215,8 @@ class TestSessionsChatControlForward:
         out = await s.sessions.chat.edit_message(gid, "alice", 0, "edited text")
         assert isinstance(out, dict)
         assert out["status"] == "completed"
-        assert agent.edit_args == (0, "edited text", None)
+        assert out["request_id"]
+        assert agent.edit_args == (0, "edited text", out["request_id"])
 
     async def test_rewind_reaches_the_agent(self, studio_engine):
         s, engine = studio_engine

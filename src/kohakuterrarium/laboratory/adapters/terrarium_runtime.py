@@ -1,5 +1,6 @@
 """Expose a Terrarium engine through the ``terrarium.runtime`` namespace."""
 
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -560,27 +561,29 @@ class TerrariumRuntimeAdapter:
 
             case "regenerate":
                 agent = self._require_hosted(msg.body["creature_id"]).agent
+                request_id = msg.body.get("request_id") or uuid.uuid4().hex
                 raw_target = msg.body.get("target")
                 target = UserMessageSelector(**raw_target) if raw_target else None
                 kwargs = {
                     "turn_index": msg.body.get("turn_index"),
                     "branch_view": msg.body.get("branch_view"),
-                    "request_id": msg.body.get("request_id"),
+                    "request_id": request_id,
                 }
                 if target is not None:
                     kwargs["target"] = target
                 await agent.regenerate_last_response(**kwargs)
-                return _completed_branch_result(agent, msg.body.get("request_id"))
+                return _completed_branch_result(agent, request_id)
 
             case "edit_message":
                 agent = self._require_hosted(msg.body["creature_id"]).agent
+                request_id = msg.body.get("request_id") or uuid.uuid4().hex
                 raw_target = msg.body.get("target")
                 target = UserMessageSelector(**raw_target) if raw_target else None
                 kwargs = {
                     "turn_index": msg.body.get("turn_index"),
                     "user_position": msg.body.get("user_position"),
                     "branch_view": msg.body.get("branch_view"),
-                    "request_id": msg.body.get("request_id"),
+                    "request_id": request_id,
                 }
                 if target is not None:
                     kwargs["target"] = target
@@ -591,7 +594,7 @@ class TerrariumRuntimeAdapter:
                 )
                 if not ok:
                     raise ValueError(f"message {msg.body['msg_idx']} cannot be edited")
-                return _completed_branch_result(agent, msg.body.get("request_id"))
+                return _completed_branch_result(agent, request_id)
 
             case "rewind":
                 await self._require_hosted(msg.body["creature_id"]).agent.rewind_to(

@@ -146,4 +146,32 @@ describe("messageEditDrafts pool", () => {
     await nextTick()
     expect(view.latest().editText.value).toBe("")
   })
+
+  it("retains sourceContent, original-block indices and text restriction across remount", async () => {
+    const view = createView("row-1")
+    const first = view.latest()
+    first.editSourceContent.value = [
+      { type: "text", text: "one" },
+      { type: "file", file: { name: "dup.txt", path: "/a" } },
+      { type: "text", text: "two" },
+      { type: "file", file: { name: "dup.txt", path: "/b" } },
+    ]
+    first.editAttachments.value = [
+      { id: "a0", name: "dup.txt", kind: "file", originalIndex: 1 },
+      { id: "a1", name: "dup.txt", kind: "file", originalIndex: 3 },
+    ]
+    first.editTextRestricted.value = true
+    first.editing.value = true
+    const retained = first.retain()
+    view.show.value = false
+    await nextTick()
+    view.show.value = true
+    await nextTick()
+    const second = view.latest()
+    expect(second.editTextRestricted.value).toBe(true)
+    expect(second.editSourceContent.value[3].file.path).toBe("/b")
+    expect(second.editAttachments.value.map((item) => item.originalIndex)).toEqual([1, 3])
+    retained.release()
+    await nextTick()
+  })
 })

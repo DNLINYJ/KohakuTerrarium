@@ -11,6 +11,7 @@ from copy import deepcopy
 
 import pytest
 
+from kohakuterrarium.errors import MediaReferenceError
 from kohakuterrarium.llm import artifact_resolve
 from kohakuterrarium.llm.codex_format import (
     _resolve_artifact_url,
@@ -28,7 +29,7 @@ class TestToResponsesInput:
     @pytest.mark.parametrize("role", ["user", "tool"])
     @pytest.mark.parametrize("as_object", [False, True])
     @pytest.mark.parametrize("reference_kind", ["file", "artifact"])
-    def test_missing_images_are_omitted_without_mutating_history(
+    def test_missing_images_fail_without_mutating_history(
         self, tmp_path, monkeypatch, role, as_object, reference_kind
     ):
         monkeypatch.setattr(artifact_resolve, "_session_dir", lambda: tmp_path)
@@ -53,21 +54,16 @@ class TestToResponsesInput:
             }
         ]
         original = deepcopy(messages)
-        items = to_responses_input(messages)
-        parts = [
-            {"type": "input_text", "text": "keep this"},
-            {"type": "input_image", "image_url": inline},
-        ]
-        expected = (
-            {"role": "user", "content": parts}
-            if role == "user"
-            else {"type": "function_call_output", "call_id": "read1", "output": parts}
-        )
-        assert items == [expected]
+        with pytest.raises(
+            MediaReferenceError, match="Required local media is unavailable"
+        ):
+            to_responses_input(messages)
         assert messages == original
 
     @pytest.mark.parametrize("role", ["user", "tool"])
-    def test_missing_image_only_message_keeps_tool_pairing(self, tmp_path, role):
+    def test_missing_image_only_message_fails_without_empty_output(
+        self, tmp_path, role
+    ):
         url = (tmp_path / "removed.png").as_uri()
         messages = [
             {
@@ -76,12 +72,12 @@ class TestToResponsesInput:
                 "content": [{"type": "image_url", "image_url": {"url": url}}],
             }
         ]
-        expected = (
-            []
-            if role == "user"
-            else [{"type": "function_call_output", "call_id": "read1", "output": ""}]
-        )
-        assert to_responses_input(messages) == expected
+        original = deepcopy(messages)
+        with pytest.raises(
+            MediaReferenceError, match="Required local media is unavailable"
+        ):
+            to_responses_input(messages)
+        assert messages == original
 
     @pytest.mark.parametrize("model", ["slurm/ds", "kimi-k2", "glm-5", "alias"])
     def test_explicit_replay_preserves_reasoning_for_aliases(self, model):

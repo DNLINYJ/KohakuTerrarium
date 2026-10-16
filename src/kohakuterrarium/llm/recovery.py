@@ -11,6 +11,7 @@ from email.utils import mktime_tz, parsedate_tz
 from enum import Enum
 from typing import Any
 
+from kohakuterrarium.errors import MediaReferenceError
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -175,6 +176,8 @@ _PROGRAMMING_ERRORS = (TypeError, AttributeError, NameError, NotImplementedError
 
 def classify_openai_error(exc: BaseException) -> ErrorClass:
     """Classify SDK and compatible-provider errors without exact class coupling."""
+    if isinstance(exc, MediaReferenceError):
+        return ErrorClass.USER_ERROR
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
         return ErrorClass.TRANSIENT
 

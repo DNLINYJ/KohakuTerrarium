@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from kohakuterrarium.api.schemas import (
     AgentChat,
+    BranchMutationResponse,
     AgentCreate,
     ChannelAdd,
     ChannelSend,
@@ -174,6 +175,35 @@ class TestRegenerateRequest:
 
 
 class TestMessageEdit:
+    def test_ordered_raw_parts_preserve_extensions_through_http_validation(self):
+        parts = [
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,aaa", "vendor": "keep"},
+                "meta": {"source_name": "a.png"},
+            },
+            {"type": "text", "text": "", "vendor": {"id": 2}},
+            {
+                "type": "file",
+                "file": {"name": "note.txt", "content": "bytes", "is_inline": True},
+            },
+        ]
+        edit = MessageEdit(content=parts, request_id="request")
+        assert edit.model_dump(exclude_unset=True)["content"] == parts
+        with pytest.raises(ValidationError):
+            MessageEdit(content=[{"type": "vendor_part", "payload": {"id": 1}}])
+        assert (
+            BranchMutationResponse(
+                status="completed",
+                request_id="request",
+                turn_index=1,
+                branch_id=2,
+                parent_branch_path=[],
+                execution_error="missing media",
+            ).model_dump()["execution_error"]
+            == "missing media"
+        )
+
     def test_string_content(self):
         m = MessageEdit(content="hello")
         assert m.content == "hello"

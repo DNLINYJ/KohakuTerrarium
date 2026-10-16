@@ -327,7 +327,16 @@ def test_prepare_snapshot_uses_preloaded_records_without_reading_store(
     assert store.state["alice:branch_snapshots"][0]["messages"] == _MSGS_A
 
 
-@pytest.mark.parametrize("kind", ["text_chunk", "text", "assistant_reasoning"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "text_chunk",
+        "text",
+        "assistant_reasoning",
+        "assistant_message",
+        "assistant_image",
+    ],
+)
 def test_preloaded_records_preserve_late_same_turn_invalidation(
     store, base_events, kind
 ):

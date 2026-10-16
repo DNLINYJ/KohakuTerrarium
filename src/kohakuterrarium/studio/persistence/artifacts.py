@@ -6,7 +6,10 @@ response handling outside the persistence layer.
 
 from pathlib import Path
 
-from kohakuterrarium.errors import InvalidRequestError, NotFoundError
+from kohakuterrarium.errors import NotFoundError
+from kohakuterrarium.session.artifacts import (
+    resolve_artifact_file as resolve_artifact_file,
+)
 from kohakuterrarium.studio.persistence.store import resolve_session_path_default
 
 
@@ -25,25 +28,3 @@ def resolve_artifacts_dir(session_name: str, session_dir: Path) -> Path:
         if sibling.is_dir():
             return sibling
     raise NotFoundError("session artifacts not found")
-
-
-def resolve_artifact_file(artifacts: Path, filepath: str) -> Path:
-    """Resolve an artifact file without allowing directory traversal.
-
-    Empty, absolute, parent-traversing, or escaping paths are invalid. A valid
-    path must resolve to an existing file.
-    """
-    if not filepath:
-        raise InvalidRequestError("empty filepath")
-    rel = Path(filepath)
-    if rel.is_absolute() or any(part in ("..", "") for part in rel.parts):
-        raise InvalidRequestError("invalid filepath")
-
-    candidate = (artifacts / rel).resolve()
-    try:
-        candidate.relative_to(artifacts.resolve())
-    except ValueError:
-        raise InvalidRequestError("path escapes artifacts")
-    if not candidate.is_file():
-        raise NotFoundError("artifact not found")
-    return candidate

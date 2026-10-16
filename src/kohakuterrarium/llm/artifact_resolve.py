@@ -1,157 +1,57 @@
-"""Resolve local media references to inline ``data:`` URLs at the provider boundary.
+"""Resolve provider media references using explicit sessions or Studio defaults."""
 
-Stored conversations keep compact references, a session-artifact URL for media
-the session produced or a ``file://`` URL for a file a tool looked at, while
-outgoing requests carry base64 data URLs that external providers can consume.
-"""
-
-import base64
-import re
+from functools import partial
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
-from kohakuterrarium.studio.persistence.artifacts import (
-    resolve_artifact_file,
-    resolve_artifacts_dir,
+from kohakuterrarium.llm.media_reference import (
+    artifact_reference,
+    current_media_session_path,
+    prepare_image_urls,
+    resolve_media_url,
+    session_media_path,
 )
+from kohakuterrarium.llm.media_reference import (
+    file_reference_path as file_reference_path,
+)
+from kohakuterrarium.session.artifacts import resolve_artifact_file
+from kohakuterrarium.studio.persistence.artifacts import resolve_artifacts_dir
 from kohakuterrarium.studio.persistence.store import _session_dir
-from kohakuterrarium.utils.fs_path import coerce_fs_path
-from kohakuterrarium.utils.logging import get_logger
-
-logger = get_logger(__name__)
-
-_ARTIFACT_URL_RE = re.compile(r"^/api/sessions/(?P<sid>[^/]+)/artifacts/(?P<path>.+)$")
-_FILE_SCHEME = "file://"
-
-_ARTIFACT_MIME_BY_EXT = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-    ".bmp": "image/bmp",
-    ".tiff": "image/tiff",
-    ".tif": "image/tiff",
-    ".svg": "image/svg+xml",
-    ".heif": "image/heif",
-    ".heic": "image/heic",
-    ".avif": "image/avif",
-}
-
-
-def file_reference_path(url: str) -> Path | None:
-    """Return the local path a ``file://`` reference names, or ``None``."""
-    if not isinstance(url, str) or not url.startswith(_FILE_SCHEME):
-        return None
-    try:
-        if urlparse(url).netloc.lower() not in ("", "localhost"):
-            return None
-        return coerce_fs_path(url)
-    except ValueError:
-        return None
 
 
 def _local_media_path(url: str) -> Path | None:
-    """Map a stored media reference to the file behind it."""
+    """Locate a file reference or a Studio-default artifact."""
     file_path = file_reference_path(url)
     if file_path is not None:
         return file_path
-    match = _ARTIFACT_URL_RE.match(url)
-    if not match:
+    reference = artifact_reference(url)
+    if reference is None:
         return None
-    artifacts = resolve_artifacts_dir(match.group("sid"), _session_dir())
-    return resolve_artifact_file(artifacts, match.group("path"))
-
-
-def _image_mime(data: bytes) -> str | None:
-    """Identify supported raster formats by signature without decoding pixels."""
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if data.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if data.startswith((b"GIF87a", b"GIF89a")):
-        return "image/gif"
-    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
-        return "image/webp"
-    return None
-
-
-def resolve_artifact_url(url: str) -> str:
-    """Inline a local media reference, preserving the original URL on failure."""
-    if not isinstance(url, str):
-        return url
-    if not (url.startswith("/api/sessions/") or url.startswith(_FILE_SCHEME)):
-        return url
-    try:
-        path = _local_media_path(url)
-        if path is None:
-            return url
-        data = path.read_bytes()
-    except Exception as exc:
-        logger.warning(
-            "Media reference resolve failed — sending as-is",
-            url=url,
-            error=str(exc),
-            exc_info=True,
-        )
-        return url
-    ext = path.suffix.lower()
-    # Canvas artifacts retain their source filename, which may not match the
-    # encoded format. Describe the bytes we send, leaving stored refs untouched.
-    mime = _image_mime(data) or _ARTIFACT_MIME_BY_EXT.get(
-        ext, "application/octet-stream"
+    namespace, filename = reference
+    return resolve_artifact_file(
+        resolve_artifacts_dir(namespace, _session_dir()), filename
     )
-    b64 = base64.b64encode(data).decode("ascii")
-    return f"data:{mime};base64,{b64}"
 
 
-def _is_unresolved_local_media(url: str) -> bool:
-    if url.startswith("data:"):
-        return False
-    return url.startswith(_FILE_SCHEME) or url.startswith("/api/sessions/")
+def resolve_artifact_url(url: str, *, session_path: str | Path | None = None) -> str:
+    """Inline a local reference, preserving its original URL on failure."""
+    if session_path is None:
+        session_path = current_media_session_path()
+    paths = (
+        _local_media_path
+        if session_path is None
+        else partial(session_media_path, session_path=Path(session_path))
+    )
+    return resolve_media_url(url, paths)
 
 
 def resolve_message_image_urls(
-    messages: list[dict[str, Any]],
+    messages: list[dict[str, Any]], *, session_path: str | Path | None = None
 ) -> list[dict[str, Any]]:
-    """Inline local image parts; omit refs that did not become a data URL."""
-    any_changed = False
-    out: list[dict[str, Any]] = []
-    for msg in messages:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            out.append(msg)
-            continue
-        new_content: list[Any] = []
-        msg_changed = False
-        for part in content:
-            if (
-                isinstance(part, dict)
-                and part.get("type") == "image_url"
-                and isinstance(part.get("image_url"), (dict, str))
-            ):
-                iu = part["image_url"]
-                url = iu.get("url") if isinstance(iu, dict) else iu
-                resolved = resolve_artifact_url(url) if isinstance(url, str) else url
-                if isinstance(resolved, str) and _is_unresolved_local_media(resolved):
-                    logger.warning(
-                        "Media reference unresolved — omitting image part",
-                        url=url,
-                    )
-                    msg_changed = True
-                    continue
-                if resolved is not url and resolved != url:
-                    image_url = (
-                        {**iu, "url": resolved} if isinstance(iu, dict) else resolved
-                    )
-                    new_content.append({**part, "image_url": image_url})
-                    msg_changed = True
-                    continue
-            new_content.append(part)
-        if msg_changed:
-            out.append({**msg, "content": new_content})
-            any_changed = True
-        else:
-            out.append(msg)
-    return out if any_changed else messages
+    """Prepare effective image blocks, rejecting unavailable required local media."""
+    resolver = (
+        resolve_artifact_url
+        if session_path is None
+        else partial(resolve_artifact_url, session_path=session_path)
+    )
+    return prepare_image_urls(messages, resolver)

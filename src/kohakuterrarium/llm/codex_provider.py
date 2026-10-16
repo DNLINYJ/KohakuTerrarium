@@ -402,7 +402,8 @@ class CodexOAuthProvider(CodexWSMixin, BaseLLMProvider):
                 input_messages.append(msg)
 
         echo_options = dict(model=self.model, extra_body=deepcopy(self.extra_body))
-        api_input = to_responses_input(
+        api_input = await asyncio.to_thread(
+            to_responses_input,
             limit_codex_images(input_messages, self._request_image_limit),
             model=self.model,
             replay_reasoning=self.extra_body.get("responses_reasoning_replay"),

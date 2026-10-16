@@ -1,7 +1,10 @@
 """Unit tests for :mod:`kohakuterrarium.core.controller`."""
 
 import asyncio
+import base64
+import copy
 import types
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +14,7 @@ from kohakuterrarium.core.controller import (
     ControllerContext,
     _merge_text_and_parts,
 )
+from kohakuterrarium.errors import InvalidRequestError, LLMError
 from kohakuterrarium.core.conversation_elide import (
     ELISION_MARKER,
     TOOL_FEEDBACK_KIND,
@@ -20,7 +24,7 @@ from kohakuterrarium.core.events import (
     create_tool_complete_event,
     create_user_input_event,
 )
-from kohakuterrarium.core.job import JobResult
+from kohakuterrarium.core.job import JobResult, JobState, JobStatus, JobType
 from kohakuterrarium.core.registry import Registry
 from kohakuterrarium.llm.message import FilePart, ImagePart, TextPart
 from kohakuterrarium.parsing.events import (
@@ -720,6 +724,31 @@ class TestMaterializeInlineFile:
 
         assert not Path(first).exists()
 
+    @pytest.mark.parametrize("encoded", [False, True])
+    async def test_changed_derived_upload_gets_fresh_path_without_overwrite(
+        self, encoded
+    ):
+        env = TestAgentBuilder().with_llm_script(["x"]).build()
+        part = FilePart(
+            name="note.txt",
+            is_inline=True,
+            **(
+                {"data_base64": base64.b64encode(b"ORIGINAL").decode()}
+                if encoded
+                else {"content": "ORIGINAL"}
+            ),
+        )
+        first = Path(await env.controller._materialize_inline_file(part))
+        first.write_bytes(b"CHANGED")
+        second = Path(await env.controller._materialize_inline_file(part))
+        assert second.read_bytes() == b"ORIGINAL"
+        assert first.read_bytes() == b"CHANGED"
+        assert first != second
+        assert await env.controller._materialize_inline_file(part) == str(second)
+        env.controller.cleanup_inline_files()
+        assert not first.exists()
+        assert not second.exists()
+
     async def test_long_upload_name_still_materializes(self):
         from pathlib import Path
 
@@ -808,8 +837,17 @@ class TestResolveFilePart:
         assert written.success
         reread = await env.controller._resolve_file_part(part)
         reread_text = " ".join(getattr(p, "text", "") for p in reread)
-        assert "updated attachment" in reread_text
-        assert f"Path: {path}" in reread_text
+        assert "hello world" in reread_text
+        rebuilt_path = reread_text.split("Path: ", 1)[1].split()[0]
+        assert rebuilt_path != path
+        assert Path(path).read_text() == "updated attachment"
+        dynamic = await env.controller._resolve_file_part(
+            FilePart(name="working copy", path=path)
+        )
+        assert "updated attachment" in " ".join(p.text for p in dynamic)
+        assert guard.session_allowed_paths == frozenset(
+            {str(Path(path).resolve()), str(Path(rebuilt_path).resolve())}
+        )
 
         unrelated = tmp_path / "outside.txt"
         unrelated.write_text("must stay guarded")
@@ -822,6 +860,7 @@ class TestResolveFilePart:
 
         env.controller.cleanup_inline_files()
         assert not Path(path).exists()
+        assert not Path(rebuilt_path).exists()
         assert guard.session_allowed_paths == frozenset()
 
 
@@ -2064,3 +2103,397 @@ class TestResolveMessageFiles:
         parts = out[0]["content"]
         # Image URL preserved through the resolution path.
         assert any(p.get("type") == "image_url" for p in parts)
+
+
+# ── M1-A ordered turn context + attachment identity ──────────────
+
+
+class TestBuildTurnContextPartOrder:
+    def test_text_only_parts_keep_empty_boundary_through_real_turn_context(self):
+        c = self._ctrl()
+        parts = [TextPart(text="a"), TextPart(text=""), TextPart(text="b")]
+        content, combined = c._build_turn_context([create_user_input_event(parts)])
+        assert content == parts
+        c.conversation.append("user", content)
+        assert c.conversation.snapshot_messages()[-1]["content"] == [
+            p.to_dict() for p in parts
+        ]
+        assert combined == "a\n\n\n\nb"
+
+    def _ctrl(self):
+        return TestAgentBuilder().with_llm_script(["x"]).build().controller
+
+    def test_preserves_ordered_text_file_image_text(self):
+        c = self._ctrl()
+        ordered = [
+            TextPart(text="before"),
+            FilePart(name="a.txt", content="A-BYTES"),
+            ImagePart(url="https://x/i.png"),
+            TextPart(text="after"),
+        ]
+        c._format_events_for_context = lambda events: ordered  # type: ignore[method-assign]
+        user_content, combined = c._build_turn_context(
+            [create_user_input_event("ignored")]
+        )
+        assert isinstance(user_content, list)
+        assert [type(p) for p in user_content] == [
+            TextPart,
+            FilePart,
+            ImagePart,
+            TextPart,
+        ]
+        assert user_content[0].text == "before"
+        assert user_content[1].name == "a.txt"
+        assert user_content[1].content == "A-BYTES"
+        assert user_content[2].url == "https://x/i.png"
+        assert user_content[3].text == "after"
+        assert combined == "before\n\nafter"
+        assert user_content[0].text != combined
+
+    def test_job_status_prepended_without_regrouping(self):
+        c = self._ctrl()
+        c.job_store.register(
+            JobStatus(
+                job_id="bash_y",
+                job_type=JobType.TOOL,
+                type_name="bash",
+                state=JobState.RUNNING,
+            )
+        )
+        ordered = [
+            TextPart(text="before"),
+            FilePart(name="a.txt", content="A"),
+            ImagePart(url="https://x/i.png"),
+            TextPart(text="after"),
+        ]
+        c._format_events_for_context = lambda events: ordered  # type: ignore[method-assign]
+        user_content, combined = c._build_turn_context(
+            [create_user_input_event("ignored")]
+        )
+        assert isinstance(user_content, list)
+        assert isinstance(user_content[0], TextPart)
+        assert "bash_y" in user_content[0].text
+        assert [type(p) for p in user_content[1:]] == [
+            TextPart,
+            FilePart,
+            ImagePart,
+            TextPart,
+        ]
+        assert "before" in combined and "after" in combined
+        assert combined.startswith(user_content[0].text)
+
+    def test_plain_text_and_empty_combined_stay_compatible(self):
+        c = self._ctrl()
+        user_content, combined = c._build_turn_context([create_user_input_event("hi")])
+        assert user_content == combined == "hi"
+        c._format_events_for_context = lambda events: ""  # type: ignore[method-assign]
+        user_content, combined = c._build_turn_context(
+            [create_tool_complete_event(job_id="t", content="")]
+        )
+        assert user_content == combined
+        assert isinstance(user_content, str)
+
+
+def _file_item(**file_fields):
+    return {"type": "file", "file": dict(file_fields)}
+
+
+def _joined_text(parts):
+    return " ".join(p.get("text", "") for p in parts if p.get("type") == "text")
+
+
+class TestResolveMessageFilesIdentity:
+    def _ctrl(self):
+        return TestAgentBuilder().with_llm_script(["x"]).build().controller
+
+    async def test_same_name_files_keep_a_and_b_by_index(self):
+        c = self._ctrl()
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "first [[file:0]] second [[file:1]]"},
+                    _file_item(name="dup.txt", content="FILE-A"),
+                    _file_item(name="dup.txt", content="FILE-B"),
+                ],
+            }
+        ]
+        out = await c._resolve_message_files(msgs)
+        joined = _joined_text(out[0]["content"])
+        assert "FILE-A" in joined
+        assert "FILE-B" in joined
+        assert joined.index("FILE-A") < joined.index("FILE-B")
+        assert joined.count("FILE-A") == 1
+        assert joined.count("FILE-B") == 1
+
+    @pytest.mark.parametrize(
+        "ref",
+        ["00", "٠٠", "００", "0٠０", "٠" * 5000],
+        ids=["ascii", "arabic", "fullwidth", "mixed", "long-zero"],
+    )
+    async def test_decimal_ordinal_normalizes_leading_zeros(self, ref):
+        c = self._ctrl()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    _file_item(name="zero.txt", content="ZERO-FILE"),
+                    {"type": "text", "text": f"before [[file:{ref}]] after"},
+                ],
+            }
+        ]
+        out = await c._resolve_message_files(messages)
+        text = _joined_text(out[0]["content"])
+        assert text.index("before") < text.index("ZERO-FILE") < text.index("after")
+        assert text.count("ZERO-FILE") == 1
+        assert "[[file:" not in text
+
+    async def test_unicode_digit_name_is_not_an_ordinal(self):
+        c = self._ctrl()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "[[file:²]]"},
+                    _file_item(name="²", content="UNICODE-NAME"),
+                ],
+            }
+        ]
+        out = await c._resolve_message_files(messages)
+        assert _joined_text(out[0]["content"]).count("UNICODE-NAME") == 1
+
+    async def test_oversized_numeric_reference_stays_literal(self):
+        c = self._ctrl()
+        placeholder = "[[file:" + "9" * 5000 + "]]"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": placeholder},
+                    _file_item(name="real.txt", content="REAL"),
+                ],
+            }
+        ]
+        out = await c._resolve_message_files(messages)
+        text = _joined_text(out[0]["content"])
+        assert placeholder in text
+        assert "REAL" in text
+
+    async def test_ambiguous_duplicate_names_raise(self):
+        c = self._ctrl()
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "see [[file:dup.txt]]"},
+                    _file_item(name="dup.txt", content="FILE-A"),
+                    _file_item(name="dup.txt", content="FILE-B"),
+                ],
+            }
+        ]
+        with pytest.raises((InvalidRequestError, LLMError), match="[Aa]mbig"):
+            await c._resolve_message_files(msgs)
+
+    async def test_name_and_path_overlap_is_ambiguous(self):
+        c = self._ctrl()
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "see [[file:notes.txt]]"},
+                    _file_item(name="notes.txt", content="NAME-HIT"),
+                    _file_item(name="other.txt", path="notes.txt", content="PATH-HIT"),
+                ],
+            }
+        ]
+        with pytest.raises((InvalidRequestError, LLMError), match="[Aa]mbig"):
+            await c._resolve_message_files(msgs)
+
+    async def test_index_refs_are_file_ordinals_not_part_indexes(self):
+        c = self._ctrl()
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "head [[file:1]] tail"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://x/i.png", "detail": "low"},
+                    },
+                    _file_item(name="a.txt", content="FILE-A"),
+                    {"type": "text", "text": "mid"},
+                    _file_item(name="b.txt", content="FILE-B"),
+                ],
+            }
+        ]
+        out = await c._resolve_message_files(msgs)
+        parts = out[0]["content"]
+        joined = _joined_text(parts)
+        assert "FILE-B" in joined
+        assert "FILE-A" in joined
+        assert joined.index("FILE-B") < joined.index("FILE-A")
+        assert any(p.get("type") == "image_url" for p in parts)
+        assert "[[file:1]]" not in joined
+
+    async def test_partial_refs_expand_unreferenced_in_place(self):
+        c = self._ctrl()
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "see [[file:0]]"},
+                    _file_item(name="a.txt", content="FILE-A"),
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://x/i.png", "detail": "low"},
+                    },
+                    _file_item(name="b.txt", content="FILE-B"),
+                    {"type": "text", "text": "end"},
+                ],
+            }
+        ]
+        out = await c._resolve_message_files(msgs)
+        parts = out[0]["content"]
+        joined = _joined_text(parts)
+        assert joined.count("FILE-A") == 1
+        assert joined.count("FILE-B") == 1
+        types = [p.get("type") for p in parts]
+        assert "image_url" in types
+        a_idx = next(
+            i for i, p in enumerate(parts) if "FILE-A" in (p.get("text") or "")
+        )
+        img_idx = next(i for i, p in enumerate(parts) if p.get("type") == "image_url")
+        b_idx = next(
+            i for i, p in enumerate(parts) if "FILE-B" in (p.get("text") or "")
+        )
+        end_idx = next(i for i, p in enumerate(parts) if p.get("text") == "end")
+        assert a_idx < img_idx < b_idx < end_idx
+
+    async def test_repeat_refs_expand_many_times_materialize_once(self):
+        c = self._ctrl()
+        calls = {"n": 0}
+        real = c._resolve_file_part
+
+        async def _counted(part):
+            calls["n"] += 1
+            return await real(part)
+
+        c._resolve_file_part = _counted  # type: ignore[method-assign]
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "[[file:0]] and [[file:0]]"},
+                    _file_item(name="once.txt", content="ONCE"),
+                ],
+            }
+        ]
+        out = await c._resolve_message_files(msgs)
+        joined = _joined_text(out[0]["content"])
+        assert joined.count("ONCE") == 2
+        assert calls["n"] == 1
+
+    async def test_unknown_placeholder_kept_literal(self):
+        c = self._ctrl()
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "missing [[file:nope]] here"},
+                    _file_item(name="real.txt", content="REAL"),
+                ],
+            }
+        ]
+        out = await c._resolve_message_files(msgs)
+        joined = _joined_text(out[0]["content"])
+        assert "[[file:nope]]" in joined
+        assert "REAL" in joined
+
+    async def test_file_expansion_preserves_image_extension_fields(self):
+        c = self._ctrl()
+        image = {
+            "type": "image_url",
+            "image_url": {"url": "https://x/i.png", "detail": "high", "extension": 7},
+            "meta": {"custom": "keep"},
+            "vendor": {"state": "opaque"},
+        }
+        text = {"type": "text", "text": "", "vendor": {"state": "caption"}}
+        msgs = [
+            {
+                "role": "user",
+                "content": [text, image, _file_item(name="x.txt", content="X")],
+            }
+        ]
+        before = copy.deepcopy(msgs)
+        out = await c._resolve_message_files(msgs)
+        assert out[0]["content"][0] == text
+        assert out[0]["content"][1] == image
+        out[0]["content"][1]["vendor"]["state"] = "changed"
+        assert msgs == before
+
+    async def test_original_history_deepcopy_unchanged(self):
+        c = self._ctrl()
+        nested = {"path": None, "name": "a.txt", "content": "AAA", "extra": ["keep"]}
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "see [[file:0]]"},
+                    {"type": "file", "file": nested},
+                ],
+                "custom": {"k": 1},
+            }
+        ]
+        original = copy.deepcopy(msgs)
+        await c._resolve_message_files(msgs)
+        assert msgs == original
+        assert nested["content"] == "AAA"
+        assert nested["extra"] == ["keep"]
+
+    async def test_replacing_referenced_occurrence_keeps_numeric_binding(self):
+        c = self._ctrl()
+        parts = [
+            {"type": "text", "text": "Read the referenced attachment: [[file:1]]"},
+            *[
+                _file_item(name="same.txt", content=value)
+                for value in ("FILE_A", "FILE_B", "FILE_C")
+            ],
+            {"type": "text", "text": "Another text block"},
+        ]
+        original = copy.deepcopy(parts)
+        for replacement in ("FILE_B", "FILE_B_REPLACED"):
+            parts[2]["file"]["content"] = replacement
+            out = await c._resolve_message_files([{"role": "user", "content": parts}])
+            text = _joined_text(out[0]["content"])
+            assert (
+                text.index("Read the referenced attachment:")
+                < text.index(replacement)
+                < text.index("FILE_A")
+                < text.index("FILE_C")
+            )
+        assert original[2]["file"]["content"] == "FILE_B"
+
+    async def test_same_name_different_bytes_use_distinct_tempfiles(self):
+        c = self._ctrl()
+        a = base64.b64encode(b"AAA-BYTES").decode()
+        b = base64.b64encode(b"BBB-BYTES").decode()
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "[[file:0]] [[file:1]]"},
+                    _file_item(name="dup.txt", data_base64=a, is_inline=True),
+                    _file_item(name="dup.txt", data_base64=b, is_inline=True),
+                ],
+            }
+        ]
+        out = await c._resolve_message_files(msgs)
+        joined = _joined_text(out[0]["content"])
+        paths = []
+        for chunk in joined.split("Path: ")[1:]:
+            paths.append(chunk.split()[0])
+        assert len(paths) == 2
+        p0, p1 = Path(paths[0]), Path(paths[1])
+        assert p0.read_bytes() == b"AAA-BYTES"
+        assert p1.read_bytes() == b"BBB-BYTES"
+        assert p0 != p1

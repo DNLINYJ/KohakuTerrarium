@@ -7,13 +7,18 @@ boundary. The live
 (it holds the Agent, channels, …), so the service Protocol returns these DTOs.
 """
 
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, TypedDict
 
 from kohakuterrarium.core.token_ledger import token_snapshot
 
 
-class BranchMutationResult(TypedDict):
+class _BranchExecutionResult(TypedDict, total=False):
+    execution_error: str
+
+
+class BranchMutationResult(_BranchExecutionResult):
     """Completed branch mutation returned across service boundaries."""
 
     status: Literal["completed"]
@@ -21,6 +26,24 @@ class BranchMutationResult(TypedDict):
     turn_index: int
     branch_id: int
     parent_branch_path: list[list[int]]
+
+
+def completed_branch_result(agent: Any, request_id: str | None) -> BranchMutationResult:
+    """Serialize an accepted branch mutation and its request-scoped execution error."""
+    parent_path = getattr(agent, "_parent_branch_path", ()) or ()
+    failure = getattr(agent, "_branch_execution_error", None)
+    return {
+        "status": "completed",
+        **(
+            {"execution_error": failure[1]}
+            if request_id and failure and failure[0] == request_id
+            else {}
+        ),
+        "request_id": request_id or uuid.uuid4().hex,
+        "turn_index": int(getattr(agent, "_turn_index", 0)),
+        "branch_id": int(getattr(agent, "_branch_id", 0)),
+        "parent_branch_path": [list(pair) for pair in parent_path],
+    }
 
 
 class RewindResult(TypedDict):
