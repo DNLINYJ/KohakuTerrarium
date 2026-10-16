@@ -1,10 +1,16 @@
 """Unit tests for session inspection summaries and reasoning helpers."""
 
 import importlib.util
+import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 
 import pytest
 
+from kohakuterrarium.session.resource_gate import GATE, ResourceReleaseError, try_fast
 from kohakuterrarium.session.store import SessionStore
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -20,6 +26,27 @@ def _load_script():
 
 
 _inspect_session = _load_script()
+
+
+def _business_rows(path):
+    with closing(
+        sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+    ) as db:
+        return {
+            table: db.execute(
+                f'SELECT key, value FROM "{table}" ORDER BY key'
+            ).fetchall()
+            for table in (
+                "meta",
+                "state",
+                "events",
+                "channels",
+                "subagents",
+                "jobs",
+                "conversation",
+                "turn_rollup",
+            )
+        }
 
 
 class TestBoundedText:
@@ -122,6 +149,112 @@ def forbid_history_values(monkeypatch, store):
 
     monkeypatch.setattr(vault_type, "__getitem__", guard(vault_type.__getitem__))
     monkeypatch.setattr(vault_type, "get", guard(vault_type.get))
+
+
+@pytest.fixture
+def closed_inspection_source(tmp_path):
+    path = tmp_path / "inspect.kohakutr"
+    with closing(SessionStore.open_readonly(path)) as store:
+        store.init_meta("inspect", "agent", "config", "", ["a"])
+        store.append_event("a", "text", {"content": "inspectionneedle"})
+        store.save_channel_message("tasks", {"sender": "a", "content": "task detail"})
+        store.save_conversation("a", [{"role": "assistant", "content": "answer"}])
+        store.meta["status"] = "completed"
+        store.meta["last_active"] = "original-recency"
+        assert store.state.get("counters:max_event_id") is None
+    return path
+
+
+@pytest.mark.parametrize("failure", [None, RuntimeError, KeyboardInterrupt])
+def test_main_legacy_counter_absence_and_failure_cleanup(
+    closed_inspection_source, monkeypatch, capsys, failure
+):
+    path = closed_inspection_source
+    before = _business_rows(path)
+    monkeypatch.setattr(
+        _inspect_session.sys,
+        "argv",
+        [str(SCRIPT_PATH), str(path), "--all", "--search", "inspectionneedle"],
+    )
+    original = _inspect_session.print_summary
+
+    def observed(store):
+        assert try_fast(path, eligible=True).reason == "legacy_enrolled"
+        original(store)
+        if failure:
+            raise failure("output interrupted")
+
+    monkeypatch.setattr(_inspect_session, "print_summary", observed)
+    if failure:
+        with pytest.raises(failure, match="output interrupted"):
+            _inspect_session.main()
+    else:
+        _inspect_session.main()
+        output = capsys.readouterr().out
+        assert "TEXT: inspectionneedle" in output
+        assert "[a] task detail" in output
+        assert "[assistant] answer" in output
+        assert "Search: 'inspectionneedle' (1 results)" in output
+    assert not GATE.snapshot(path).registered
+    assert _business_rows(path) == before
+    with closing(SessionStore.open_readonly(path)) as check:
+        assert check.state.get("counters:max_event_id") is None
+        assert check.meta["status"] == "completed"
+        assert check.meta["last_active"] == "original-recency"
+
+
+def test_main_waits_for_new_then_releases_its_own_resources(
+    closed_inspection_source, monkeypatch
+):
+    path = closed_inspection_source
+    before = _business_rows(path)
+    monkeypatch.setattr(_inspect_session.sys, "argv", [str(SCRIPT_PATH), str(path)])
+    entered = threading.Event()
+    original = _inspect_session.print_summary
+
+    def observed(store):
+        entered.set()
+        assert try_fast(path, eligible=True).reason == "legacy_enrolled"
+        original(store)
+
+    monkeypatch.setattr(_inspect_session, "print_summary", observed)
+    lease = try_fast(path, eligible=True).lease
+    assert lease is not None
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_inspect_session.main)
+        try:
+            deadline = time.monotonic() + 5
+            while (
+                not GATE.snapshot(path).legacy_pending and time.monotonic() < deadline
+            ):
+                time.sleep(0.005)
+            assert GATE.snapshot(path).legacy_pending
+            assert not entered.is_set() and not future.done()
+        finally:
+            lease.finish(source_released=True)
+        future.result(timeout=10)
+    assert entered.is_set() and not GATE.snapshot(path).registered
+    assert _business_rows(path) == before
+
+
+def test_main_refuses_uncertain_source_and_missing_path(
+    closed_inspection_source, tmp_path, monkeypatch
+):
+    path = closed_inspection_source
+    before = _business_rows(path)
+    lease = try_fast(path, eligible=True).lease
+    assert lease is not None
+    lease.finish(source_released=False)
+    monkeypatch.setattr(_inspect_session.sys, "argv", [str(SCRIPT_PATH), str(path)])
+    with pytest.raises(ResourceReleaseError):
+        _inspect_session.main()
+    assert GATE.snapshot(path).new_uncertain
+    assert _business_rows(path) == before
+    missing = tmp_path / "missing.kohakutr"
+    monkeypatch.setattr(_inspect_session.sys, "argv", [str(SCRIPT_PATH), str(missing)])
+    with pytest.raises(SystemExit) as exc:
+        _inspect_session.main()
+    assert exc.value.code == 1 and not missing.exists()
 
 
 class TestStoredSummaryCounts:
@@ -263,7 +396,7 @@ class TestStoredSummaryCounts:
         assert "Channels: 1 (1 messages)" in out
         assert "Sub-agent runs: 1" in out
 
-    def test_main_summary_preserves_legacy_lifecycle(
+    def test_main_summary_preserves_business_state(
         self, summary_store, monkeypatch, capsys
     ):
         store = summary_store
@@ -273,13 +406,15 @@ class TestStoredSummaryCounts:
         store.close(update_status=False)
         opened = []
 
-        def open_store(path):
-            owned = SessionStore(path)
-            opened.append(owned)
-            forbid_history_values(monkeypatch, owned)
-            return owned
+        before = _business_rows(path)
 
-        monkeypatch.setattr(_inspect_session, "SessionStore", open_store)
+        class ObservedStore(SessionStore):
+            def __init__(self, path):
+                super().__init__(path)
+                opened.append(self)
+                forbid_history_values(monkeypatch, self)
+
+        monkeypatch.setattr(_inspect_session, "SessionStore", ObservedStore)
         monkeypatch.setattr(_inspect_session.sys, "argv", [str(SCRIPT_PATH), path])
         _inspect_session.main()
         out = capsys.readouterr().out
@@ -288,11 +423,8 @@ class TestStoredSummaryCounts:
         assert "TEXT: summary only" not in out
         assert "Use --events" in out
         assert len(opened) == 1 and opened[0]._closed
-        check = SessionStore.open_readonly(path)
-        try:
-            assert check.meta["status"] == "paused"
-        finally:
-            check.close()
+        assert _business_rows(path) == before
+        assert not GATE.snapshot(path).registered
 
     def test_explicit_detail_readers_still_show_payloads(self, summary_store, capsys):
         store = summary_store

@@ -42,11 +42,15 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+import kohakuterrarium.api.routes.persistence.preflight_metadata as _preflight_metadata
+import kohakuterrarium.api.routes.persistence.resume_cluster as _resume_cluster
 from kohakuterrarium.api.app import create_app
 from kohakuterrarium.api.deps import get_service_legacy, set_service
 from kohakuterrarium.llm.openai import OpenAIProvider
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.readonly import read_session_meta
+from kohakuterrarium.session.metadata_candidate import read_metadata_candidate
+from kohakuterrarium.session.resource_gate import GATE, acquire_legacy, try_fast
 from kohakuterrarium.studio.persistence.store import resolve_session_path_in
 from kohakuterrarium.api.routes.catalog import _deps as _catalog_deps
 from kohakuterrarium.bootstrap import agent_init as _agent_init
@@ -61,6 +65,7 @@ from kohakuterrarium.studio.sessions import memory_search as _memory_search
 from kohakuterrarium.terrarium import LocalTerrariumService, Terrarium
 from kohakuterrarium.testing.llm import ScriptedLLM
 from tests.helpers.kt_biome import find_kt_biome_source
+from tests.helpers.resume_metadata_contention import resume_with_metadata_contention
 
 pytestmark = pytest.mark.timeout(60)
 
@@ -2050,7 +2055,42 @@ class TestApiIntegration:
         preflight = client.post("/api/sessions/retired-source/resume/preflight")
         assert preflight.status_code == 200
         assert preflight.json()["ready"] is True
-        resp = client.post("/api/sessions/retired-source/resume")
+        classifications, candidates = [], []
+
+        def copied_classification(path):
+            classifications.append(Path(path))
+            return read_session_meta(path)
+
+        def observed_candidate(path, *, eligible=False):
+            assert eligible
+            outcome = read_metadata_candidate(path, eligible=eligible)
+            candidates.append(outcome.reason)
+            return outcome
+
+        with monkeypatch.context() as controlled:
+            controlled.setattr(
+                _resume_cluster, "read_session_meta", copied_classification
+            )
+            controlled.setattr(
+                _preflight_metadata, "read_metadata_candidate", observed_candidate
+            )
+            optimized = client.post("/api/sessions/retired-source/resume/preflight")
+            assert optimized.status_code == 200
+            assert optimized.json() == preflight.json()
+            assert len(classifications) == 2
+            assert candidates and set(candidates) == {"ok"}
+            assert not GATE.snapshot(target_path).registered
+            candidates.clear()
+            reservation = acquire_legacy(target_path, "controlled_preflight_fallback")
+            try:
+                fallback = client.post("/api/sessions/retired-source/resume/preflight")
+                assert fallback.json() == preflight.json()
+                assert candidates and set(candidates) == {"legacy_enrolled"}
+            finally:
+                reservation.finish(source_released=True)
+        resp = resume_with_metadata_contention(
+            client, target_path, "/api/sessions/retired-source/resume", monkeypatch
+        )
         assert resp.status_code == 200
         resumed = resp.json()
         assert resumed["type"] == "agent"
@@ -2214,6 +2254,25 @@ terrarium:
         assert resp.status_code == 200
         resp = client.delete(f"/api/sessions/{terra_b}")
         assert resp.status_code == 200
+
+        quarantined_path = session_dir / "quarantined.kohakutr"
+        quarantined = SessionStore(quarantined_path)
+        try:
+            quarantined.init_meta("quarantined", "agent", "", str(tmp_path), ["alice"])
+        finally:
+            quarantined.close(update_status=False)
+        reservation = try_fast(quarantined_path, eligible=True)
+        assert reservation.lease is not None
+        reservation.lease.finish(source_released=False)
+        for _ in range(2):
+            resp = client.post("/api/sessions/quarantined/resume/preflight")
+            assert resp.status_code == 503
+            assert (
+                resp.json()["detail"]["code"] == "session_metadata_resource_unavailable"
+            )
+            assert "ready" not in resp.json()
+            assert GATE.snapshot(quarantined_path).new_uncertain
+        assert client.post("/api/sessions/absent/resume/preflight").status_code == 404
 
     def test_terrarium_hotplug_and_runtime_graph_workflow(
         self, client: TestClient, creature_dir: Path, scripted_llm: ScriptedLLM

@@ -20,7 +20,9 @@ from kohakuterrarium.laboratory.adapters.terrarium_files import (
     _list_sync,
     _unpack_bundle_entry,
 )
-from kohakuterrarium.laboratory.adapters.file_scopes import ScopeError
+from kohakuterrarium.laboratory.adapters.file_scopes import ScopeError, resolve_in_scope
+from kohakuterrarium.session import file_family as family
+from tests.unit.laboratory.file_mutation_enrollment_helpers import assert_idle
 
 
 def _sha(data: bytes) -> str:
@@ -198,8 +200,10 @@ class TestStatReadWriteDelete:
             "bytes_b64": _b64encode(b"hello"),
         }
         write_out = await adapter._dispatch(_msg("write", body))
-        assert write_out["written"] == 5
-        assert write_out["sha256"] == _sha(b"hello")
+        assert write_out == {"written": 5, "sha256": _sha(b"hello")}
+        target = resolve_in_scope(body["scope"], body["path"], adapter._engine)
+        assert target.read_bytes() == b"hello"
+        assert_idle(target)
 
         read_out = await adapter._dispatch(
             _msg("read", {"scope": "recipe://test1", "path": "f.txt"})
@@ -248,7 +252,7 @@ class TestStatReadWriteDelete:
         )
         assert out["error"]["kind"] == "invalid"
 
-    async def test_write_expect_hash_mismatch(self, adapter):
+    async def test_write_expect_hash_mismatch(self, adapter, monkeypatch):
         # First write.
         await adapter._dispatch(
             _msg(
@@ -260,6 +264,13 @@ class TestStatReadWriteDelete:
                 },
             )
         )
+        enrolled = []
+
+        def forbidden(*args, **kwargs):
+            enrolled.append(args)
+            raise AssertionError("hash mismatch must not enroll")
+
+        monkeypatch.setattr(family, "acquire_legacy", forbidden)
         # Second write with wrong expect_hash.
         out = await adapter._dispatch(
             _msg(
@@ -273,6 +284,9 @@ class TestStatReadWriteDelete:
             )
         )
         assert out["error"]["kind"] == "invalid"
+        assert not enrolled
+        target = resolve_in_scope("recipe://eh", "f.txt", adapter._engine)
+        assert target.read_bytes() == b"old"
 
     async def test_read_on_directory_fails(self, adapter):
         await adapter._dispatch(
@@ -306,6 +320,9 @@ class TestStatReadWriteDelete:
             _msg("delete", {"scope": "recipe://del", "path": "f.txt"})
         )
         assert out == {}
+        target = resolve_in_scope("recipe://del", "f.txt", adapter._engine)
+        assert not target.exists()
+        assert_idle(target)
 
     async def test_delete_root_refused(self, adapter):
         out = await adapter._dispatch(_msg("delete", {"scope": "recipe://anywhere"}))
@@ -317,7 +334,7 @@ class TestStatReadWriteDelete:
         )
         assert out["error"]["kind"] == "not_found"
 
-    async def test_delete_directory(self, adapter):
+    async def test_delete_directory(self, adapter, monkeypatch):
         # Create a subdir with a file.
         await adapter._dispatch(
             _msg(
@@ -329,10 +346,20 @@ class TestStatReadWriteDelete:
                 },
             )
         )
+        enrolled = []
+        real_acquire = family.acquire_legacy
+
+        def record(target, operation):
+            enrolled.append(target)
+            return real_acquire(target, operation)
+
+        monkeypatch.setattr(family, "acquire_legacy", record)
         out = await adapter._dispatch(
             _msg("delete", {"scope": "recipe://dir-del", "path": "sub"})
         )
         assert out == {}
+        assert enrolled == []
+        assert not resolve_in_scope("recipe://dir-del", "sub", adapter._engine).exists()
 
     async def test_active_session_file_cannot_be_overwritten_or_deleted(
         self, adapter, monkeypatch, tmp_path
@@ -399,6 +426,11 @@ class TestPushBundle:
         deployed = sorted(out["deployed"])
         assert deployed == ["a.txt", "sub/b.txt"]
         assert out["conflicts"] == []
+        assert set(out) == {"deployed", "conflicts"}
+        for name, payload in (("a.txt", b"hi"), ("sub/b.txt", b"there")):
+            target = resolve_in_scope("recipe://pb", name, adapter._engine)
+            assert target.read_bytes() == payload
+            assert_idle(target)
 
     async def test_idempotent_skip(self, adapter):
         files = {"a.txt": [_sha(b"hi"), _b64encode(b"hi")]}
@@ -432,6 +464,7 @@ class TestPushBundle:
             _msg("push_bundle", {"scope": "recipe://bad", "files": files})
         )
         assert out["error"]["kind"] == "invalid"
+        assert "mismatched hash" in out["error"]["message"]
 
     async def test_non_dict_files(self, adapter):
         out = await adapter._dispatch(

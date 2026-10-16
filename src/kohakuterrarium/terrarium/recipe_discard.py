@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import kohakuterrarium.terrarium.wiring as wiring
+from kohakuterrarium.session.file_family import acquire_family
+from kohakuterrarium.session.file_mutation import await_mutation, run_admitted_mutation
 from kohakuterrarium.terrarium import graph_checkpoint
 from kohakuterrarium.terrarium.channels import remove_channel_trigger
+from kohakuterrarium.utils.fs_path import coerce_fs_path
 from kohakuterrarium.utils.logging import get_logger
 
 if TYPE_CHECKING:
@@ -91,7 +95,20 @@ async def discard_recipe_graph(
     engine._session_stores.pop(graph_id, None)
     engine._owned_sessions.discard(graph_id)
     engine._recipe_graph_locks.pop(graph_id, None)
-    _discard_session_family(session_path)
+    family = _recipe_session_family(session_path)
+
+    def mutate():
+        identity = _primary_identity(session_path)
+        if any(
+            _primary_identity(item.path) == identity
+            for item in engine._session_stores.values()
+        ):
+            raise ValueError("recipe discard refuses an active session store")
+        _discard_members(family)
+
+    await run_admitted_mutation(
+        lambda: acquire_family(family, "recipe_discard"), mutate
+    )
 
 
 async def discard_recipe_graph_shielded(
@@ -108,11 +125,7 @@ async def discard_recipe_graph_shielded(
             before_store_close=before_store_close,
         )
     )
-    try:
-        await asyncio.shield(cleanup)
-    except asyncio.CancelledError:
-        await cleanup
-        raise
+    await await_mutation(cleanup)
 
 
 async def _close_store(store) -> None:
@@ -124,8 +137,14 @@ async def _close_store(store) -> None:
         await result
 
 
-def _discard_session_family(path: Path) -> None:
-    family = [
+def _primary_identity(path: str | Path) -> str:
+    """Normalized resolved primary path; family sets are not equality."""
+    return os.path.normcase(str(coerce_fs_path(path).expanduser().resolve()))
+
+
+def _recipe_session_family(path: Path) -> list[Path]:
+    """Explicit recipe session family, including Drive sidecars."""
+    return [
         path,
         path.with_name(path.name + "-wal"),
         path.with_name(path.name + "-shm"),
@@ -134,6 +153,18 @@ def _discard_session_family(path: Path) -> None:
         path.with_name(path.name + ".drives-shm"),
         *path.parent.glob(f"{path.name}.drives.split-intent.json*"),
     ]
+
+
+def _discard_session_family(path: Path) -> None:
+    family = _recipe_session_family(path)
+    lease = acquire_family(family, "recipe_discard")
+    try:
+        _discard_members(family)
+    finally:
+        lease.finish(source_released=True)
+
+
+def _discard_members(family: list[Path]) -> None:
     detached: list[tuple[Path, Path]] = []
     try:
         for source in family:

@@ -64,6 +64,8 @@ from kohakuterrarium.session.migrations import (
     path_for_version,
 )
 from kohakuterrarium.session.readonly import read_session_meta
+from kohakuterrarium.session.readonly_view import SessionReadView
+from kohakuterrarium.session.resource_gate import try_fast
 from kohakuterrarium.session.raw_history import UserMessageSelector
 from kohakuterrarium.session.resume import detect_session_type, resume_agent
 from kohakuterrarium.session.resume_async import resume_agent_async
@@ -572,6 +574,17 @@ class TestSessionIntegration:
         source_mtime = session_path.stat().st_mtime_ns
         assert detect_format_version(session_path.as_uri()) == FORMAT_VERSION
         assert read_session_meta(session_path.as_uri())["agents"] == ["scribe"]
+        with SessionReadView(session_path.as_uri()) as view:
+            assert try_fast(session_path, eligible=True).reason == "legacy_enrolled"
+            selected = view.items("events", prefix="scribe:e")
+            first_key, first_event = next(selected)
+            assert view.get("meta", "agents") == ["scribe"]
+            selected_events = [first_event, *(event for _, event in selected)]
+            assert selected_events == events
+            assert first_key.startswith("scribe:e")
+        admission = try_fast(session_path, eligible=True)
+        assert admission.lease is not None, admission.reason
+        admission.lease.finish(source_released=True)
         assert session_path.read_bytes() == source_bytes
         assert session_path.stat().st_mtime_ns == source_mtime
         # A missing path is a hard FileNotFoundError, not a silent 1.
@@ -579,6 +592,39 @@ class TestSessionIntegration:
             detect_format_version(tmp_path / "nope.kohakutr.v2")
         # detect_session_type reads config_type out of meta.
         assert detect_session_type(session_path) == "agent"
+
+        with SessionReadView(session_path) as view:
+            inspection_meta = dict(view.items("meta"))
+            inspection_state = dict(view.items("state"))
+        repo_root = Path(__file__).resolve().parents[2]
+        inspection = await asyncio.to_thread(
+            subprocess.run,
+            [
+                sys.executable,
+                str(repo_root / "scripts" / "inspect_session.py"),
+                str(session_path),
+                "--all",
+                "--search",
+                "channel",
+            ],
+            cwd=tmp_path,
+            env={**os.environ, "PYTHONPATH": str(repo_root / "src")},
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+        )
+        assert inspection.returncode == 0, inspection.stderr
+        assert f"  scribe: {len(events)} events" in inspection.stdout
+        assert "a second channel broadcast message" in inspection.stdout
+        assert "Search: 'channel'" in inspection.stdout
+        assert "(0 results)" not in inspection.stdout
+        with SessionReadView(session_path) as view:
+            assert dict(view.items("meta")) == inspection_meta
+            assert dict(view.items("state")) == inspection_state
+            assert [
+                event for _, event in view.items("events", prefix="scribe:e")
+            ] == events
 
         # ---- phase 2: reopen the file fresh, resume the agent ----
         reopened = SessionStore(str(session_path))
@@ -948,7 +994,10 @@ class TestSessionIntegration:
         # ONLY the new events — _extract_blocks emits a tool block and
         # the indexed counter advances past the original two turns.
         patched_llm["script"] = ["[/echo]search-target-token[echo/]", "noted."]
+        assert try_fast(session_path).reason == "not_eligible"
+        assert try_fast(session_path, eligible=True).reason == "legacy_enrolled"
         store.close()
+        assert try_fast(session_path, eligible=True).reason == "legacy_enrolled"
         agent2, store = resume_agent(session_path)
         echo2 = _EchoTool()
         agent2.registry.register_tool(echo2)
@@ -1045,8 +1094,19 @@ class TestSessionIntegration:
                 h.content for h in hits
             }
         store.close()
+        admission = try_fast(session_path, eligible=True)
+        assert admission.reason == "ok"
+        admission.lease.finish(source_released=True)
+        reopened = SessionStore.open_readonly(session_path)
+        try:
+            assert try_fast(session_path, eligible=True).reason == "legacy_enrolled"
+            assert reopened.get_events("seeker")
+        finally:
+            reopened.close()
 
-    async def test_fork_at_event_copies_lineage(self, patched_llm, tmp_path):
+    async def test_fork_at_event_copies_lineage(
+        self, patched_llm, tmp_path, monkeypatch
+    ):
         """Run an agent, then fork its session at a mid-stream event.
 
         Asserts copy-on-fork lineage: the child is an independent file
@@ -1244,8 +1304,23 @@ class TestSessionIntegration:
             raise RuntimeError("mutator blew up")
 
         boom_path = tmp_path / "brancher-boom.kohakutr.v2"
-        with pytest.raises(RuntimeError, match="mutate callable raised"):
-            store.fork(str(boom_path), at_event_id=fork_point_id, mutate=boom)
+        original_unlink = Path.unlink
+        cleanup_paths = []
+
+        def guarded_unlink(path, *args, **kwargs):
+            if path == boom_path:
+                admission = try_fast(path, eligible=True)
+                if admission.lease is not None:
+                    admission.lease.finish(source_released=True)
+                assert admission.reason == "legacy_enrolled"
+                cleanup_paths.append(path)
+            return original_unlink(path, *args, **kwargs)
+
+        with monkeypatch.context() as cleanup:
+            cleanup.setattr(Path, "unlink", guarded_unlink)
+            with pytest.raises(RuntimeError, match="mutate callable raised"):
+                store.fork(str(boom_path), at_event_id=fork_point_id, mutate=boom)
+        assert cleanup_paths == [boom_path]
         assert not boom_path.exists()  # partial output removed
 
         # A mutate callable that returns a NON-dict is a TypeError, and
@@ -1419,7 +1494,9 @@ class TestSessionIntegration:
         still_live = normalize_resumable_events(unfinished, live_job_ids={"c-open"})
         assert not [e for e in still_live if e.get("_synthetic_resume")]
 
-    async def test_v1_to_v2_migration_round_trip(self, patched_llm, tmp_path):
+    async def test_v1_to_v2_migration_round_trip(
+        self, patched_llm, tmp_path, monkeypatch
+    ):
         """Write a v1-format session, migrate it, resume from the result.
 
         ``ensure_latest_version`` discovers the bare v1 file, runs the
@@ -1629,6 +1706,31 @@ class TestSessionIntegration:
         assert all("_history_key" in m for m in fallback["messages"])
         snap_v1.close()
 
+        partial_path = path_for_version(snap_v1_path, 2)
+        original_flush, original_unlink = SessionStore.flush, Path.unlink
+        cleanup_paths = []
+
+        def failed_flush(store):
+            if Path(store.path) == partial_path:
+                raise OSError("migration output failure")
+            return original_flush(store)
+
+        def guarded_unlink(path, *args, **kwargs):
+            if path == partial_path:
+                admission = try_fast(path, eligible=True)
+                if admission.lease is not None:
+                    admission.lease.finish(source_released=True)
+                assert admission.reason == "legacy_enrolled"
+                cleanup_paths.append(path)
+            return original_unlink(path, *args, **kwargs)
+
+        with monkeypatch.context() as cleanup:
+            cleanup.setattr(SessionStore, "flush", failed_flush)
+            cleanup.setattr(Path, "unlink", guarded_unlink)
+            with pytest.raises(RuntimeError, match="migration output failure"):
+                ensure_latest_version(snap_v1_path)
+        assert cleanup_paths == [partial_path]
+        assert snap_v1_path.exists() and not partial_path.exists()
         snap_migrated_path = ensure_latest_version(snap_v1_path)
         assert snap_migrated_path == path_for_version(snap_v1_path, 2)
         snap_migrated = SessionStore(str(snap_migrated_path))

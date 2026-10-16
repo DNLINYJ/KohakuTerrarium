@@ -380,7 +380,7 @@ def main():
         print(f"Error: {path} does not exist", file=sys.stderr)
         sys.exit(1)
 
-    store = SessionStore(path)
+    store = SessionStore.open_readonly(path)
 
     try:
         show_all = args.all

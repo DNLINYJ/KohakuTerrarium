@@ -20,6 +20,11 @@ from kohakuterrarium.api.routes.persistence.cluster_resume_compensation import (
     rollback_cluster_resume,
     snapshot_controller_state,
 )
+from kohakuterrarium.api.routes.persistence.preflight_metadata import (
+    MetadataReader,
+    local_metadata_reader,
+    read_local_preflight,
+)
 from kohakuterrarium.api.routes.persistence.resume_coordinator import (
     resume_coordinator,
     session_coordination_key,
@@ -84,6 +89,7 @@ async def preflight_resume(
     req: WorkspacePreflightRequest | None = None,
     session_dir: Path = Depends(resolve_request_session_dir),
     service_factory: Callable[[], TerrariumService] = Depends(get_service_factory),
+    metadata_reader: MetadataReader | None = Depends(local_metadata_reader),
 ) -> dict[str, Any]:
     """Inspect local session workspaces without creating a runtime."""
     if req is not None and req.pwd is not None and req.workspace_overrides:
@@ -91,10 +97,12 @@ async def preflight_resume(
             status_code=422,
             detail="pwd and workspace_overrides are mutually exclusive",
         )
-    path = await asyncio.to_thread(resolve_session_path_in, session_name, session_dir)
+    path = await read_local_preflight(
+        resolve_session_path_in, session_name, session_dir
+    )
     if path is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    path = await asyncio.to_thread(canonical_resume_path, path, session_dir)
+    path = await read_local_preflight(canonical_resume_path, path, session_dir)
     requested_members = req.members if req is not None and req.members else None
     saved_members = await asyncio.to_thread(_read_saved_cluster_members, path)
     primary_sid = await asyncio.to_thread(
@@ -164,14 +172,20 @@ async def preflight_resume(
             require_ready=False,
         )
     try:
-        preflight = await asyncio.to_thread(preflight_session_workspaces, path)
+        if metadata_reader is None:
+            preflight = await read_local_preflight(preflight_session_workspaces, path)
+        else:
+            preflight = await read_local_preflight(
+                preflight_session_workspaces, path, metadata_reader=metadata_reader
+            )
     except WorkspaceResumeError as exc:
         raise HTTPException(
             status_code=409,
             detail={"code": exc.code.value, "message": str(exc)},
         ) from exc
+    reader = read_session_meta if metadata_reader is None else metadata_reader
     if preflight is None:
-        meta = await asyncio.to_thread(read_session_meta, path)
+        meta = await read_local_preflight(reader, path)
         saved_pwd = meta.get("pwd")
         effective_pwd = (req.pwd if req is not None else None) or saved_pwd
         ready = bool(effective_pwd and Path(effective_pwd).is_dir())
@@ -199,9 +213,7 @@ async def preflight_resume(
             member.creature_id: pwd_override for member in preflight.members
         }
     if replacements:
-        raw_manifest = (await asyncio.to_thread(read_session_meta, path)).get(
-            MANIFEST_KEY
-        )
+        raw_manifest = (await read_local_preflight(reader, path)).get(MANIFEST_KEY)
         assert isinstance(raw_manifest, dict)
         manifest = parse_manifest(raw_manifest)
         try:

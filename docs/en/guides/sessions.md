@@ -84,6 +84,50 @@ tool output remains under `tool_outputs/`. Existing artifact paths remain
 readable and are not migrated. Deleting session data does not delete its
 retained artifacts. Use `--no-session` to opt out of session persistence.
 
+### Runtime storage boundaries
+
+Keep session storage directories and their ancestor directories in place while the
+process is running. Deleting, renaming, or moving them at runtime is undefined
+behavior and the caller's responsibility, including through Web file management,
+Lab, editors, shell commands, or external programs. The framework does not add a
+filesystem monitor or permission gate to enforce this requirement.
+
+Likewise, directly editing, replacing, deleting, or renaming `.kohakutr` databases
+or related SQLite files (such as `-wal` and `-shm`) through generic file APIs,
+write/edit tools, or raw database access is not a supported runtime maintenance
+operation. Use the session APIs for normal recording, Memory updates, migration,
+forking, and session deletion. Ordinary unrelated project-file editing is unaffected.
+
+The metadata-read coordination described below covers supported framework operations
+in one process on one machine. It does not coordinate external processes or arbitrary
+custom code that bypasses those operations, and it does not redesign concurrency
+between existing legacy readers and writers.
+
+### Inspecting an offline session from a checkout
+
+From a checkout with its dependencies available, run:
+
+```bash
+python scripts/inspect_session.py /path/to/saved.kohakutr
+python scripts/inspect_session.py /path/to/saved.kohakutr --all --search "query"
+```
+
+The inspector owns a `SessionStore.open_readonly()` handle and closes only that
+handle, including when output fails or is interrupted. It does not change session
+status or recency and does not persist reconstructed event counters on close.
+It uses the existing Store resource enrollment: an in-process fast reader delays
+opening, and source-release uncertainty prevents opening.
+
+This is **business-read-only**, not SQLite `mode=ro`: native table initialization
+and SQLite coordination can still modify schema or filesystem bytes. Use it on an
+offline session, not alongside another process writing that file. It neither borrows
+nor finalizes a running owner's Store, and adds no cross-process coordination.
+
+Summary counts enumerate keys rather than decoding event/channel/subagent payloads;
+explicit detail and search options still read their contents. Opening an old session
+without a persisted event counter can still scan event values during Store construction.
+The key-only summary optimization does not remove that separate legacy startup cost.
+
 ## What persists
 
 On each turn KohakuTerrarium records:
@@ -98,6 +142,41 @@ On each turn KohakuTerrarium records:
 - **Binary artifacts**: generated images and similar binary outputs written under `<session>.artifacts/` beside the session file.
 
 ## Resuming
+
+### Web resume preflight metadata reads
+
+`POST /api/sessions/{name}/resume/preflight` automatically attempts a selective,
+read-only metadata query for its **local metadata-reading suffix**. No configuration
+flag or request parameter is required. The query observes committed SQLite WAL data,
+materializes metadata rows, and releases source resources before decoding those rows
+in a private in-memory decoder. It does not migrate, checkpoint, or update business
+state on the source.
+
+Best effort means **admission-controlled optimization**, not silent error recovery:
+
+- If related enrolled legacy resources (for example, a live Store or Memory index)
+  occupy the source, or another fast reader wins admission, the local read uses the
+  existing copy-based path. The earlier path-resolution phase can itself wait for an
+  active fast reader before reaching this decision.
+- Once candidate source SQL has started, a read or decode failure is reported, not
+  retried through a copy. Local candidate SQL/decode failures return HTTP 500 with
+  `detail.code = session_metadata_read_failed`.
+- If source release cannot be established, related enrolled access remains blocked
+  for that file identity in the process. The preflight resource-error mapping returns
+  HTTP 503 with `detail.code = session_metadata_resource_unavailable`, including when
+  a subsequent request encounters that state during path resolution. This is not a
+  normal busy response to retry blindly. Stop related work, let workers finish, and
+  shut down/restart the process cleanly; restarting is not database repair. Do not
+  manually clear occupancy while a source handle or worker may still be alive.
+- A private decoder failure after proven source release does not quarantine the source.
+
+This optimization does not extend to shared classification or version-probe reads,
+remote/cluster preflight branches, history browsing, other metadata consumers, or the
+actual resume operation. It introduces no cross-process safety guarantee. The
+[runtime storage boundaries](#runtime-storage-boundaries) above are part of its
+supported operating conditions.
+
+### CLI resume
 
 ```bash
 kt resume --last            # most recent session

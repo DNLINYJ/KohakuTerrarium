@@ -8,6 +8,7 @@ import pytest
 from kohakuterrarium.session import readonly_view
 from kohakuterrarium.session.errors import SessionNotReadyError
 from kohakuterrarium.session.readonly_view import SessionReadView
+from kohakuterrarium.session.resource_gate import GATE
 from kohakuterrarium.session.store import SessionStore
 
 
@@ -128,3 +129,51 @@ def test_missing_view_does_not_create_database(tmp_path):
     with pytest.raises(FileNotFoundError):
         SessionReadView(path)
     assert not path.exists()
+    assert GATE.snapshot(path).registered is False
+
+
+def test_snapshot_interleaves_items_get_and_event_keys(tmp_path):
+    path = tmp_path / "interleave.kohakutr"
+    with closing(SessionStore(path)) as store:
+        _populate(store)
+    with SessionReadView(path) as reader:
+        events = reader.items("events")
+        keys = reader._event_keys()
+        meta = reader.items("meta")
+        event1 = next(events)
+        key1 = next(keys)
+        nested = reader.get("meta", "nested")
+        event2 = next(events)
+        meta1 = next(meta)
+        key2 = next(keys)
+        rest_events = list(events)
+        rest_keys = list(keys)
+        seen = [event1, event2, *rest_events]
+        assert [item[1]["content"] for item in seen] == [
+            "private",
+            "first",
+            "second",
+            "new agent",
+        ]
+        assert [key1, key2, *rest_keys] == [item[0] for item in seen]
+        assert nested == {"items": [None, True, 4.5, "汉字"]}
+        assert meta1[0]
+        assert dict(meta)["nested"] == nested
+
+
+def test_snapshot_get_after_close_raises_closed_error(tmp_path):
+    path = tmp_path / "closed-get.kohakutr"
+    with closing(SessionStore(path)) as store:
+        _populate(store)
+    reader = SessionReadView(path)
+    reader.close()
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        reader.get("meta", "nested")
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        reader.get("meta", "missing", "default")
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        list(reader.items("events"))
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        list(reader._event_keys())
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        reader.load_meta()

@@ -15,6 +15,7 @@ from kohakuterrarium.errors import (
 from kohakuterrarium.session.resume import _open_store_with_migration
 from kohakuterrarium.session.resume_async import inject_saved_state_async
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.session.store_open import open_owned_store
 from kohakuterrarium.terrarium.creature_host import (
     Creature,
     apply_creature_name,
@@ -62,7 +63,9 @@ async def resume_manifest_into_engine(
     """
     runtime_ids = [item.creature_id for item in workspace_plan.manifest.creatures]
     async with engine._recipe_identities.reserve_exact(engine, runtime_ids):
-        store = _open_store_with_migration(path, writer_lock=True)
+        store = await open_owned_store(
+            _open_store_with_migration, path, writer_lock=True
+        )
         try:
             locked_manifest = _manifest.load_manifest(store)
         except BaseException:

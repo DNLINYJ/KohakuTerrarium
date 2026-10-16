@@ -3,6 +3,7 @@
 Studio adds lifecycle bookkeeping and HTTP/CLI orchestration above this layer.
 """
 
+import asyncio
 import os
 from copy import deepcopy
 from pathlib import Path
@@ -32,6 +33,7 @@ from kohakuterrarium.session.resume_async import (
     resume_agent_async,
 )
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.session.store_open import open_owned_store
 from kohakuterrarium.terrarium.config import load_terrarium_config
 from kohakuterrarium.terrarium.creature_host import (
     Creature,
@@ -152,7 +154,7 @@ async def resume_into_engine(
     if pwd is not None and workspace_overrides:
         raise ValueError("pwd and workspace_overrides are mutually exclusive")
     path = _resolve_store_path(store)
-    path = resolve_resume_path(path)
+    path = await asyncio.to_thread(resolve_resume_path, path)
     active = active_resume_graph(engine, path)
     if active is not None:
         if pwd is not None or workspace_overrides or llm is not None:
@@ -162,7 +164,7 @@ async def resume_into_engine(
         return active
     if isinstance(store, SessionStore):
         store.close(update_status=False)
-    meta = read_session_meta(path)
+    meta = await asyncio.to_thread(read_session_meta, path)
     # None is the checkpoint tombstone — legacy resume, not a manifest.
     dirty_state = meta.get("workspace_resume_state")
     if isinstance(dirty_state, dict) and dirty_state.get("status") == "partial_dirty":
@@ -199,8 +201,8 @@ async def resume_into_engine(
         if resumed is not None:
             return resumed
         # Tombstoned between the read-only probe and writer-lock revalidation.
-    preflight_legacy_workspace(path, pwd)
-    session_type = detect_session_type(path)
+    await asyncio.to_thread(preflight_legacy_workspace, path, pwd)
+    session_type = await asyncio.to_thread(detect_session_type, path)
 
     if session_type == "agent":
         return await _resume_agent_into_engine(engine, path, pwd=pwd, llm=llm, io=io)
@@ -387,7 +389,7 @@ async def _resume_terrarium_into_engine(
     io: str = "none",
 ) -> str:
     """Multi-creature recipe resume: rebuild graph, inject per-creature."""
-    store = _open_store_with_migration(path, writer_lock=True)
+    store = await open_owned_store(_open_store_with_migration, path, writer_lock=True)
     # ``apply_recipe`` appends every creature it adds here, so a failure
     # rolls back exactly this adoption's creatures — never one a
     # concurrent task added meanwhile.

@@ -18,10 +18,6 @@ from kohakuterrarium.session.history import (
     normalize_resumable_events,
 )
 from kohakuterrarium.session.identity import legacy_conversation_id, new_conversation_id
-from kohakuterrarium.session.open_registry import (
-    register_open_store,
-    unregister_open_store,
-)
 from kohakuterrarium.session.rollup import (
     get_turn_rollup,
     list_turn_rollups,
@@ -40,13 +36,7 @@ from kohakuterrarium.session.store_discovery import (
     discover_attached_agents,
 )
 from kohakuterrarium.session.store_fork import perform_fork
-from kohakuterrarium.session.store_lock import (
-    TABLE_ATTRS,
-    acquire_writer_lock,
-    close_tables,
-    discard_partial_open,
-    release_writer_lock,
-)
+from kohakuterrarium.session.store_resources import StoreResourceMixin
 from kohakuterrarium.session.token_views import (
     token_usage as _token_usage_impl,
     token_usage_all_loops as _token_usage_all_loops_impl,
@@ -81,7 +71,7 @@ def _key_text(key: Any) -> str:
     return key.decode("utf-8", errors="replace") if isinstance(key, bytes) else key
 
 
-class SessionStore(StoreAffinityMixin, BranchIndexMixin):
+class SessionStore(StoreAffinityMixin, StoreResourceMixin, BranchIndexMixin):
     """Persistent session storage backed by KohakuVault.
 
     One ``.kohakutr`` file contains metadata, per-agent state, append-only
@@ -107,10 +97,9 @@ class SessionStore(StoreAffinityMixin, BranchIndexMixin):
         # Read-only consumers must not alter status or recency on close.
         self._readonly = False
 
-        # The optional cross-process writer lock is released during close.
-        self._writer_lock = acquire_writer_lock(self._path) if writer_lock else None
+        # Occupancy is enrolled before native open; the writer lock is optional.
         self._ready = False
-        register_open_store(self._path, self)
+        self._enroll_resources(writer_lock=writer_lock)
 
         self._flush_every_n_events: int = (
             flush_every_n_events
@@ -144,14 +133,7 @@ class SessionStore(StoreAffinityMixin, BranchIndexMixin):
             self._open_tables()
             self._restore_counters()
         except BaseException:
-            discard_partial_open(
-                [(name, getattr(self, name, None)) for name in TABLE_ATTRS],
-                getattr(self, "fts", None),
-                self._path,
-            )
-            release_writer_lock(self._writer_lock)
-            self._writer_lock = None
-            unregister_open_store(self._path, self)
+            self._discard_failed_open()
             raise
         self._ready = True
 
@@ -921,27 +903,35 @@ class SessionStore(StoreAffinityMixin, BranchIndexMixin):
         Writable stores optionally transition to paused; read-only stores never
         mutate metadata.
         """
-        if not self._begin_close():
-            return
-        unregister_open_store(self._path, self)
-        if self._readonly:
-            update_status = False
-        if not self._readonly:
-            persist_event_counter(self.state, self._global_event_id)
-        if update_status:
+        try:
+            if not self._begin_close():
+                return
+        except BaseException:
+            if self._closed:
+                self._finish_resource_lease(False)
+            raise
+        try:
+            if self._readonly:
+                update_status = False
+            if not self._readonly:
+                persist_event_counter(self.state, self._global_event_id)
+            if update_status:
+                try:
+                    self.update_status("paused")
+                except Exception as e:
+                    logger.warning(
+                        "Failed to update session status on close",
+                        error=str(e),
+                        exc_info=True,
+                    )
+        except BaseException as primary:
             try:
-                self.update_status("paused")
-            except Exception as e:
-                logger.warning(
-                    "Failed to update session status on close",
-                    error=str(e),
-                    exc_info=True,
-                )
-        tables = tuple(getattr(self, name) for name in TABLE_ATTRS)
-        # Close helpers release the writer lock even if a companion closer fails.
-        close_tables(tables, self.fts, self._writer_lock, self._companion_closers)
-        self._writer_lock = None
-        logger.debug("SessionStore closed", path=self._path)
+                self._close_enrolled_resources()
+            except BaseException as cleanup:
+                raise primary from cleanup
+            raise
+        else:
+            self._close_enrolled_resources()
 
     def fork(
         self,
