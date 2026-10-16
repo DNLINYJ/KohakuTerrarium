@@ -10,7 +10,6 @@ docstring rather than mocked into existence.
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -361,37 +360,26 @@ class TestMalformedBase64AndOneShot:
     async def test_oneshot_read_limit_uses_real_oversize_file(
         self, adapter, tmp_path, monkeypatch
     ):
-        """Real oversize bytes would allocate 1 MiB+; keep a tiny file and
-        only fake ``st_size`` so the production one-shot check still runs.
-        """
-        await adapter._dispatch(
-            msg(
-                "write",
-                {
-                    "scope": "recipe://oneshot",
-                    "path": "f.bin",
-                    "bytes_b64": b64(b"small"),
-                },
-            )
-        )
+        """Reject a real oversized file before opening its contents."""
         target = tmp_path / "kt-config" / "recipes" / "oneshot" / "f.bin"
-        real_stat = Path.stat
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("wb") as stream:
+            stream.write(b"small")
+            stream.truncate(MAX_ONESHOT_BYTES + 1)
+        assert target.is_file()
 
-        def huge_stat(self, *args, **kwargs):
-            st = real_stat(self, *args, **kwargs)
-            if self == target:
-                return SimpleNamespace(
-                    st_size=MAX_ONESHOT_BYTES + 1, st_mtime=st.st_mtime
-                )
-            return st
+        def forbidden_open(*args, **kwargs):
+            pytest.fail("oversized content must not be opened")
 
-        monkeypatch.setattr(Path, "stat", huge_stat)
+        monkeypatch.setattr(files_mod.aiofiles, "open", forbidden_open)
         out = await adapter._dispatch(
             msg("read", {"scope": "recipe://oneshot", "path": "f.bin"})
         )
         assert out["error"]["kind"] == "invalid"
         assert "one-shot limit" in out["error"]["message"]
-        assert target.read_bytes() == b"small"
+        assert target.stat().st_size == MAX_ONESHOT_BYTES + 1
+        with target.open("rb") as stream:
+            assert stream.read(5) == b"small"
 
 
 class TestListAndBundleEdges:
