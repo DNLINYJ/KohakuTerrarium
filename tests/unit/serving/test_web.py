@@ -147,7 +147,9 @@ def test_desktop_blocking_passes_window_icon_on_windows(monkeypatch, tmp_path):
             return self
 
     window = SimpleNamespace(
-        events=SimpleNamespace(shown=_Shown(), before_show=_Shown(), loaded=_Shown()),
+        events=SimpleNamespace(
+            shown=_Shown(), before_show=_Shown(), before_load=_Shown(), loaded=_Shown()
+        ),
         expose=lambda *functions: None,
     )
     webview = SimpleNamespace(

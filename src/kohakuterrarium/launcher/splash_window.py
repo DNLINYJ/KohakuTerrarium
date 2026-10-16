@@ -23,6 +23,7 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
+from kohakuterrarium.launcher.dpi import configure_process_dpi
 from kohakuterrarium.launcher.log import get_logger
 from kohakuterrarium.launcher.splash_server import SplashServer
 
@@ -206,6 +207,7 @@ def run_with_splash(work: Callable[[SplashServer], T]) -> T:
     result (or exception) is handed back here. ``work`` publishes its
     progress through the :class:`SplashServer` it receives.
     """
+    configure_process_dpi()
     server = SplashServer(page_html=_HTML_PATH.read_text(encoding="utf-8")).start()
     outcome = _Outcome()
     worker = threading.Thread(

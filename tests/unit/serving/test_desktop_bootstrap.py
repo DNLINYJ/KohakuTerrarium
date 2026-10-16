@@ -25,6 +25,7 @@ def _isolate_native_dpi(monkeypatch):
 class _Events:
     def __init__(self):
         self.before_show = _Event()
+        self.before_load = _Event()
         self.loaded = _Event()
         self.shown = _Event()
         self.closed = _Event()

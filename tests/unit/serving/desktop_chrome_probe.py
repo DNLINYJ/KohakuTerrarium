@@ -15,7 +15,6 @@ from kohakuterrarium.serving.desktop_chrome import configure_desktop_chrome
 from kohakuterrarium.serving.desktop_frame import Rect
 from kohakuterrarium.serving.desktop_palette import (
     BACKGROUND,
-    BORDER,
     DARK_BACKGROUND,
     DARK_FOREGROUND,
 )
@@ -54,7 +53,8 @@ def values(rect):
 
 def run():
     from System import Action
-    from System.Windows.Forms import Screen
+    from System.Drawing import Color, Rectangle
+    from System.Windows.Forms import Form, FormBorderStyle, FormStartPosition, Screen
     from PIL import ImageGrab
 
     result = {}
@@ -136,13 +136,83 @@ def run():
         )
         capture.save(str(output.with_suffix(".png")))
         background = tuple(int(BACKGROUND[i : i + 2], 16) for i in (1, 3, 5))
-        border = tuple(int(BORDER[i : i + 2], 16) for i in (1, 3, 5))
         cx, cy = client[0] - bounds[0] + 20, client[1] - bounds[1] + 20
         assert capture.getpixel((cx, cy + 15))[:3] == background, "White caption seam"
-        assert capture.getpixel((cx + 5, cy))[:3] == border, "Missing top outline"
-        assert (
-            capture.getpixel((client[2] - bounds[0] - 30 + 20, cy))[:3] == border
-        ), "Button covers top outline"
+        backdrop = []
+
+        def create_backdrop():
+            panel = Form()
+            panel.FormBorderStyle = getattr(FormBorderStyle, "None")
+            panel.StartPosition = FormStartPosition.Manual
+            panel.ShowInTaskbar = False
+            panel.TopMost = True
+            panel.Bounds = Rectangle(
+                bounds[0] - 30,
+                bounds[1] - 30,
+                bounds[2] - bounds[0] + 60,
+                bounds[3] - bounds[1] + 60,
+            )
+            form.Owner = panel
+            panel.Show()
+            form.BringToFront()
+            backdrop.append(panel)
+
+        form.Invoke(Action(create_backdrop))
+        result["border_states"] = []
+        try:
+            for backdrop_color in (Color.White, Color.Black):
+                for active in (False, True):
+
+                    def redraw():
+                        backdrop[0].BackColor = backdrop_color
+                        backdrop[0].Refresh()
+                        user.SendMessageW(hwnd, 0x86, int(active), 0)
+                        form.Refresh()
+
+                    form.Invoke(Action(redraw))
+                    dwm.DwmFlush()
+                    time.sleep(0.1)
+                    shot = ImageGrab.grab(
+                        bbox=(
+                            bounds[0] - 20,
+                            bounds[1] - 20,
+                            bounds[2] + 20,
+                            bounds[3] + 20,
+                        ),
+                        all_screens=True,
+                    )
+                    vx, vy, vr, vb = visible
+                    points = [
+                        ((vx + vr) // 2, vy),
+                        (vx, (vy + vb) // 2),
+                        (vr - 1, (vy + vb) // 2),
+                        ((vx + vr) // 2, vb - 1),
+                        (client[2] - 30, vy),
+                    ]
+                    colors = [
+                        shot.getpixel((x - bounds[0] + 20, y - bounds[1] + 20))[:3]
+                        for x, y in points
+                    ]
+                    assert all(
+                        max(values) - min(values) <= 1 for values in zip(*colors)
+                    ), (active, backdrop_color.Name, colors)
+                    result["border_states"].append(
+                        [active, backdrop_color.Name, colors]
+                    )
+                    shot.save(
+                        str(
+                            output.with_name(
+                                f"{output.stem}-border-{backdrop_color.Name}-{active}.png"
+                            )
+                        )
+                    )
+        finally:
+
+            def close_backdrop():
+                form.Owner = None
+                backdrop[0].Dispose()
+
+            form.Invoke(Action(close_backdrop))
         css_background = "rgb(" + ", ".join(map(str, background)) + ")"
         assert (
             window.evaluate_js("getComputedStyle(document.body).backgroundColor")
@@ -161,6 +231,15 @@ def run():
         result["startup_palette_and_outline"] = True
 
         caption = window._desktop_titlebar
+        guarded_on_ui_thread = []
+
+        def stale():
+            guarded_on_ui_thread.append(not form.InvokeRequired)
+            return False
+
+        assert caption.set_dark(True, is_current=stale) is False
+        assert guarded_on_ui_thread == [True]
+        assert caption.background.ToArgb() & 0xFFFFFF == int(BACKGROUND[1:], 16)
         for dark in (True, False, True, False):
             window.evaluate_js(
                 f"document.documentElement.classList.toggle('dark', {str(dark).lower()})"
@@ -234,6 +313,16 @@ def run():
             result,
             values(info.work),
         )
+        top_pixel = ImageGrab.grab(
+            bbox=(
+                info.work.left + 5,
+                info.work.top,
+                info.work.left + 6,
+                info.work.top + 1,
+            ),
+            all_screens=True,
+        ).getpixel((0, 0))[:3]
+        assert top_pixel == background, ("Maximized top seam", top_pixel, background)
         click(1)
         wait_for(lambda: not user.IsZoomed(hwnd))
         assert snapshot() == original, (snapshot(), original)

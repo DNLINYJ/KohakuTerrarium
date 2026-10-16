@@ -13,6 +13,30 @@ import pytest
 from kohakuterrarium.serving.desktop_frame import NativeFrame, Rect
 
 
+def test_top_edge_uses_compositor_alpha_in_both_activation_states():
+    frame = NativeFrame.__new__(NativeFrame)
+    frame.hwnd = 1
+    frame._user = SimpleNamespace(IsZoomed=lambda _: False)
+    captured = []
+
+    def draw(
+        _dc, _x, _y, width, _height, _sx, _sy, _start, _lines, pixels, _header, _usage
+    ):
+        captured.append(
+            list(ctypes.cast(pixels, ctypes.POINTER(ctypes.c_uint32 * width)).contents)
+        )
+        return 1
+
+    frame._gdi = SimpleNamespace(SetDIBitsToDevice=draw)
+    frame.active = True
+    frame.paint_top_edge(1, 4)
+    frame.active = False
+    frame.paint_top_edge(1, 4)
+    frame._user.IsZoomed = lambda _: True
+    frame.paint_top_edge(1, 4)
+    assert captured == [[0] * 4, [0x802B2B2B] * 4]
+
+
 @pytest.mark.parametrize("maximized", [False, True])
 def test_caption_controls_and_negative_monitor_coordinates(maximized):
     frame = NativeFrame.__new__(NativeFrame)

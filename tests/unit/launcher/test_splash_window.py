@@ -30,6 +30,11 @@ from kohakuterrarium.launcher.splash_server import SplashServer
 MAIN_THREAD_ERROR = "pywebview must be run on a main thread."
 
 
+@pytest.fixture(autouse=True)
+def isolate_process_dpi(monkeypatch):
+    monkeypatch.setattr(splash_window, "configure_process_dpi", lambda: True)
+
+
 class _FakeEvent:
     def __init__(self) -> None:
         self._event = threading.Event()

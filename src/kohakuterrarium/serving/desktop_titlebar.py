@@ -7,7 +7,6 @@ from System.Windows.Forms import Button, Control, FlatStyle, FormWindowState, Pa
 from kohakuterrarium.serving.desktop_frame import NativeFrame
 from kohakuterrarium.serving.desktop_palette import (
     BACKGROUND,
-    BORDER,
     DARK_BACKGROUND,
     DARK_FOREGROUND,
     FOREGROUND,
@@ -25,7 +24,6 @@ class DesktopTitleBar:
         self.font = Font("Segoe UI", 9)
         self.foreground = ColorTranslator.FromHtml(FOREGROUND)
         self.background = ColorTranslator.FromHtml(BACKGROUND)
-        self.border = ColorTranslator.FromHtml(BORDER)
         form.BackColor = self.background
         for name, command in (
             ("Minimize", 0xF020),
@@ -56,14 +54,20 @@ class DesktopTitleBar:
         form.DpiChanged += self._layout
         form.Disposed += self._dispose
         self.frame.dpi_changed = self._layout
+        self.frame.appearance_changed = self._invalidate
         self._layout()
         self.frame.install()
 
-    def set_dark(self, dark: bool) -> bool:
+    def set_dark(self, dark: bool, *, is_current=lambda: True) -> bool:
         if self.form.IsDisposed or not self.form.IsHandleCreated:
             return False
 
+        applied = False
+
         def apply():
+            nonlocal applied
+            if not is_current():
+                return
             self.background = ColorTranslator.FromHtml(
                 DARK_BACKGROUND if dark else BACKGROUND
             )
@@ -82,13 +86,14 @@ class DesktopTitleBar:
                 )
                 button.Invalidate()
             self.form.Invalidate()
+            applied = True
 
         try:
             if self.form.InvokeRequired:
                 self.form.Invoke(Action(apply))
             else:
                 apply()
-            return True
+            return applied
         except (ObjectDisposedException, InvalidOperationException):
             return False
 
@@ -151,7 +156,7 @@ class DesktopTitleBar:
         return paint
 
     def _invalidate(self, *_):
-        self.form.Invalidate()
+        self.form.Invalidate(True)
 
     def _paint(self, _sender, event):
         scale = self.frame.dpi / 96
@@ -167,11 +172,11 @@ class DesktopTitleBar:
     def _paint_top_edge(self, graphics, width):
         if self.frame.maximized:
             return
-        pen = Pen(self.border, 1)
+        hdc = graphics.GetHdc()
         try:
-            graphics.DrawLine(pen, 0, 0, width - 1, 0)
+            self.frame.paint_top_edge(hdc.ToInt64(), width)
         finally:
-            pen.Dispose()
+            graphics.ReleaseHdc(hdc)
 
     def _dispose(self, *_):
         self.frame.close()
