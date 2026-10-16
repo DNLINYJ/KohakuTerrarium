@@ -85,8 +85,7 @@ between existing legacy readers and writers.
 
 ### Inspecting an offline session from a checkout
 
-With KohakuTerrarium installed in the active environment (for development,
-`uv pip install -e ".[dev]"`), run:
+From a checkout with its dependencies available, run:
 
 ```bash
 python scripts/inspect_session.py /path/to/saved.kohakutr
