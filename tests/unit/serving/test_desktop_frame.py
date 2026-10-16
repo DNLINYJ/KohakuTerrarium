@@ -13,6 +13,41 @@ import pytest
 from kohakuterrarium.serving.desktop_frame import NativeFrame, Rect
 
 
+def test_size_transitions_refresh_dwm_after_maximized_focus_changes():
+    frame = NativeFrame.__new__(NativeFrame)
+    frame.hwnd = 1
+    state = {"maximized": False}
+    top_margins = []
+    frame._user = SimpleNamespace(IsZoomed=lambda _: state["maximized"])
+    frame._dwm = SimpleNamespace(
+        DwmExtendFrameIntoClientArea=lambda _hwnd, margins: top_margins.append(
+            ctypes.cast(margins, ctypes.POINTER(ctypes.c_int * 4)).contents[2]
+        ),
+        DwmSetWindowAttribute=lambda *_: 0,
+    )
+    frame._comctl = SimpleNamespace(DefSubclassProc=lambda *_: 0)
+    frame._extend_frame()
+    assert top_margins[-1] == 1
+    state["maximized"] = True
+    frame._dispatch(1, 0x5, 2, 0, 1, 0)
+    frame._dispatch(1, 0x6, 0, 0, 1, 0)
+    frame._dispatch(1, 0x6, 1, 0, 1, 0)
+    assert top_margins[-1] == 0
+    state["maximized"] = False
+    frame._dispatch(1, 0x5, 0, 0, 1, 0)
+    assert top_margins[-1] == 1
+
+    state["maximized"] = True
+    frame._dispatch(1, 0x5, 2, 0, 1, 0)
+    assert top_margins[-1] == 0
+    state["maximized"] = False
+    frame._dispatch(1, 0x5, 1, 0, 1, 0)
+    assert top_margins[-1] == 0
+    state["maximized"] = True
+    frame._dispatch(1, 0x5, 2, 0, 1, 0)
+    assert top_margins[-1] == 0
+
+
 def test_top_edge_uses_compositor_alpha_in_both_activation_states():
     frame = NativeFrame.__new__(NativeFrame)
     frame.hwnd = 1

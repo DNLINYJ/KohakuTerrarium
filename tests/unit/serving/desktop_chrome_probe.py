@@ -53,7 +53,7 @@ def values(rect):
 
 def run():
     from System import Action
-    from System.Drawing import Color, Rectangle
+    from System.Drawing import Color, Rectangle, Size
     from System.Windows.Forms import Form, FormBorderStyle, FormStartPosition, Screen
     from PIL import ImageGrab
 
@@ -157,62 +157,67 @@ def run():
             form.BringToFront()
             backdrop.append(panel)
 
-        form.Invoke(Action(create_backdrop))
-        result["border_states"] = []
-        try:
-            for backdrop_color in (Color.White, Color.Black):
-                for active in (False, True):
+        def verify_borders(stage, *, existing_backdrop=False):
+            if not existing_backdrop:
+                backdrop.clear()
+                form.Invoke(Action(create_backdrop))
+            result.setdefault("border_states", {})[stage] = []
+            try:
+                for backdrop_color in (Color.White, Color.Black):
+                    for active in (False, True):
 
-                    def redraw():
-                        backdrop[0].BackColor = backdrop_color
-                        backdrop[0].Refresh()
-                        user.SendMessageW(hwnd, 0x86, int(active), 0)
-                        form.Refresh()
+                        def redraw():
+                            backdrop[0].BackColor = backdrop_color
+                            backdrop[0].Refresh()
+                            user.SendMessageW(hwnd, 0x86, int(active), 0)
+                            form.Refresh()
 
-                    form.Invoke(Action(redraw))
-                    dwm.DwmFlush()
-                    time.sleep(0.1)
-                    shot = ImageGrab.grab(
-                        bbox=(
-                            bounds[0] - 20,
-                            bounds[1] - 20,
-                            bounds[2] + 20,
-                            bounds[3] + 20,
-                        ),
-                        all_screens=True,
-                    )
-                    vx, vy, vr, vb = visible
-                    points = [
-                        ((vx + vr) // 2, vy),
-                        (vx, (vy + vb) // 2),
-                        (vr - 1, (vy + vb) // 2),
-                        ((vx + vr) // 2, vb - 1),
-                        (client[2] - 30, vy),
-                    ]
-                    colors = [
-                        shot.getpixel((x - bounds[0] + 20, y - bounds[1] + 20))[:3]
-                        for x, y in points
-                    ]
-                    assert all(
-                        max(values) - min(values) <= 1 for values in zip(*colors)
-                    ), (active, backdrop_color.Name, colors)
-                    result["border_states"].append(
-                        [active, backdrop_color.Name, colors]
-                    )
-                    shot.save(
-                        str(
-                            output.with_name(
-                                f"{output.stem}-border-{backdrop_color.Name}-{active}.png"
+                        form.Invoke(Action(redraw))
+                        dwm.DwmFlush()
+                        time.sleep(0.1)
+                        shot = ImageGrab.grab(
+                            bbox=(
+                                bounds[0] - 20,
+                                bounds[1] - 20,
+                                bounds[2] + 20,
+                                bounds[3] + 20,
+                            ),
+                            all_screens=True,
+                        )
+                        vx, vy, vr, vb = visible
+                        points = [
+                            ((vx + vr) // 2, vy),
+                            (vx, (vy + vb) // 2),
+                            (vr - 1, (vy + vb) // 2),
+                            ((vx + vr) // 2, vb - 1),
+                            (client[2] - 30, vy),
+                        ]
+                        colors = [
+                            shot.getpixel((x - bounds[0] + 20, y - bounds[1] + 20))[:3]
+                            for x, y in points
+                        ]
+                        assert all(
+                            max(values) - min(values) <= 1 for values in zip(*colors)
+                        ), (active, backdrop_color.Name, colors)
+                        result["border_states"][stage].append(
+                            [active, backdrop_color.Name, colors]
+                        )
+                        shot.save(
+                            str(
+                                output.with_name(
+                                    f"{output.stem}-{stage}-border-{backdrop_color.Name}-{active}.png"
+                                )
                             )
                         )
-                    )
-        finally:
+            finally:
 
-            def close_backdrop():
-                form.Owner = None
-                backdrop[0].Dispose()
+                def close_backdrop():
+                    form.Owner = None
+                    backdrop[0].Dispose()
 
-            form.Invoke(Action(close_backdrop))
+                form.Invoke(Action(close_backdrop))
+
+        verify_borders("initial")
         css_background = "rgb(" + ", ".join(map(str, background)) + ")"
         assert (
             window.evaluate_js("getComputedStyle(document.body).backgroundColor")
@@ -323,9 +328,15 @@ def run():
             all_screens=True,
         ).getpixel((0, 0))[:3]
         assert top_pixel == background, ("Maximized top seam", top_pixel, background)
+        backdrop.clear()
+        form.Invoke(Action(create_backdrop))
+        form.Invoke(Action(form.Activate))
+        user.SendMessageW(hwnd, 0x6, 0, 0)
+        user.SendMessageW(hwnd, 0x6, 1, 0)
         click(1)
         wait_for(lambda: not user.IsZoomed(hwnd))
         assert snapshot() == original, (snapshot(), original)
+        verify_borders("restored_after_maximized_focus", existing_backdrop=True)
 
         for maximize in (False, True):
             if maximize:
@@ -372,6 +383,14 @@ def run():
             form.Invoke(Action(lambda: None))
             before = snapshot()
             dpi = frame.dpi
+            minimum = tuple(round(value * dpi / 96) for value in window.min_size)
+            assert (form.MinimumSize.Width, form.MinimumSize.Height) == minimum
+            form.Invoke(Action(lambda: setattr(form, "Size", Size(1, 1))))
+            smallest = snapshot()["outer"]
+            assert (smallest[2] - smallest[0], smallest[3] - smallest[1]) == minimum
+            x, y, right, bottom = before["outer"]
+            user.SetWindowPos(hwnd, None, x, y, right - x, bottom - y, 0x14)
+            form.Invoke(Action(lambda: None))
             assert frame.caption_height == round(32 * dpi / 96), (
                 dpi,
                 frame.caption_height,
@@ -388,7 +407,11 @@ def run():
             wait_for(lambda: not user.IsZoomed(hwnd))
             assert snapshot() == before, (snapshot(), before)
             result["monitors"].append(
-                {"dpi": dpi, "work": [work.Left, work.Top, work.Right, work.Bottom]}
+                {
+                    "dpi": dpi,
+                    "minimum": minimum,
+                    "work": [work.Left, work.Top, work.Right, work.Bottom],
+                }
             )
         result["ok"] = True
     except Exception:

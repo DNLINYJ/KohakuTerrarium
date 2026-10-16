@@ -16,8 +16,9 @@ from kohakuterrarium.serving.desktop_palette import (
 class DesktopTitleBar:
     """Native caption controls independent of WebView navigation and zoom."""
 
-    def __init__(self, form):
+    def __init__(self, form, *, min_size: tuple[int, int]):
         self.form = form
+        self._logical_minimum = tuple(min_size)
         self.frame = NativeFrame(form.Handle.ToInt64())
         self.buttons = []
         self._state = FormWindowState.Normal
@@ -110,6 +111,9 @@ class DesktopTitleBar:
             if state != FormWindowState.Normal:
                 self.form.Size = self.form.RestoreBounds.Size
         scale = self.frame.dpi / 96
+        minimum = Size(*(round(value * scale) for value in self._logical_minimum))
+        if self.form.MinimumSize != minimum:
+            self.form.MinimumSize = minimum
         height, width = round(32 * scale), round(46 * scale)
         self.frame.caption_height = height
         self.frame.controls_width = 3 * width

@@ -37,6 +37,7 @@ class NativeFrame:
         self.dpi_changed = lambda: None
         self.appearance_changed = lambda: None
         self.active = False
+        self._extended_maximized = None
         self._user = ctypes.WinDLL("user32", use_last_error=True)
         self._comctl = ctypes.WinDLL("comctl32", use_last_error=True)
         self._dwm = ctypes.WinDLL("dwmapi", use_last_error=True)
@@ -137,7 +138,8 @@ class NativeFrame:
         self._user.PostMessageW(self.hwnd, 0x112, command, 0)
 
     def _extend_frame(self) -> None:
-        margins = (ctypes.c_int * 4)(0, 0, 0 if self.maximized else 1, 0)
+        self._extended_maximized = self.maximized
+        margins = (ctypes.c_int * 4)(0, 0, 0 if self._extended_maximized else 1, 0)
         self._dwm.DwmExtendFrameIntoClientArea(self.hwnd, ctypes.byref(margins))
         dark = ctypes.c_int(1)
         self._dwm.DwmSetWindowAttribute(self.hwnd, 20, ctypes.byref(dark), 4)
@@ -192,6 +194,9 @@ class NativeFrame:
                     return result
             elif message in (0x6, 0x31E):  # WM_ACTIVATE / WM_DWMCOMPOSITIONCHANGED
                 self._extend_frame()
+            elif message == 0x5 and wparam != 1:  # WM_SIZE, excluding SIZE_MINIMIZED
+                if self.maximized != self._extended_maximized:
+                    self._extend_frame()
             elif message == 0x86:  # WM_NCACTIVATE
                 self.active = bool(wparam)
                 result = self._comctl.DefSubclassProc(hwnd, message, wparam, lparam)
@@ -199,6 +204,7 @@ class NativeFrame:
                 return result
             elif message == 0x2E0:  # WM_DPICHANGED
                 result = self._comctl.DefSubclassProc(hwnd, message, wparam, lparam)
+                self.dpi_changed()
                 bounds = Rect.from_address(lparam)
                 self._user.SetWindowPos(
                     hwnd,
@@ -209,7 +215,6 @@ class NativeFrame:
                     bounds.bottom - bounds.top,
                     0x14,
                 )
-                self.dpi_changed()
                 return result
         except Exception:
             logger.exception("Desktop non-client message failed")

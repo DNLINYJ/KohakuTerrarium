@@ -70,7 +70,9 @@ def configure_desktop_chrome(window) -> None:
     def before_show():
         from kohakuterrarium.serving.desktop_titlebar import DesktopTitleBar
 
-        window._desktop_titlebar = DesktopTitleBar(window.native)
+        window._desktop_titlebar = DesktopTitleBar(
+            window.native, min_size=window.min_size
+        )
 
     def set_desktop_theme(dark: bool, document_generation: int) -> bool:
         caption = getattr(window, "_desktop_titlebar", None)
