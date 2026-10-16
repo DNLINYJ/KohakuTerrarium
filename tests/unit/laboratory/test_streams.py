@@ -223,7 +223,40 @@ class TestRemoteStreamIteration:
         await demux._dispatch(
             _make_msg(rs.stream_id, {"error": {"kind": "k", "message": "m"}})
         )
-        with pytest.raises(RemoteStreamError):
+        with pytest.raises(RemoteStreamError) as excinfo:
+            await rs.__anext__()
+        assert excinfo.value.kind == "k"
+        assert excinfo.value.message == "m"
+        assert rs._closed
+        assert rs.stream_id not in demux._queues
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {
+                "type": "tool_error",
+                "name": "send_channel",
+                "error": "Channel not found",
+            },
+            {"type": "error", "error": {"kind": "k", "message": "m"}},
+            {"status": "failed", "error": "boom"},
+            {"status": "done", "error": None},
+        ],
+    )
+    async def test_payload_error_field_is_data_not_terminal(self, payload):
+        demux, rs = await self._make()
+        await demux._dispatch(_make_msg(rs.stream_id, dict(payload)))
+        assert await rs.__anext__() == {**payload, "stream_id": rs.stream_id}
+        assert not rs._closed
+        assert rs.stream_id in demux._queues
+
+        await demux._dispatch(_make_msg(rs.stream_id, {"token": "after"}))
+        assert await asyncio.wait_for(rs.__anext__(), timeout=1.0) == {
+            "token": "after",
+            "stream_id": rs.stream_id,
+        }
+        await demux._dispatch(_make_msg(rs.stream_id, {"eof": True}))
+        with pytest.raises(StopAsyncIteration):
             await rs.__anext__()
 
     async def test_closed_iterator_stops(self):

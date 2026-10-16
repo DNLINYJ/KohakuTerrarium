@@ -47,6 +47,7 @@ def _write_creature_config(
     system_prompt: str,
     *,
     subagents: list[str] | None = None,
+    tool_format: str | None = None,
 ) -> Path:
     """Write a realistic on-disk creature config dir.
 
@@ -58,7 +59,8 @@ def _write_creature_config(
 
     ``subagents`` — when given, each name is declared as a ``builtin``
     sub-agent on the creature so the worker builds the full VERTICAL
-    composition (controller → sub-agent) at spawn time.
+    composition (controller → sub-agent) at spawn time. ``tool_format``
+    overrides the ``bracket`` default those sub-agent creatures get.
     """
     cdir = root / f"creature_{name}"
     cdir.mkdir(parents=True, exist_ok=True)
@@ -71,8 +73,9 @@ def _write_creature_config(
         "input:\n  type: cli\n"
         "output:\n  type: stdout\n"
     )
+    if tool_format or subagents:
+        text += f"tool_format: {tool_format or 'bracket'}\n"
     if subagents:
-        text += "tool_format: bracket\n"
         text += "subagents:\n"
         for sa in subagents:
             text += f"  - name: {sa}\n    type: builtin\n"
@@ -120,6 +123,19 @@ async def _drain_chat_ws(
         elif ftype == "idle" and chunks:
             break
     return "".join(chunks)
+
+
+async def _recv_chat_turn(ws, reply_marker: str) -> list[dict]:
+    """Collect chat WS frames up to the ``idle`` that follows ``reply_marker``."""
+    frames: list[dict] = []
+    text = ""
+    while True:
+        frame = json.loads(await ws.recv())
+        frames.append(frame)
+        if frame.get("type") == "text":
+            text += str(frame.get("content", ""))
+        elif frame.get("type") == "idle" and reply_marker in text:
+            return frames
 
 
 @pytest.fixture(autouse=True)
@@ -2906,11 +2922,34 @@ async def test_frontend_create_then_chat_attach_sequence_on_worker(
     Drives the literal frontend order — nodes → history → active →
     chat WS — and attaches BOTH by the engine ``creature_id`` AND by
     the creature's display ``name`` (the frontend's chat tab keys off
-    the friendly name, e.g. ``/creatures/quiet-meadow/chat``).
+    the friendly name, e.g. ``/creatures/quiet-meadow/chat``). A failed
+    tool call must then leave that same chat WS serving the reply, idle,
+    and a second turn.
     """
     monkeypatch.setenv("KT_SESSION_DIR", str(tmp_path / "host-sessions"))
-    install_scripted_llm(monkeypatch, script=["attach reply ok"])
-    cfg_dir = _write_creature_config(tmp_path, "attachme", "You attach.")
+    install_scripted_llm(
+        monkeypatch,
+        script=[
+            ScriptEntry(response="attach reply ok"),
+            ScriptEntry(
+                response=(
+                    "[/send_channel]\n"
+                    "@@channel=attach-missing-ch\n"
+                    "@@message=probe\n"
+                    "[send_channel/]"
+                ),
+                match="tool error probe",
+            ),
+            ScriptEntry(
+                response="recovered after tool error", match="attach-missing-ch"
+            ),
+            ScriptEntry(response="second turn reply", match="second turn probe"),
+            ScriptEntry(response="attach reply ok"),
+        ],
+    )
+    cfg_dir = _write_creature_config(
+        tmp_path, "attachme", "You attach.", tool_format="bracket"
+    )
 
     async with RealLabHost(tmp_path) as host:
         async with RealLabWorker("worker-1", host.lab_ws_url, tmp_path / "worker-1"):
@@ -2964,11 +3003,44 @@ async def test_frontend_create_then_chat_attach_sequence_on_worker(
                 reply_by_name = await asyncio.wait_for(
                     _drain_chat_ws(ws, "ping"), timeout=OP_TIMEOUT
                 )
-            assert "attach reply ok" in reply_by_name, (
-                f"chat attach by creature NAME {creature_name!r} streamed "
-                f"{reply_by_name!r} — the frontend keys its chat tab off "
-                "the display name and the WebSocket closes empty"
-            )
+                assert "attach reply ok" in reply_by_name, (
+                    f"chat attach by creature NAME {creature_name!r} streamed "
+                    f"{reply_by_name!r} — the frontend keys its chat tab off "
+                    "the display name and the WebSocket closes empty"
+                )
+
+                # A failed tool call leaves this connection usable.
+                await ws.send(
+                    json.dumps({"type": "input", "content": "tool error probe"})
+                )
+                frames = await asyncio.wait_for(
+                    _recv_chat_turn(ws, "recovered after tool error"),
+                    timeout=OP_TIMEOUT,
+                )
+                tool_errors = [f for f in frames if f.get("type") == "tool_error"]
+                assert tool_errors, f"no tool_error frame before idle: {frames}"
+                assert "attach-missing-ch" in str(
+                    tool_errors[0].get("error")
+                ), f"tool_error does not describe the failed send: {tool_errors[0]}"
+                after_error = frames[frames.index(tool_errors[0]) :]
+                recovered = "".join(
+                    str(f.get("content", ""))
+                    for f in after_error
+                    if f.get("type") == "text"
+                )
+                assert (
+                    "recovered after tool error" in recovered
+                ), f"reply did not follow the tool_error frame: {frames}"
+
+                await ws.send(
+                    json.dumps({"type": "input", "content": "second turn probe"})
+                )
+                second = await asyncio.wait_for(
+                    _recv_chat_turn(ws, "second turn reply"), timeout=OP_TIMEOUT
+                )
+                assert not [
+                    f for f in second if f.get("type") == "error"
+                ], f"second turn on the same chat WS reported an error: {second}"
 
 
 # ===========================================================================

@@ -13,6 +13,7 @@ failure, push detection down into a unit test FIRST, then fix.
 import asyncio
 
 import pytest
+from fastapi import WebSocketDisconnect
 
 from kohakuterrarium.api.routes.identity.grok import grok_usage
 from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
@@ -50,6 +51,7 @@ from kohakuterrarium.studio.studio import Studio
 from kohakuterrarium.studio.sessions import lifecycle as session_lifecycle
 from kohakuterrarium.session.readonly import read_session_meta
 from kohakuterrarium.terrarium.graph_manifest import MANIFEST_KEY
+from kohakuterrarium.studio.attach.io import attach_io
 from kohakuterrarium.studio.catalog.packages import install_package_op
 from kohakuterrarium.terrarium import Terrarium
 from kohakuterrarium.terrarium.drive.config import (
@@ -125,6 +127,19 @@ def scripted_llm(monkeypatch):
                 response="bravo got it",
                 match="hello-from-alpha",
             ),
+            ScriptEntry(
+                response=(
+                    "[/send_channel]\n"
+                    "@@channel=attach-missing-ch\n"
+                    "@@message=probe\n"
+                    "[send_channel/]"
+                ),
+                match="attach probe",
+            ),
+            ScriptEntry(
+                response="attach-recovered-reply",
+                match="attach-missing-ch",
+            ),
             ScriptEntry(response="generic-reply-1"),
             ScriptEntry(response="generic-reply-2"),
             ScriptEntry(response="generic-reply-3"),
@@ -140,6 +155,42 @@ def scripted_llm(monkeypatch):
     monkeypatch.setattr(_bootstrap_llm_mod, "create_llm_provider", _create)
     monkeypatch.setattr(_agent_init_mod, "create_llm_provider", _create)
     return holder
+
+
+class _AttachWebSocket:
+    """Controller-side WebSocket double for driving ``attach_io``."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+        self._inbound: asyncio.Queue = asyncio.Queue()
+        self._arrived = asyncio.Event()
+
+    def push(self, frame: dict) -> None:
+        self._inbound.put_nowait(frame)
+
+    def disconnect(self) -> None:
+        self._inbound.put_nowait(None)
+
+    async def send_json(self, frame: dict) -> None:
+        self.sent.append(frame)
+        self._arrived.set()
+
+    async def receive_json(self) -> dict:
+        frame = await self._inbound.get()
+        if frame is None:
+            raise WebSocketDisconnect()
+        return frame
+
+    async def wait_for(self, predicate, timeout: float = 10.0) -> dict:
+        async def _scan() -> dict:
+            while True:
+                for frame in self.sent:
+                    if predicate(frame):
+                        return frame
+                self._arrived.clear()
+                await self._arrived.wait()
+
+        return await asyncio.wait_for(_scan(), timeout)
 
 
 def _attach_worker_stack(engine: Terrarium, client: ClientConnector, session_dir):
@@ -558,6 +609,38 @@ class TestLaboratoryMultiNodeService:
                 import traceback
 
                 traceback.print_exc()
+
+            # ── 16c. Studio attaches to remote alpha; a tool call fails ──
+            # Driven like api/ws/io.py. The tool_error frame's string ``error``
+            # field is payload: the turn's reply and idle must still arrive.
+            attach_ws = _AttachWebSocket()
+            attach_task = asyncio.create_task(
+                attach_io(
+                    attach_ws, service, alpha_info.graph_id, alpha_info.creature_id
+                )
+            )
+            try:
+                attach_ws.push({"type": "input", "content": "attach probe"})
+                idle = await attach_ws.wait_for(lambda f: f.get("type") == "idle")
+                tool_error = next(
+                    f for f in attach_ws.sent if f.get("type") == "tool_error"
+                )
+                assert "attach-missing-ch" in tool_error["error"]
+                after_error = attach_ws.sent[
+                    attach_ws.sent.index(tool_error) : attach_ws.sent.index(idle)
+                ]
+                reply = "".join(
+                    f.get("content", "") for f in after_error if f.get("type") == "text"
+                )
+                assert "attach-recovered-reply" in reply
+                attach_ws.disconnect()
+                with pytest.raises(WebSocketDisconnect):
+                    await asyncio.wait_for(attach_task, timeout=5.0)
+            finally:
+                if not attach_task.done():
+                    attach_ws.disconnect()
+                    attach_task.cancel()
+                    await asyncio.gather(attach_task, return_exceptions=True)
 
             # ── 17. cross-node output wiring via the service Protocol ──
             # The TerrariumOutputWireAdapter routes this through the
