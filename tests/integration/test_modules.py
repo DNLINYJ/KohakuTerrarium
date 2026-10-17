@@ -760,7 +760,9 @@ class TestModulesIntegration:
         # Turn 2 installs a scheduler via the universal trigger tool.
         agent = make_agent(
             script=[
-                ScriptEntry("timer acknowledged", match="heartbeat check"),
+                ScriptEntry(
+                    "timer acknowledged", match="heartbeat check", delay_per_chunk=0.05
+                ),
                 ScriptEntry(
                     "[/add_schedule]@@every_minutes=30\n@@prompt=cron tick\n"
                     "[add_schedule/]",
@@ -778,11 +780,20 @@ class TestModulesIntegration:
         agent.executor.register_tool(sched_tool)
 
         fired: list = []
+        processed = asyncio.get_running_loop().create_future()
         original = agent._process_event
 
         async def _spy(event):
             fired.append(event)
-            return await original(event)
+            try:
+                result = await original(event)
+            except BaseException as exc:
+                if not processed.done():
+                    processed.set_exception(exc)
+                raise
+            if not processed.done():
+                processed.set_result(result)
+            return result
 
         agent._process_event = _spy  # observe events the manager delivers
         agent.trigger_manager._process_event = _spy
@@ -796,12 +807,7 @@ class TestModulesIntegration:
             trigger_id = await agent.add_trigger(trigger, trigger_id="hb")
             assert trigger_id == "hb"
 
-            # Give the trigger manager's loop task a chance to fire +
-            # deliver the event into _process_event.
-            for _ in range(20):
-                if fired:
-                    break
-                await asyncio.sleep(0.02)
+            assert await asyncio.wait_for(processed, timeout=10) is True
 
             assert len(fired) == 1
             event = fired[0]
