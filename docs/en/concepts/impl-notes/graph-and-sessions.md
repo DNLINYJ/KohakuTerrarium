@@ -54,7 +54,7 @@ freeze the topology at start) breaks one of those three.
 
 ## What we actually do
 
-### Pure-data graph (`terrarium/topology.py`)
+### Pure-data graph (`terrarium/graph/topology.py`)
 
 Topology lives in a plain `TopologyState` value:
 
@@ -172,8 +172,8 @@ channel, and resubscribes against the new live one. The
 `apply_split_bookkeeping` and `_merge_environment_into` paths call
 this for every affected creature × channel pair.
 
-### Recipe as the source of truth on resume (`terrarium/resume.py`,
-`terrarium/recipe.py`)
+### Recipe as the source of truth on resume (`terrarium/resume/resume.py`,
+`terrarium/recipe/loader.py`)
 
 `resume_into_engine` does **not** persist the live topology to disk
 and play it back. It loads `meta.config_path` (the recipe path
@@ -210,27 +210,27 @@ topology returns to the recipe's natural shape.
 
 ## Where it lives in the code
 
-- `src/kohakuterrarium/terrarium/topology.py`: `TopologyState`,
+- `src/kohakuterrarium/terrarium/graph/topology.py`: `TopologyState`,
   `GraphTopology`, `TopologyDelta`, pure mutation functions,
   `find_components`, `_normalize_components`, `_merge_graphs`.
-- `src/kohakuterrarium/terrarium/engine.py`: `Terrarium`
+- `src/kohakuterrarium/terrarium/engine/engine.py`: `Terrarium`
   orchestrator. `add_creature`, `remove_creature`, `connect`,
   `disconnect`, `add_channel`, `remove_channel`, plus the
   environment / session-store registries.
-- `src/kohakuterrarium/terrarium/channels.py`: `connect_creatures`,
+- `src/kohakuterrarium/terrarium/channels/channels.py`: `connect_creatures`,
   `_merge_environment_into`, `_ensure_channel_persistence`,
   `inject_channel_trigger`, `_teardown_existing_trigger`.
-- `src/kohakuterrarium/terrarium/channel_lifecycle.py`:
+- `src/kohakuterrarium/terrarium/channels/lifecycle.py`:
   `apply_split_bookkeeping`, channel removal flow, environment
   reallocation.
-- `src/kohakuterrarium/terrarium/session_coord.py`: `apply_merge`,
+- `src/kohakuterrarium/terrarium/session/coord.py`: `apply_merge`,
   `apply_split`, `merge_session_stores`, `split_session_store`,
   `copy_events_into`, meta refresh helpers.
 - `src/kohakuterrarium/terrarium/runtime_prompt.py`: event-driven
   per-creature prompt refresh on `TOPOLOGY_CHANGED`,
   `CREATURE_STARTED`, `CREATURE_STOPPED`, `OUTPUT_WIRE_ADDED`,
   `OUTPUT_WIRE_REMOVED`, `PARENT_LINK_CHANGED`.
-- `src/kohakuterrarium/terrarium/resume.py`: `resume_into_engine`,
+- `src/kohakuterrarium/terrarium/resume/resume.py`: `resume_into_engine`,
   recipe-driven topology reconstruction.
 - `src/kohakuterrarium/terrarium/events.py`: `EngineEvent` taxonomy,
   `EventFilter`.

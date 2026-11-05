@@ -55,7 +55,7 @@ def build_events_payload(
         raise NotFoundError(f"Agent not found in session: {agent}")
 
     type_set = parse_type_filter(types)
-    rows = store.get_events(agent)
+    rows = store._iter_events(agent)
 
     out: list[dict] = []
     for ev in rows:

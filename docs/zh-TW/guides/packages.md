@@ -137,6 +137,57 @@ KohakuTerrarium 自己所在的環境。傳 `--no-deps` 可以跳過；
 - 程序性 skill 是例外：後者勝出 (last-wins)，作用域較窄的
   (專案 / 使用者 / 生物) 覆蓋套件附帶的版本。
 
+### 自訂 LLM 後端 (`llm_backends:`)
+
+套件可以在內建的 `openai`、`anthropic`、`codex` 等類型之外，新增一種後端類型
+(與模型溝通的傳輸層)：
+
+```yaml
+llm_backends:
+  - name: my-transport              # 成為合法的 backend_type
+    module: my_pack.provider
+    class: MyProvider
+    display_name: My transport      # 選填，顯示在設定頁
+    description: 設定頁上的一行說明。
+    credentials: api_key            # api_key (預設) | external | none
+
+llm_presets:
+  - name: my-model
+    provider: my-transport          # 上面的後端名稱
+    model: real-model-id
+    max_context: 200000
+```
+
+該類別繼承 `kohakuterrarium.llm.base.BaseLLMProvider`，並提供一個由已解析
+profile 建立實例的類別方法：
+
+```python
+from kohakuterrarium.llm.base import BaseLLMProvider, LLMConfig
+
+
+class MyProvider(BaseLLMProvider):
+    @classmethod
+    def from_profile(cls, profile):
+        return cls(LLMConfig(model=profile.model))
+
+    async def _stream_chat(self, messages, *, tools=None, **kwargs):
+        yield "..."
+
+    @classmethod
+    def doctor(cls) -> str:          # 選填：由 `kt doctor` 顯示
+        return "ready"
+```
+
+- 所有建立模型的路徑都會使用它：`kt run`、YAML 設定、設定頁、`/model`
+  切換、壓縮模型以及子代理。
+- 已安裝的套件會提供一筆同名的 provider 記錄。它不會寫入你的
+  `llm_profiles.yaml`，解除安裝套件後就會消失。
+- `credentials: external` (或 `none`) 表示後端自行處理登入：
+  KohakuTerrarium 不會為它索取、儲存或檢查 API 金鑰，`kt login <name>`
+  只會印出提示。
+- 探索階段只讀取 manifest；模組在第一次建立該後端的 profile 時才匯入。
+- 與內建後端類型同名的項目會被忽略。兩個套件宣告同一個名稱會報錯。
+
 ## 安裝模式
 
 ### 市集 spec (`@name`)

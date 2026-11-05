@@ -9,7 +9,17 @@ import asyncio
 
 from kohakuterrarium import validate
 from kohakuterrarium.cli.shims import shims_summary
-from kohakuterrarium.llm.profiles import get_default_model
+from kohakuterrarium.serving.desktop.webview_probe import (
+    describe as describe_native_window,
+)
+from kohakuterrarium.llm.profiles.backend_registry import (
+    backend_doctor,
+    package_backend,
+)
+from kohakuterrarium.llm.profiles.resolve import (
+    get_default_model,
+    resolve_controller_llm,
+)
 from kohakuterrarium.packages.walk import list_packages
 from kohakuterrarium.utils.config_dir import config_dir
 from kohakuterrarium.utils.logging import get_logger
@@ -24,6 +34,14 @@ def _check(label: str, fn) -> tuple[bool, str]:
         return True, str(out) if out is not None else ""
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
+
+
+def _package_backend_type(selector: str | None) -> str:
+    """The selector's backend type when a package provides it, else ``""``."""
+    profile = resolve_controller_llm({}, llm=selector)
+    if profile is None or package_backend(profile.backend_type) is None:
+        return ""
+    return profile.backend_type
 
 
 def doctor_cli(
@@ -67,13 +85,20 @@ def doctor_cli(
 
     # Shim status is informational and never raises for missing installations.
     run("terminal shims", shims_summary)
+    run("desktop window", describe_native_window)
 
     selector = llm or get_default_model() or None
     if selector or llm is None:
-        run(
+        resolved = run(
             f"llm resolves ({selector or 'default'})",
             lambda: validate.llm(selector),
         )
+        backend_type = _package_backend_type(selector) if resolved else ""
+        if backend_type:
+            run(
+                f"backend status ({backend_type})",
+                lambda: backend_doctor(backend_type) or "no status check",
+            )
 
     if target:
 

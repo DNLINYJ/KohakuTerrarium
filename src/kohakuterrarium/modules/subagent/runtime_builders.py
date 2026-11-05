@@ -1,9 +1,10 @@
 """Runtime builder helpers for SubAgentManager."""
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from kohakuterrarium.core.compact import CompactConfig, CompactManager
+from kohakuterrarium.core.compact.manager import CompactConfig, CompactManager
 from kohakuterrarium.core.loader import ModuleLoader
 from kohakuterrarium.llm.base import LLMProvider
 from kohakuterrarium.modules.plugin.base import PluginContext
@@ -12,9 +13,26 @@ from kohakuterrarium.modules.subagent.config import SubAgentConfig
 from kohakuterrarium.modules.subagent.model_resolve import (  # noqa: F401
     resolve_subagent_llm as resolve_llm,
 )
+from kohakuterrarium.utils.file.guard import FileReadState
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def fork_tool_context(builder, child):
+    """Keep location guards while isolating a child's read-before-write state."""
+    read_state = FileReadState()
+
+    def build():
+        context = builder()
+        return replace(
+            context,
+            agent_name=child.config.name,
+            file_read_state=read_state,
+            runtime_services=dict(context.runtime_services),
+        )
+
+    return build
 
 
 def build_plugin_manager(

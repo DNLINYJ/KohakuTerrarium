@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 
 import {
   buildEditedMessageParts,
@@ -103,6 +103,44 @@ describe("order-preserving inline editor helpers", () => {
       file: { name: "note.txt", path: "/workspace/other.txt", mime: "text/plain" },
     },
   ]
+
+  it("copies draft and output containers without serializing inline strings", async () => {
+    const source = [
+      { type: "text", text: "caption", extra: { nested: [{ value: "text" }] } },
+      {
+        type: "file",
+        file: { name: "a.bin", data_base64: "A".repeat(1024 * 1024) },
+        extension: { nested: [{ value: "original" }] },
+      },
+      { type: "vendor", extension: { nested: [null, { keep: true }] } },
+    ]
+    const stringify = vi.spyOn(JSON, "stringify")
+    const parse = vi.spyOn(JSON, "parse")
+    try {
+      const draft = contentToEditableDraft(source)
+      draft.attachments[0].existingPart.extension.nested[0].value = "attachment"
+      draft.sourceContent[0].extra.nested[0].value = "draft"
+      expect(source[0].extra.nested[0].value).toBe("text")
+      expect(source[1].extension.nested[0].value).toBe("original")
+      expect(draft.sourceContent[1].extension.nested[0].value).toBe("original")
+      const output = await buildEditedMessageParts(
+        draft.sourceContent,
+        "changed",
+        draft.attachments,
+      )
+      output[1].extension.nested[0].value = "output"
+      output[2].extension.nested[1].keep = false
+      expect(draft.attachments[0].existingPart.extension.nested[0].value).toBe("attachment")
+      expect(source[2].extension.nested[1].keep).toBe(true)
+      expect(draft.sourceContent[2].extension.nested[1].keep).toBe(true)
+      expect(output[1].file.data_base64).toBe(source[1].file.data_base64)
+      expect(stringify).not.toHaveBeenCalled()
+      expect(parse).not.toHaveBeenCalled()
+    } finally {
+      stringify.mockRestore()
+      parse.mockRestore()
+    }
+  })
 
   it("captures original-block indices and does not regroup history order", () => {
     const draft = contentToEditableDraft(original)

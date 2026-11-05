@@ -1,12 +1,31 @@
 import { onBeforeUnmount, onMounted, watch } from "vue"
 
-import { subscribeAttention, subscribeAttentionEdges, totalAttention } from "@/stores/attention"
+import { dispatchToChannels } from "@/ext/notificationChannels"
+import {
+  attentionOverview,
+  firstAttentionTarget,
+  subscribeAttention,
+  subscribeAttentionEdges,
+  totalAttention,
+} from "@/stores/attention"
+import { useShellSettings } from "@/composables/useShellSettings"
 import { useAttentionPrefs } from "@/stores/attentionPrefs"
+import { useChatStore } from "@/stores/chat"
+import { showActionToast } from "@/utils/actionNotification"
 import { attentionTargetLabel, navigateToAttention } from "@/utils/attentionNavigation"
+import {
+  desktopCapabilities,
+  hasDesktopHost,
+  hostSupports,
+  onHostReady,
+  requestDesktopAttention as requestHostAttention,
+  setAttentionState,
+  showDesktopNotification,
+} from "@/utils/hostBridge"
 import { useI18n } from "@/utils/i18n"
 
-const DESKTOP_PROTOCOL = 1
 const AUDIO_UNLOCK_EVENT = "kt:attention-audio-unlock"
+const FOCUS_ATTENTION_EVENT = "kt:desktop-focus-attention"
 
 export function requestAttentionAudioUnlock() {
   document.dispatchEvent(new Event(AUDIO_UNLOCK_EVENT))
@@ -23,32 +42,28 @@ export async function requestNotificationPermission() {
 
 export function useAttentionEffects() {
   const prefs = useAttentionPrefs()
+  const shell = useShellSettings()
   const { t } = useI18n()
   let unsubscribeEdges
   let unsubscribeAttention
-  let desktopSurface = Boolean(window.pywebview?.api)
-  let desktopCapabilities = null
+  let desktopSurface = hasDesktopHost()
+  let hostCapabilities = null
+  let stopHostReady = () => {}
   let audioContext = null
   let favicons = []
   let originalFavicons = []
   let pendingDesktopAttention = false
+  let lastBadge = ""
 
   async function detectDesktopSurface() {
-    const api = window.pywebview?.api
-    if (!api) return
+    if (!hasDesktopHost()) return
     desktopSurface = true
-    try {
-      const capabilities = await api.get_desktop_capabilities?.()
-      if (capabilities?.surface === "desktop" && capabilities.protocol === DESKTOP_PROTOCOL) {
-        desktopCapabilities = capabilities
-        if (pendingDesktopAttention) {
-          pendingDesktopAttention = false
-          requestDesktopAttention()
-        }
-      }
-    } catch {
-      desktopCapabilities = null
+    hostCapabilities = await desktopCapabilities()
+    if (hostCapabilities && pendingDesktopAttention) {
+      pendingDesktopAttention = false
+      requestDesktopAttention()
     }
+    publishTrayBadge()
   }
 
   function unlockAudio() {
@@ -127,27 +142,106 @@ export function useAttentionEffects() {
     }
   }
 
+  function notifyDesktop(event) {
+    if (
+      !desktopSurface ||
+      hostCapabilities?.notifications !== true ||
+      !prefs.state.systemNotifications
+    ) {
+      return
+    }
+    const enabled =
+      (event.kind === "waiting-input" && prefs.state.notifyWaiting) ||
+      (event.kind === "completed" && prefs.state.notifyCompletion)
+    if (!enabled) return
+    const actions = toastActions(event)
+    if (actions.length) {
+      void notifyWithActions(event, actions)
+      return
+    }
+    const { title, body } = notificationContent(event)
+    void showDesktopNotification(title, body)
+  }
+
+  /** The buttons a notification may carry: answers that do not need a second look. */
+  function toastActions(event) {
+    if (
+      event.kind !== "waiting-input" ||
+      hostCapabilities?.notificationActions !== true ||
+      shell.settings.value?.notifyActions !== true
+    ) {
+      return []
+    }
+    return (event.options || []).filter((option) => option.style !== "secondary")
+  }
+
+  async function notifyWithActions(event, actions) {
+    const target = attentionTargetLabel(event)
+    const detail = prefs.state.notificationPreview ? event.detail : ""
+    const shown = await showActionToast(
+      {
+        title: event.prompt || t("attention.notify.waitingTitle"),
+        body: [target, detail].filter(Boolean).join(" · "),
+        actions: actions.map(({ id, label }) => ({ id, label })),
+      },
+      (id) => {
+        const answered = id && useChatStore(event.scope).submitUIReply(event.tab, event.eventId, id)
+        if (!answered) navigateToAttention(event)
+      },
+    )
+    if (!shown) {
+      const content = notificationContent(event)
+      void showDesktopNotification(content.title, content.body)
+    }
+  }
+
   function requestDesktopAttention() {
-    const api = window.pywebview?.api
-    if (!desktopSurface || !prefs.state.desktopAttention || !api?.request_desktop_attention) return
-    if (desktopCapabilities === null) {
+    if (!desktopSurface || !prefs.state.desktopAttention) return
+    if (!hostSupports("request_desktop_attention")) return
+    if (hostCapabilities === null) {
       pendingDesktopAttention = true
       return
     }
-    if (desktopCapabilities.nativeAttention !== true) return
-    void api.request_desktop_attention().catch(() => {})
+    if (hostCapabilities.nativeAttention !== true) return
+    void requestHostAttention()
+  }
+
+  function forwardToChannels(event) {
+    const enabled =
+      (event.kind === "waiting-input" && prefs.state.notifyWaiting) ||
+      (event.kind === "completed" && prefs.state.notifyCompletion)
+    if (!enabled) return
+    const { title, body } = notificationContent(event)
+    void dispatchToChannels({ kind: event.kind, title, body, target: attentionTargetLabel(event) })
   }
 
   function onEdge(event) {
+    forwardToChannels(event)
     const inactive = document.hidden || !document.hasFocus()
     if (inactive) {
       requestDesktopAttention()
       notifyBrowser(event)
+      notifyDesktop(event)
     }
     playSound(event.kind)
   }
 
+  function publishTrayBadge() {
+    if (!desktopSurface || hostCapabilities?.trayBadge !== true) return
+    const overview = attentionOverview()
+    const key = JSON.stringify(overview)
+    if (key === lastBadge) return
+    lastBadge = key
+    void setAttentionState(overview)
+  }
+
+  function openFirstAttention() {
+    const target = firstAttentionTarget()
+    if (target) navigateToAttention(target)
+  }
+
   function updateFavicon() {
+    publishTrayBadge()
     if (favicons.length === 0) return
     const summary = totalAttention()
     const showBadge = prefs.state.faviconBadge && (summary.pending > 0 || summary.completed > 0)
@@ -169,8 +263,8 @@ export function useAttentionEffects() {
     document.addEventListener("pointerdown", unlockAudio, { passive: true })
     document.addEventListener("keydown", unlockAudio)
     document.addEventListener(AUDIO_UNLOCK_EVENT, unlockAudio)
-    window.addEventListener("pywebviewready", detectDesktopSurface)
-    void detectDesktopSurface()
+    stopHostReady = onHostReady(detectDesktopSurface)
+    window.addEventListener(FOCUS_ATTENTION_EVENT, openFirstAttention)
     updateFavicon()
   })
 
@@ -180,7 +274,8 @@ export function useAttentionEffects() {
     document.removeEventListener("pointerdown", unlockAudio)
     document.removeEventListener("keydown", unlockAudio)
     document.removeEventListener(AUDIO_UNLOCK_EVENT, unlockAudio)
-    window.removeEventListener("pywebviewready", detectDesktopSurface)
+    stopHostReady()
+    window.removeEventListener(FOCUS_ATTENTION_EVENT, openFirstAttention)
     favicons.forEach((favicon, index) => {
       const original = originalFavicons[index]
       if (original !== null) favicon.href = original

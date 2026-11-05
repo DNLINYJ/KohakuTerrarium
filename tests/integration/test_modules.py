@@ -7,14 +7,14 @@ implementations into a *real* :class:`Agent` and drives them the same
 way the production runtime does:
 
 * ``bootstrap/*`` builds the agent and wires modules into it.
-* ``core/executor.py`` fires plugin ``pre_tool_execute`` /
+* ``core/jobs/executor.py`` fires plugin ``pre_tool_execute`` /
   ``post_tool_execute`` around every tool call (and a
   ``PluginBlockError`` in a pre-hook becomes the tool result).
 * ``core/trigger_manager.py`` runs each trigger's ``wait_for_trigger``
   loop and feeds the produced ``TriggerEvent`` into ``_process_event``.
 * ``modules/subagent/manager.py`` spawns sub-agents; results route back
   into the parent controller's conversation.
-* ``modules/output/router.py`` runs the parse-event state machine.
+* ``modules/output/router/router.py`` runs the parse-event state machine.
 * ``bootstrap/agent_init.py`` wires slash commands; ``inject_input``
   with a ``/command`` string dispatches them against the live agent.
 
@@ -27,42 +27,57 @@ Each method runs ONE complete workflow end-to-end.
 
 import asyncio
 import json
+from collections import deque
+from contextlib import closing
+from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 from PIL import Image
 
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
+from kohakuterrarium.builtins.cli_rich.output import RichCLIOutput
+from kohakuterrarium.builtins.plugins.apps.plugin import AppsPlugin
 from kohakuterrarium.builtins.plugins.budget.plugin import BudgetPlugin
 from kohakuterrarium.builtins.plugins.sandbox.plugin import SandboxPlugin
-from kohakuterrarium.builtins.subagents.research import RESEARCH_CONFIG
-from kohakuterrarium.builtins.tools import web_search
-from kohakuterrarium.builtins.tools.canvas_image import CanvasImageTool
-from kohakuterrarium.builtins.tools.edit import EditTool
-from kohakuterrarium.builtins.tools.read import ReadTool
-from kohakuterrarium.builtins.tools.glob import GlobTool
-from kohakuterrarium.builtins.tools.grep import GrepTool
-from kohakuterrarium.builtins.tools.web_search import WebSearchTool
+from kohakuterrarium.builtins.plugins.sandbox.confine import confinement_backend
+from kohakuterrarium.builtins.plugins.sandbox import roots
+from kohakuterrarium.builtins.plugins.ui_declarative.plugin import UiDeclarativePlugin
+from kohakuterrarium.builtins.tools.web import deepseek as deepseek_web
+from kohakuterrarium.builtins.tools.web import fetch as web_fetch
+from kohakuterrarium.builtins.tools.web import search as web_search
+from kohakuterrarium.builtins.tools.media.canvas_image import CanvasImageTool
+from kohakuterrarium.builtins.tools.files.edit import EditTool
+from kohakuterrarium.builtins.tools.files.read import ReadTool
+from kohakuterrarium.builtins.tools.bash.bash import ShellTool
+from kohakuterrarium.builtins.tools.files.glob import GlobTool
+from kohakuterrarium.builtins.tools.files.grep import GrepTool
+from kohakuterrarium.builtins.tools.web.search import WebSearchTool
+from kohakuterrarium.builtins.tools.web.fetch import WebFetchTool
 from kohakuterrarium.core.agent import Agent
-from kohakuterrarium.core.config_types import (
+from kohakuterrarium.core.config.types import (
     AgentConfig,
     InputConfig,
     OutputConfig,
     OutputConfigItem,
 )
 from kohakuterrarium.core.events import EventType, create_user_input_event
+from kohakuterrarium.errors import RendererUnavailable
 from kohakuterrarium.llm.message import ImagePart, TextPart
 from kohakuterrarium.modules.output.event import OutputEvent, UIReply
-from kohakuterrarium.modules.output.router import OutputRouter
-from kohakuterrarium.modules.output.router_multi import MultiOutputRouter
+from kohakuterrarium.modules.output.router.router import OutputRouter
+from kohakuterrarium.modules.output.router.multi import MultiOutputRouter
+from kohakuterrarium.modules.output.widgets.service import WidgetMessage
 from kohakuterrarium.modules.plugin.base import (
     BasePlugin,
     PluginBlockError,
     PluginContext as RuntimePluginContext,
+    PluginLockedError,
     ToolVisibility,
 )
-from kohakuterrarium.modules.plugin.manager import PluginManager
+from kohakuterrarium.modules.plugin.manager.manager import PluginManager
 from kohakuterrarium.modules.subagent.base import SubAgent
 from kohakuterrarium.modules.subagent.config import (
     ContextUpdateMode,
@@ -79,6 +94,7 @@ from kohakuterrarium.modules.tool.base import (
     ToolResult,
 )
 from kohakuterrarium.modules.tool.media_policy import MediaPolicy
+from kohakuterrarium.session.history.replay import replay_conversation
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.modules.trigger.timer import TimerTrigger
 from kohakuterrarium.modules.user_command.base import (
@@ -98,9 +114,11 @@ from kohakuterrarium.parsing import (
     ToolCallEvent,
 )
 from kohakuterrarium.skills.registry import Skill
+from kohakuterrarium.studio.attach._event_stream import StreamOutput
+from kohakuterrarium.studio.attach.widget_frames import handle_widget_msg
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
 from kohakuterrarium.testing.output import OutputRecorder
-from kohakuterrarium.utils.file_guard import PathBoundaryGuard
+from kohakuterrarium.utils.file.guard import PathBoundaryGuard
 
 pytestmark = pytest.mark.timeout(60)
 
@@ -110,6 +128,20 @@ pytestmark = pytest.mark.timeout(60)
 # These are ordinary subclasses of the public ``modules/`` base
 # classes — exactly what a framework user would write.
 # ─────────────────────────────────────────────────────────────────────
+
+
+class ForkableScriptedLLM(ScriptedLLM):
+    """Script isolated side runs without changing ScriptedLLM's shared behavior."""
+
+    def __init__(self, script, side_scripts):
+        super().__init__(script)
+        self.side_scripts = list(side_scripts)
+        self.children = []
+
+    def fork(self):
+        child = ScriptedLLM(self.side_scripts.pop(0))
+        self.children.append(child)
+        return child
 
 
 class RecordingTool(BaseTool):
@@ -164,6 +196,35 @@ class VisibilityProbeTool(BaseTool):
         return ToolResult(output="visibility probe ran")
 
 
+class _TerminalOverlay:
+    """Rich CLI bus overlay stand-in that records what it was asked to show."""
+
+    def __init__(self) -> None:
+        self.opened: list = []
+        self.pending_event_ids: set[str] = set()
+        self.on_reply = None
+
+    def open(self, event, *, router=None) -> None:
+        self.opened.append((event, router))
+
+    def on_supersede(self, event_id) -> None:
+        self.pending_event_ids.discard(event_id)
+
+
+class _TerminalApp:
+    """The parts of RichCLIApp that RichCLIOutput draws widgets through."""
+
+    def __init__(self) -> None:
+        self.bus_overlay = _TerminalOverlay()
+        self.cards: list[dict] = []
+
+    def _invalidate(self) -> None:
+        pass
+
+    def on_card_event(self, payload: dict) -> None:
+        self.cards.append(payload)
+
+
 class _DeepSeekResponse:
     status_code = 200
 
@@ -206,6 +267,25 @@ class _DeepSeekClient:
 
     async def post(self, url, **kwargs):
         self.capture.append((url, kwargs["json"]))
+        if url.endswith("/tools/search"):
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "title": "Direct source",
+                            "url": "https://example.com/source",
+                            "summary": "Direct summary",
+                            "snippet": "Snippet",
+                            "content": "Included body",
+                        }
+                    ]
+                },
+            )
+        if url.endswith("/tools/fetch"):
+            return httpx.Response(
+                200, json={"title": "Direct page", "content": "# Fetched page"}
+            )
         return _DeepSeekResponse()
 
 
@@ -402,7 +482,7 @@ def llm_box(monkeypatch):
     box = _Box()
 
     def _fake_create(config, llm=None):
-        return ScriptedLLM(box.script)
+        return llm if llm is not None else ScriptedLLM(box.script)
 
     monkeypatch.setattr(_bootstrap_llm, "create_llm_provider", _fake_create)
     monkeypatch.setattr(_agent_init, "create_llm_provider", _fake_create)
@@ -474,7 +554,9 @@ class TestModulesIntegration:
     """End-to-end workflows exercising each ``modules/`` protocol through
     a real :class:`Agent`."""
 
-    async def test_plugin_hooks_wrap_a_real_tool_call(self, make_agent, tmp_path):
+    async def test_plugin_hooks_wrap_a_real_tool_call(
+        self, make_agent, tmp_path, monkeypatch
+    ):
         """plugin protocol — the FULL hook surface fires through a real
         agent run: tool pre/post hooks (incl. arg rewrite + a
         ``PluginBlockError`` veto), LLM pre/post hooks, lifecycle
@@ -482,8 +564,8 @@ class TestModulesIntegration:
         ``on_agent_stop`` / ``on_unload``), runtime prompt contribution,
         and ``applies_to`` declarative gating.
 
-        Mirrors: ``core/executor.py`` wrapping ``tool.execute``,
-        ``core/controller.py`` firing ``pre_llm_call`` /
+        Mirrors: ``core/jobs/executor.py`` wrapping ``tool.execute``,
+        ``core/controller/controller.py`` firing ``pre_llm_call`` /
         ``post_llm_call``, ``core/agent.py`` + ``agent_lifecycle`` +
         ``agent_handlers`` firing the lifecycle callbacks, and
         ``PluginManager._applicable_plugins`` enforcing ``applies_to``.
@@ -553,11 +635,20 @@ class TestModulesIntegration:
             "recorder",
             "skill",
             "visibility_probe",
+            "fork",
         }
         assert mgr.enable("tool_visibility") is True
         assert [s.name for s in agent.controller._get_native_tool_schemas()] == [
             "recorder"
         ]
+        # The same restriction governs the text-format prompt the toggle
+        # rebuilt: hidden tools are not listed for the model either.
+        listing = agent.get_system_prompt().split("## Available Functions", 1)[1]
+        assert "`recorder`" in listing and "`visibility_probe`" not in listing
+        assert mgr.disable("tool_visibility") is True
+        listing = agent.get_system_prompt().split("## Available Functions", 1)[1]
+        assert "`visibility_probe`" in listing
+        assert mgr.enable("tool_visibility") is True
 
         await agent.start()
         # on_agent_start fired on agent.start().
@@ -732,6 +823,35 @@ class TestModulesIntegration:
             denied = await agent.executor.wait_for(denied_job)
             assert "SandboxViolation[fs_read]" in denied.error
             assert "blocked.txt" not in denied.output
+            if confinement_backend() is not None:
+                # pytest's base temp lies under /tmp on Linux, a writable root.
+                monkeypatch.setattr(roots, "temp_roots", lambda: [])
+                # The kernel, not the command, decides: a shell that deletes
+                # outside the workspace fails, writes inside it still land.
+                agent.executor.register_tool(ShellTool())
+                rm_job = await agent.executor.submit(
+                    "bash",
+                    {"command": f"rm -f '{outside / 'blocked.txt'}'"},
+                    is_direct=True,
+                )
+                rm_result = await agent.executor.wait_for(rm_job)
+                assert rm_result.exit_code != 0
+                assert (outside / "blocked.txt").read_text(
+                    encoding="utf-8"
+                ) == "outside"
+                write_job = await agent.executor.submit(
+                    "bash", {"command": "echo made > made.txt"}, is_direct=True
+                )
+                assert (await agent.executor.wait_for(write_job)).exit_code == 0
+                assert (work / "made.txt").read_text(encoding="utf-8") == "made\n"
+            # Once locked, neither a disable nor a workspace move can widen it.
+            mgr.set_plugin_options("sandbox", {"locked": True})
+            with pytest.raises(PluginLockedError):
+                agent.workspace.set(outside)
+            with pytest.raises(PluginLockedError):
+                mgr.disable("sandbox")
+            assert agent.executor._working_dir == work
+            assert mgr.is_enabled("sandbox")
             # should_proceed with no veto hooks → True (nothing vetoes).
             assert (
                 await mgr.should_proceed("on_compact_start", context_length=10) is True
@@ -743,6 +863,28 @@ class TestModulesIntegration:
         # Explicit teardown fires on_unload.
         await mgr.unload_all()
         assert plugin.lifecycle[-1] == "on_unload"
+
+        # Contexts from two real creatures share a store but keep plugin state private.
+        other = make_agent()
+        other.config.name = "other_modules_agent"
+        state_path = tmp_path / "plugin-state.kohakutr"
+        with closing(SessionStore(state_path)) as store:
+            agent.attach_session_store(store)
+            other.attach_session_store(store)
+            peer = RuntimePluginContext(
+                agent_name=other.config.name,
+                _host_agent=other,
+                _plugin_name=ctx._plugin_name,
+            )
+            ctx.set_state("turns", 7)
+            peer.set_state("turns", 2)
+            assert ctx.get_state("turns") == 7
+            assert peer.get_state("turns") == 2
+        with closing(SessionStore(state_path)) as reopened:
+            agent.attach_session_store(reopened)
+            other.attach_session_store(reopened)
+            assert ctx.get_state("turns") == 7
+            assert peer.get_state("turns") == 2
 
     async def test_trigger_produces_event_and_drives_a_turn(self, make_agent):
         """trigger protocol — a real :class:`TimerTrigger` is hot-plugged
@@ -1139,6 +1281,130 @@ class TestModulesIntegration:
             assert "## Available Sub-Agents" in sa_prompt
             assert "- worker: Background worker sub-agent." in sa_prompt
             assert not hasattr(agent.subagent_manager, "_max_depth")
+
+            side_llm = ForkableScriptedLLM(
+                ["parent remains independent"],
+                [
+                    ["Side finding: logs are healthy."],
+                    ["Follow-up: inspect timestamps."],
+                ],
+            )
+            agent.llm = agent.controller.llm = agent.subagent_manager.llm = side_llm
+            before = agent.capture_context()
+            replay_before = replay_conversation(store.get_events("modules_agent"))
+            assert "worker finished" in str(replay_before)
+            # Persistence elsewhere in the session advances its global cursor
+            # without changing this parent's effective context.
+            _, other_event_id = store.append_event(
+                "other_creature", "assistant_message", {"content": "Independent update"}
+            )
+            command = agent.list_user_commands()["btw"]
+            context = UserCommandContext(agent=agent)
+            started = await command.execute("What did the logs show?", context)
+            assert started.success, started.error
+            source = started.data["source"]
+            assert source == {
+                **before.provenance,
+                "event_watermark": source["event_watermark"],
+            }
+            assert before.provenance["event_watermark"] < other_event_id
+            assert (
+                other_event_id
+                <= source["event_watermark"]
+                <= store.max_event_id("modules_agent")
+            )
+            side_id = started.data["job_id"]
+            side_result = await agent.subagent_manager.wait_for(side_id)
+            assert side_result.output == "Side finding: logs are healthy."
+            assert side_llm.call_count == 0
+            assert side_llm.children[0].call_count == 1
+            assert "logs look healthy" in str(side_llm.children[0].call_log)
+            assert agent.capture_context().messages == before.messages
+            assert (
+                agent._recorder.activities_of_type("btw_result")[-1].detail
+                == side_result.output
+            )
+
+            opened = await command.execute(f"--open {side_id}", context)
+            assert "What did the logs show?" in opened.output
+            assert "Side finding: logs are healthy." in opened.output
+            assert "dispatch the worker" not in opened.output
+            assert "Private context fork instructions" not in opened.output
+            saved_side = store.find_subagent_run(side_id, parent="modules_agent")
+            assert saved_side["meta"]["source"] == source
+            assert saved_side["meta"]["audience"] == "user"
+            assert saved_side["meta"]["inherited_message_count"] == len(before.messages)
+
+            follow = await command.execute(
+                f"--continue {side_id} What should I inspect next?", context
+            )
+            assert follow.success, follow.error
+            assert (
+                await agent.subagent_manager.wait_for(side_id)
+            ).output == "Follow-up: inspect timestamps."
+            assert "Side finding: logs are healthy." in str(
+                side_llm.children[1].call_log
+            )
+            assert agent.capture_context().messages == before.messages
+            assert side_llm.call_count == 0
+            assert [
+                (row["run"], row["job_id"])
+                for row in store.list_subagent_runs(parent="modules_agent", name="fork")
+            ] == [(saved_side["run"], side_id)]
+
+            resumed_llm = ForkableScriptedLLM(
+                ["unused"], [["Reopened: timestamps checked."]]
+            )
+            resumed = await Agent.build(
+                AgentConfig(name="modules_agent"),
+                llm=resumed_llm,
+                io="headless",
+                pwd=tmp_path,
+            )
+            resumed.attach_session_store(store)
+            try:
+                resumed_command = resumed.list_user_commands()["btw"]
+                resumed_context = UserCommandContext(agent=resumed)
+                reopened = await resumed_command.execute(
+                    f"--open {side_id}", resumed_context
+                )
+                assert "What did the logs show?" in reopened.output
+                assert "Follow-up: inspect timestamps." in reopened.output
+                assert "dispatch the worker" not in reopened.output
+                continuation = await resumed_command.execute(
+                    f"--continue {side_id} Check timestamps", resumed_context
+                )
+                assert continuation.success, continuation.error
+                assert (
+                    await resumed.subagent_manager.wait_for(side_id)
+                ).output == "Reopened: timestamps checked."
+                assert resumed_llm.call_count == 0
+                assert "Follow-up: inspect timestamps." in str(
+                    resumed_llm.children[0].call_log
+                )
+                assert (
+                    store.find_subagent_run(side_id, parent="modules_agent")["run"]
+                    == saved_side["run"]
+                )
+                assert (
+                    store.find_subagent_run(side_id, parent="modules_agent")["meta"][
+                        "source"
+                    ]
+                    == source
+                )
+            finally:
+                await resumed.stop()
+            replay_after = replay_conversation(store.get_events("modules_agent"))
+            assert replay_after == replay_before
+            for side_text in (
+                "What did the logs show?",
+                "Side finding: logs are healthy.",
+                "What should I inspect next?",
+                "Follow-up: inspect timestamps.",
+                "Check timestamps",
+                "Reopened: timestamps checked.",
+            ):
+                assert side_text not in str(replay_after)
         finally:
             await agent.stop()
             store.close()
@@ -1149,8 +1415,8 @@ class TestModulesIntegration:
         stays alive across multiple ``push_context`` calls, and produces
         output for each, then is stopped.
 
-        Mirrors: ``modules/subagent/interactive_mgr.py`` +
-        ``modules/subagent/interactive.py`` lifecycle.
+        Mirrors: ``modules/subagent/interactive/manager.py`` +
+        ``modules/subagent/interactive/interactive.py`` lifecycle.
         """
         agent = make_agent(script=["interactive reply"])
 
@@ -1285,7 +1551,7 @@ class TestModulesIntegration:
         the typed-event ``emit()`` bus fans activity + processing
         events.
 
-        Mirrors: ``modules/output/router_parsing.py.route``, the
+        Mirrors: ``modules/output/router/parsing.py.route``, the
         ``OutputState`` suppression machine, and ``OutputRouter.emit``
         that ``core/agent_*`` drives during a turn.
         """
@@ -1450,6 +1716,31 @@ class TestModulesIntegration:
             # 13. pending_outputs / completed_outputs property accessors.
             assert router.pending_outputs == []
             assert router.completed_outputs == []
+
+            # 14. Widgets: no attached output renders kt.ui until a web
+            #     client says hello; then a widget opens, plain recorders
+            #     get its fallback text, a message with no agent is dropped.
+            assert router.ui_renderers() == {}
+            with pytest.raises(RendererUnavailable):
+                await router.widgets.open("kt.ui", {})
+            web_frames = asyncio.Queue()
+            web = StreamOutput("modules_agent", web_frames, [])
+            router.add_secondary(web)
+            web.set_client_renderers({"kt.ui": 1})
+            assert router.ui_renderers() == {"kt.ui": 1}
+            handle = await router.widgets.open("kt.ui", {}, fallback="A chart")
+            assert web_frames.get_nowait()["event_id"] == handle.id
+            assert [(a.activity_type, a.detail) for a in secondary.activities][-1] == (
+                "widget",
+                "A chart",
+            )
+            stray = WidgetMessage(handle.id, "click")
+            assert router.widgets.submit_message(stray) == "dropped"
+            await handle.close()
+            assert router.widgets.submit_message(stray) == "unknown"
+            await router.widgets.drain()
+            router.remove_secondary(web)
+            assert router.ui_renderers() == {}
         finally:
             await router.stop()
 
@@ -1539,6 +1830,43 @@ class TestModulesIntegration:
             )
             assert timed_out.is_timeout is True
             assert timed_out.action_id == "__timeout__"
+
+            # The same interaction over the widget path: a web client gets a
+            # kt.confirm widget, answers with widget_msg, and sees the close;
+            # the plain recorder keeps receiving the legacy-typed event.
+            web_q: asyncio.Queue = asyncio.Queue()
+            web = StreamOutput("web", web_q, deque(maxlen=20))
+            ibus.add_secondary(web)
+            web_agent = SimpleNamespace(output_router=ibus)
+            acks: list[dict] = []
+            wait = asyncio.create_task(
+                ibus.emit_and_wait(
+                    OutputEvent(
+                        type="confirm",
+                        interactive=True,
+                        id="evt-3",
+                        payload={"prompt": "Ship?"},
+                    )
+                )
+            )
+            opened = await asyncio.wait_for(web_q.get(), 1)
+            assert opened["type"] == "widget" and opened["event_id"] == "evt-3"
+            assert opened["payload"]["renderer"] == "kt.confirm"
+            assert opened["payload"]["spec"] == {"prompt": "Ship?"}
+            assert ibus_default.events[-1].type == "confirm"
+            handle_widget_msg(
+                {"event_id": "evt-3", "name": "yes", "data": {"why": "ready"}},
+                web_agent,
+                "web",
+                acks.append,
+            )
+            answered = await wait
+            assert (answered.action_id, answered.values) == ("yes", {"why": "ready"})
+            assert acks[-1]["status"] == "accepted"
+            closed = await asyncio.wait_for(web_q.get(), 1)
+            assert closed["type"] == "widget_close"
+            assert closed["payload"] == {"reason": "replied", "action_id": "yes"}
+            ibus.remove_secondary(web)
         finally:
             await ibus.stop()
 
@@ -1657,8 +1985,8 @@ class TestModulesIntegration:
         result is fed back into the controller's conversation so the next
         LLM turn can see it.
 
-        Mirrors: ``core/agent_handlers.py._dispatch_tool_event`` →
-        ``core/executor.py.submit`` → result collection back into the
+        Mirrors: ``core/agent/turn/handlers.py._dispatch_tool_event`` →
+        ``core/jobs/executor.py.submit`` → result collection back into the
         controller loop.
         """
         agent = make_agent(
@@ -1904,6 +2232,72 @@ class TestModulesIntegration:
             )
             assert (await agent.executor.wait_for(bad_job)).error
             assert target.read_text() == "a\nNEW\nb\n"
+
+            # ── ui.apps: a plugin-contributed tool gated on the web client ──
+            # Hidden until a client says it renders kt.app; then show_app
+            # stores the document as a session artifact, the web client gets
+            # the widget frame, an app message the tool is not waiting for
+            # becomes an untrusted widget_event, and read + patch round-trip.
+            await agent.add_plugin(AppsPlugin(allowed_hosts=[]))
+            assert "show_app" in agent.registry.list_tools()
+            assert "show_app" not in agent.get_system_prompt(), "no client yet"
+            web_q: asyncio.Queue = asyncio.Queue()
+            web = StreamOutput("web", web_q, deque(maxlen=20), agent)
+            agent.output_router.add_secondary(web)
+            web.set_client_renderers({"kt.app": 1})
+            assert "show_app" in agent.get_system_prompt()
+            job = await agent.executor.submit(
+                "show_app",
+                {"title": "Tip", "html": "<p id=t>10%</p>", "data": {"bill": 40}},
+                is_direct=True,
+            )
+            shown = await agent.executor.wait_for(job)
+            assert shown.error is None and shown.output.startswith("app w_")
+            app_id = shown.output.split()[1]
+            frame = await asyncio.wait_for(web_q.get(), 1)
+            while frame.get("type") != "widget":
+                frame = await asyncio.wait_for(web_q.get(), 1)
+            spec = frame["payload"]["spec"]
+            assert frame["surface"] == "canvas" and spec["allowed_hosts"] == []
+            assert spec["data"] == {"bill": 40} and "html" not in spec
+            assert list((store.artifacts_dir / "apps" / "docs").glob("*.html"))
+            injected: list = []
+
+            async def _record(event, *args, **kwargs):
+                injected.append(event)
+                return True
+
+            agent.inject_event = _record
+            acks: list[dict] = []
+            handle_widget_msg(
+                {
+                    "event_id": app_id,
+                    "name": "tip",
+                    "data": {"pct": 15},
+                    "origin": "app",
+                },
+                agent,
+                "web",
+                acks.append,
+            )
+            await agent.output_router.widgets.drain()
+            assert acks[-1]["status"] == "accepted"
+            (event,) = injected
+            assert event.type == "widget_event"
+            assert 'trust="untrusted"' in event.get_text_content()
+            del agent.inject_event
+            read_job = await agent.executor.submit(
+                "show_app", {"read": app_id}, is_direct=True
+            )
+            assert "<p id=t>10%</p>" in (await agent.executor.wait_for(read_job)).output
+            patch_job = await agent.executor.submit(
+                "show_app",
+                {"update": app_id, "patch": [{"find": "10%", "replace": "15%"}]},
+                is_direct=True,
+            )
+            assert (await agent.executor.wait_for(patch_job)).error is None
+            agent.output_router.remove_secondary(web)
+            assert "show_app" not in agent.get_system_prompt()
         finally:
             await agent.stop()
             store.close()
@@ -1931,7 +2325,7 @@ class TestModulesIntegration:
         agent = make_agent(
             script=[
                 ScriptEntry(
-                    "[/web_search]@@query=kt search\n[web_search/]",
+                    "[/web_search]@@query=kt search\n@@need_content=false\n[web_search/]",
                     match="search now",
                 ),
                 ScriptEntry("search complete", match="Grounded answer"),
@@ -1949,7 +2343,7 @@ class TestModulesIntegration:
         assert changed.success
         assert tool.backend == "deepseek"
         research = SubAgent(
-            config=RESEARCH_CONFIG,
+            config=SubAgentConfig(name="research", tools=["web_search", "web_fetch"]),
             parent_registry=agent.registry,
             llm=agent.llm,
             agent_path=tmp_path,
@@ -1961,7 +2355,7 @@ class TestModulesIntegration:
         try:
             await agent._process_event(create_user_input_event("search now"))
             assert capture
-            assert capture[0][1]["model"] == "deepseek-v4-flash"
+            assert capture[0][1]["model"] == "deepseek-v4-pro"
             assert "ds-secret" not in repr(capture[0][1])
         finally:
             await agent.stop()
@@ -1993,6 +2387,81 @@ class TestModulesIntegration:
         )
         assert reset.success
         assert resumed_tool.backend == "duckduckgo"
+
+        monkeypatch.setattr(deepseek_web, "get_api_key", lambda provider: "ds-secret")
+        monkeypatch.setattr(web_fetch, "has_api_key", lambda provider: True)
+        resumed_fetch = WebFetchTool()
+        resumed.registry.register_tool(resumed_fetch)
+        resumed.executor.register_tool(resumed_fetch)
+        changed = await resumed_command.execute(
+            "set web_search backend deepseek_api", resumed._user_command_context
+        )
+        assert changed.success
+        resumed.tool_options.set(
+            "web_search",
+            {
+                "need_content": True,
+                "localization": "203.0.113.1",
+                "deepseek_model": "deepseek-v4-flash",
+            },
+        )
+        changed = await resumed_command.execute(
+            "set web_fetch backend deepseek", resumed._user_command_context
+        )
+        assert changed.success
+
+        direct = make_agent(
+            script=[
+                ScriptEntry(
+                    "[/web_search]@@query=direct search\n@@max_results=2\n@@need_content=false\n[web_search/]",
+                    match="search direct",
+                ),
+                ScriptEntry(
+                    "[/web_fetch]@@url=https://example.com/source\n@@max_length=12\n[web_fetch/]",
+                    match="Direct summary",
+                ),
+                ScriptEntry("Direct workflow complete", match="[truncated]"),
+            ]
+        )
+        direct_search, direct_fetch = WebSearchTool(), WebFetchTool()
+        for item in (direct_search, direct_fetch):
+            direct.registry.register_tool(item)
+            direct.executor.register_tool(item)
+        direct.attach_session_store(store)
+        assert direct_search.backend == "deepseek_api"
+        assert direct_search.deepseek_model == "deepseek-flash"
+        assert direct_search.need_content is True
+        assert direct_search.localization == "203.0.113.1"
+        assert direct_fetch.backend == "deepseek"
+        await direct.start()
+        try:
+            await direct._process_event(create_user_input_event("search direct"))
+        finally:
+            await direct.stop()
+        assert capture[-2] == (
+            "https://api.deepseek.com/v1/tools/search",
+            {
+                "query": "direct search",
+                "count": 2,
+                "need_content": False,
+                "localization": "203.0.113.1",
+            },
+        )
+        assert capture[-1] == (
+            "https://api.deepseek.com/v1/tools/fetch",
+            {"url": "https://example.com/source"},
+        )
+        direct_events = [
+            e for e in store.get_events("modules_agent") if e["type"] == "tool_result"
+        ]
+        assert direct_events[-2]["tool_metadata"]["backend"] == "deepseek_api"
+        assert direct_events[-2]["tool_metadata"]["citation_status"] == "search_results"
+        assert direct_events[-1]["tool_metadata"]["title"] == "Direct page"
+        assert "ds-secret" not in repr(direct_events)
+        direct.tool_options.set("web_search", {})
+        direct.tool_options.set("web_fetch", {})
+        assert direct_search.backend == "duckduckgo"
+        assert direct_fetch.backend == "auto"
         store.close()
 
     async def test_drive_tools_injected_and_execute_through_engine(
@@ -2010,8 +2479,10 @@ class TestModulesIntegration:
             DriveRuntimeConfig,
             default_registrations,
         )
-        from kohakuterrarium.terrarium.drive.tools import SELF_SERVICE_TOOL_NAMES
-        from kohakuterrarium.terrarium.engine import Terrarium
+        from kohakuterrarium.terrarium.drive.tools.self_service import (
+            SELF_SERVICE_TOOL_NAMES,
+        )
+        from kohakuterrarium.terrarium.engine.engine import Terrarium
 
         llm_box.set(["ok"] * 8)
 
@@ -2098,8 +2569,8 @@ class TestModulesIntegration:
 
         from kohakuterrarium.modules.user_command.base import UserCommandContext
         from kohakuterrarium.terrarium.drive.models import ActorRef, DriveStatus
-        from kohakuterrarium.terrarium.engine import Terrarium
-        from kohakuterrarium.terrarium.service import LocalTerrariumService
+        from kohakuterrarium.terrarium.engine.engine import Terrarium
+        from kohakuterrarium.terrarium.service.service import LocalTerrariumService
 
         alice = ActorRef("user", "alice")
 
@@ -2244,3 +2715,109 @@ class TestModulesIntegration:
             assert any(
                 r["kind"] == "goal" for r in await service.list_drive_registrations()
             )
+
+    async def test_ui_declarative_plugin_teaches_inline_ui(self, make_agent):
+        """plugin + prompt + output protocols — the built-in ``ui.declarative``
+        plugin teaches inline ``<ui>`` components, and only while a client
+        that draws ``kt.ui`` is attached.
+
+        Full workflow: enable the plugin → no client, no part → a web client
+        says hello → the inline part of ``## Presenting your answer`` appears
+        (with the ``show_app`` part once ``ui.apps`` is on and the client
+        draws ``kt.app``) → the
+        model replies with one valid and one broken block → the next request
+        carries one note about the broken block, the one after does not →
+        the client leaves and the section is gone → a Rich CLI output brings
+        it back without the ``show_app`` pointer. Only the LLM is scripted."""
+        good = (
+            '<ui title="Split">\n<state total={120} people={3}/>\n'
+            "<let each={total / people}/>\n"
+            '<number label="People" bind="people"/>\n'
+            '<stat label="Each">{fmt(each, 2)}</stat>\n</ui>'
+        )
+        broken = '<ui><stat label="Each"/><slider bind="ghost"/></ui>'
+        reply = f"Here you go:\n\n{good}\n\nAnd a second view:\n{broken}\n"
+        agent = make_agent(
+            script=[
+                ScriptEntry(reply, match="split the bill"),
+                ScriptEntry("fixed it", match="and now"),
+                ScriptEntry("plain answer", match="thanks"),
+            ]
+        )
+        await agent.start()
+        try:
+            await agent.add_plugin(UiDeclarativePlugin())
+            assert "### Inline components" not in agent.get_system_prompt()
+
+            frames: asyncio.Queue = asyncio.Queue()
+            web = StreamOutput("modules_agent", frames, deque(maxlen=50), agent)
+            agent.output_router.add_secondary(web)
+            web.set_client_renderers({"kt.ui": 1})
+            prompt = agent.get_system_prompt()
+            assert (
+                "## Presenting your answer" in prompt
+                and "### Inline components" in prompt
+            )
+            assert (
+                "- `chart`: kind*: bar|stacked|line|area|pie|scatter|radar|heatmap|gauge"
+                in prompt
+            )
+            assert "`show_app`" not in prompt
+            # Rare components are named once; ``info("ui:<name>")`` has them.
+            assert "call `info` with `ui:<name>`" in prompt
+            assert "`quiz`" in prompt and "- `quiz`:" not in prompt
+
+            await agent.add_plugin(AppsPlugin())
+            web.set_client_renderers({"kt.ui": 1, "kt.app": 1})
+            prompt = agent.get_system_prompt()
+            assert "When inline UI is not enough, use `show_app`: a full page" in prompt
+            assert "stays inline as `html`" in prompt
+            assert "→ `html` (a sandboxed frame" in prompt
+
+            await agent._process_event(create_user_input_event("split the bill"))
+            last = agent.controller.conversation.get_last_assistant_message()
+            assert '<stat label="Each">' in last.get_text_content()
+
+            await agent._process_event(create_user_input_event("and now?"))
+            request = " ".join(str(m.get("content")) for m in agent.llm.call_log[-1])
+            assert "[inline UI]" in request and "- block 2:" in request
+            assert "root.children[0].value: is required" in request
+            assert "'ghost' is not a key of 'state'" in request
+            assert "- block 1:" not in request
+            stored = " ".join(
+                m.get_text_content()
+                for m in agent.controller.conversation.get_messages()
+            )
+            assert "[inline UI]" not in stored, "the note is not kept in history"
+
+            await agent._process_event(create_user_input_event("thanks"))
+            request = " ".join(str(m.get("content")) for m in agent.llm.call_log[-1])
+            assert "[inline UI]" not in request, "one note per failing reply"
+            assert agent.llm.call_count == 3
+
+            agent.output_router.remove_secondary(web)
+            assert "### Inline components" not in agent.get_system_prompt()
+
+            previous = agent.output_router.default_output
+            agent.output_router.default_output = RichCLIOutput(_TerminalApp())
+            prompt = agent.get_system_prompt()
+            assert (
+                "## Presenting your answer" in prompt
+                and "### Inline components" in prompt
+            )
+            assert (
+                "When inline UI is not enough" not in prompt
+                and "show_app" not in prompt
+            )
+            # The terminal runs no app frames, so the ``html`` component is not taught.
+            assert "→ `html`" not in prompt and "`html`" not in prompt
+
+            agent.plugins.disable("ui.declarative")
+            assert "### Inline components" not in agent.get_system_prompt()
+            agent.plugins.enable("ui.declarative")
+            assert "### Inline components" in agent.get_system_prompt()
+
+            agent.output_router.default_output = previous
+            assert "### Inline components" not in agent.get_system_prompt()
+        finally:
+            await agent.stop()

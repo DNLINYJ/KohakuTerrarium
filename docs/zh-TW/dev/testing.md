@@ -65,7 +65,7 @@ studio}` 加上多節點。e2e 回答一個問題：*系統從頭到尾能跑嗎
 ### 排除項
 
 有些檔案被刻意排除在 95% per-file 覆蓋率目標之外：第三方
-provider（`llm/codex_provider.py`）、平台 PTY
+provider（`llm/codex/provider.py`）、平台 PTY
 （`api/ws/pty.py`）、使用者端 CLI/UI（`builtins/cli_rich/*`、
 `builtins/tui/*`）、pywebview 啟動路徑。完整清單在
 `tests/README.md`。
@@ -278,14 +278,14 @@ er.assert_before("tool_complete", "channel_message")
 | 你改了                   | 加測試到                            |
 |-------------------------|------------------------------------|
 | `core/agent.py`         | `tests/unit/test_phase5.py` 或新檔 |
-| `core/controller.py`    | `tests/unit/test_phase3_4.py`      |
-| `core/executor.py`      | `tests/unit/test_phase3_4.py`      |
+| `core/controller/controller.py`    | `tests/unit/test_phase3_4.py`      |
+| `core/jobs/executor.py`      | `tests/unit/test_phase3_4.py`      |
 | `parsing/`              | `tests/unit/test_phase2.py`        |
 | `modules/subagent/`     | `tests/unit/test_phase6.py`        |
 | `modules/trigger/`      | `tests/unit/test_phase7.py`        |
 | `core/environment.py`   | `tests/unit/test_environment.py`   |
 | `session/store.py`      | `tests/unit/test_session_store.py` |
-| `session/resume.py`     | `tests/unit/test_session_resume.py`|
+| `session/resume/resume.py`     | `tests/unit/test_session_resume.py`|
 | `bootstrap/`            | `tests/unit/test_bootstrap.py`     |
 | `terrarium/`            | `tests/unit/test_terrarium_modules.py` |
 
@@ -325,7 +325,7 @@ session 同步、cluster fold）至少需要一個 worker 才有意義。
 ### Integration：`InProcTransport`
 
 對於橫跨實際 Lab dispatch 邏輯的 workflow（handshake → APP
-request → response），用 `laboratory/_internal/transport_inproc.py`
+request → response），用 `laboratory/_internal/transport/inproc.py`
 的 `InProcTransport`。它實作和 WebSocket transport 同一個
 `LabTransport` Protocol，但所有東西都留在同一個 event loop
 裡。標準設定 helper 見

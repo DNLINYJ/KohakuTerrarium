@@ -1,19 +1,24 @@
 """Unit tests for the studio.identity.* helpers.
 
 Focuses on the wrapper logic + validation; the underlying
-``kohakuterrarium.llm.profiles`` operations are mocked.
+``kohakuterrarium.llm.profiles.resolve`` operations are mocked.
 """
 
 from pathlib import Path
 
 import pytest
+import yaml
 
-from kohakuterrarium.studio.identity import (
-    llm_backends as backends_mod,
-    llm_default as default_mod,
-    llm_native_tools as native_mod,
-    llm_profiles as profiles_mod,
-    settings as settings_mod,
+from kohakuterrarium.studio.identity import settings as settings_mod
+from kohakuterrarium.studio.identity.llm import backends as backends_mod
+from kohakuterrarium.studio.identity.llm import default as default_mod
+from kohakuterrarium.studio.identity.llm import native_tools as native_mod
+from kohakuterrarium.studio.identity.llm import profiles as profiles_mod
+
+from tests.unit._fakes.package_backend import (
+    echo_backend,
+    install_backend_package,
+    kt_home,  # noqa: F401
 )
 
 # ── llm_backends ────────────────────────────────────────────
@@ -32,7 +37,7 @@ class TestLlmBackends:
             backends_mod.remove_backend("deepseek")
 
     def test_list_backends(self, monkeypatch):
-        from kohakuterrarium.llm.profiles import LLMBackend
+        from kohakuterrarium.llm.profiles.resolve import LLMBackend
 
         backend = LLMBackend(
             name="openai",
@@ -91,6 +96,55 @@ class TestLlmBackends:
         monkeypatch.setattr(backends_mod, "load_backends", lambda: {})
         monkeypatch.setattr(backends_mod, "PROVIDER_KEY_MAP", {})
         assert backends_mod.is_provider_known("ghost") is False
+
+
+class TestPackageBackendRecords:
+    """Studio view of backend types and records contributed by packages."""
+
+    def test_backend_types_list_builtins_then_packages(self, kt_home):
+        install_backend_package(
+            kt_home,
+            "pkg-x",
+            [echo_backend(display_name="Echo", credentials="external")],
+        )
+        rows = backends_mod.list_backend_types()
+        assert [r["name"] for r in rows if r["source"] == "builtin"] == sorted(
+            ["openai", "anthropic", "codex", "grok-subscription", "google-antigravity"]
+        )
+        assert rows[-1] == {
+            "name": "echo",
+            "display_name": "Echo",
+            "description": "",
+            "source": "package",
+            "package": "pkg-x",
+            "credentials": "external",
+        }
+
+    def test_list_backends_marks_package_and_user_records(self, kt_home):
+        install_backend_package(
+            kt_home, "pkg-x", [echo_backend(credentials="external")]
+        )
+        rows = {r["name"]: r for r in backends_mod.list_backends()}
+        assert rows["echo"]["source"] == "package"
+        assert rows["echo"]["package"] == "pkg-x"
+        assert rows["echo"]["credentials"] == "external"
+        assert rows["echo"]["available"] is True
+        assert rows["openai"]["source"] == "builtin"
+
+        backends_mod.save_backend_record("echo-2", "echo")
+        rows = {r["name"]: r for r in backends_mod.list_backends()}
+        assert rows["echo-2"]["source"] == "user"
+        assert rows["echo-2"]["package"] == "pkg-x"
+
+    def test_saving_a_record_never_persists_the_package_record(self, kt_home):
+        install_backend_package(kt_home, "pkg-x", [echo_backend()])
+        backends_mod.save_backend_record("mine", "openai", base_url="https://x")
+        saved = yaml.safe_load((kt_home / "llm_profiles.yaml").read_text())
+        assert set(saved["backends"]) == {"mine"}
+
+    def test_unknown_type_still_rejected(self, kt_home):
+        with pytest.raises(ValueError, match="Unsupported"):
+            backends_mod.save_backend_record("x", "echo")
 
 
 # ── llm_default ─────────────────────────────────────────────

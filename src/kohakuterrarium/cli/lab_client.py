@@ -17,7 +17,7 @@ import sys
 from kohakuterrarium.cli._config_layers import load_layered_config
 from kohakuterrarium.laboratory import ClientConfig
 from kohakuterrarium.laboratory._internal.client import ClientConnector
-from kohakuterrarium.laboratory._internal.transport_ws import WebSocketTransport
+from kohakuterrarium.laboratory._internal.transport.ws import WebSocketTransport
 from kohakuterrarium.laboratory.adapters import (
     StudioCatalogAdapter,
     StudioDeployAdapter,
@@ -36,16 +36,16 @@ from kohakuterrarium.laboratory.adapters._worker_session import (
     WorkerSessionAttacher,
 )
 from kohakuterrarium.laboratory.identity_cache import IdentityCache
-from kohakuterrarium.llm.api_keys import (
+from kohakuterrarium.llm.profiles.api_keys import (
     clear_api_key_resolver,
     register_api_key_resolver,
 )
-from kohakuterrarium.llm.codex_auth import (
+from kohakuterrarium.llm.codex.auth import (
     clear_codex_resolver,
     register_codex_resolver,
 )
 from kohakuterrarium.studio.hooks import register_group_hooks
-from kohakuterrarium.studio.identity import drive_settings as _drive_settings
+from kohakuterrarium.studio.identity.drive_settings import settings as _drive_settings
 from kohakuterrarium.terrarium import Terrarium
 from kohakuterrarium.utils.fd_limit import raise_fd_limit
 from kohakuterrarium.utils.logging import (

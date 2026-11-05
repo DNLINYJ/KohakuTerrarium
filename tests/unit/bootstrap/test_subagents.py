@@ -2,12 +2,14 @@
 
 import textwrap
 
+import pytest
 
 from kohakuterrarium.bootstrap.subagents import (
     create_subagent_config,
     init_subagents,
 )
-from kohakuterrarium.core.config_types import (
+from kohakuterrarium.core.agent import Agent
+from kohakuterrarium.core.config.types import (
     AgentConfig,
     SubAgentConfigItem,
 )
@@ -15,14 +17,68 @@ from kohakuterrarium.core.loader import ModuleLoader
 from kohakuterrarium.core.registry import Registry
 from kohakuterrarium.modules.subagent import SubAgentManager
 from kohakuterrarium.modules.subagent.config import SubAgentConfig
+from kohakuterrarium.testing.llm import ScriptedLLM
 
 # ── create_subagent_config: builtin ─────────────────────────────
 
 
 class TestCreateSubAgentConfigBuiltin:
-    def test_unknown_builtin_returns_none(self):
-        item = SubAgentConfigItem(name="no_such_subagent", type="builtin")
+    @pytest.mark.parametrize(
+        "name", ["no_such_subagent", "worker", "plan", "research", "coordinator"]
+    )
+    def test_unknown_builtin_warns_and_returns_none(self, name, caplog):
+        item = SubAgentConfigItem(name=name, type="builtin")
         assert create_subagent_config(item, loader=None) is None
+        assert name in caplog.text
+        assert "Skipping unavailable builtin sub-agent" in caplog.text
+        assert "kt-biome" in caplog.text
+
+    @pytest.mark.parametrize("strict", [True, False])
+    async def test_older_biome_config_still_builds_and_runs(
+        self, tmp_path, caplog, strict
+    ):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "name: older_biome\n"
+            "tools:\n"
+            "  - {name: read, type: builtin}\n"
+            "subagents:\n"
+            "  - {name: explore, type: builtin}\n"
+            "  - {name: worker, type: builtin}\n"
+            "  - {name: plan, type: builtin}\n"
+            "  - {name: research, type: builtin}\n"
+            "  - {name: coordinator, type: builtin}\n"
+            "  - {name: critic, type: builtin}\n"
+            "  - {name: response, type: builtin}\n",
+            encoding="utf-8",
+        )
+        agent = await Agent.build(
+            config_path,
+            llm=ScriptedLLM(["Still operational."]),
+            io="headless",
+            strict=strict,
+            pwd=tmp_path,
+        )
+        try:
+            assert set(agent.subagent_manager.list_subagents()) == {
+                "explore",
+                "critic",
+                "response",
+                "fork",
+            }
+            assert set(agent.registry.list_subagents()) == {
+                "explore",
+                "critic",
+                "response",
+                "fork",
+            }
+            for name in ("worker", "plan", "research", "coordinator"):
+                assert f"Skipping unavailable builtin sub-agent {name!r}" in caplog.text
+            await agent.start()
+            result = await agent.run("Check startup.")
+            assert result.text == "Still operational."
+        finally:
+            await agent.stop()
 
     def test_known_builtin_loads(self):
         # ``explore`` is a real builtin sub-agent — it MUST resolve.
@@ -42,6 +98,8 @@ class TestCreateSubAgentConfigBuiltin:
                 "plugins": [{"name": "x"}],
                 "compact": {"max_tokens": 1000},
                 "model": "gpt-4",
+                "max_turns": 20,
+                "timeout": 900,
                 "notify_controller_on_background_complete": False,
             },
         )
@@ -53,6 +111,8 @@ class TestCreateSubAgentConfigBuiltin:
         assert cfg.default_plugins == ["auto-compact"]
         assert cfg.notify_controller_on_background_complete is False
         assert cfg.model == "gpt-4"
+        assert cfg.max_turns == 20
+        assert cfg.timeout == 900
 
 
 # ── create_subagent_config: custom with module + config_name ────
@@ -174,7 +234,7 @@ class TestUnknownType:
 
 class TestInitSubAgents:
     def test_registers_into_manager_and_registry(self, tmp_path):
-        from kohakuterrarium.core.executor import Executor
+        from kohakuterrarium.core.jobs.executor import Executor
 
         cfg = AgentConfig(
             name="a",
@@ -200,7 +260,7 @@ class TestInitSubAgents:
         assert "inline_sa" in registry.list_subagents()
 
     def test_skips_failed_entries(self, tmp_path):
-        from kohakuterrarium.core.executor import Executor
+        from kohakuterrarium.core.jobs.executor import Executor
 
         cfg = AgentConfig(
             name="a",

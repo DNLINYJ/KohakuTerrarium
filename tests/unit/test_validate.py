@@ -14,8 +14,15 @@ from kohakuterrarium.errors import (
     PackageNotInstalledError,
 )
 from kohakuterrarium.cli.doctor import doctor_cli
-from kohakuterrarium.llm.profile_types import LLMProfile
+from kohakuterrarium.llm.profiles.types import LLMProfile
 from kohakuterrarium.testing.llm import ScriptedLLM
+
+from tests.unit._fakes.package_backend import (
+    PROVIDER_SOURCE,
+    echo_backend,
+    install_backend_package,
+    kt_home,  # noqa: F401
+)
 
 
 def _write_creature(tmp_path, name="vtest"):
@@ -121,6 +128,36 @@ class TestDoctorCli:
         out = capsys.readouterr().out
         assert rc == 0
         assert "All checks passed." in out
+
+    def test_doctor_reports_package_backend_status(self, kt_home, monkeypatch, capsys):
+        install_backend_package(
+            kt_home,
+            "p",
+            [echo_backend(credentials="external")],
+            presets=[{"name": "echo-m", "provider": "echo", "model": "m"}],
+        )
+        rc = doctor_cli(llm="echo/echo-m")
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        assert "backend status (echo)" in out and "echo ready" in out
+
+    def test_doctor_red_when_package_backend_check_fails(
+        self, kt_home, monkeypatch, capsys
+    ):
+        source = PROVIDER_SOURCE.replace(
+            'return "echo ready"', 'raise RuntimeError("Not logged in")'
+        )
+        install_backend_package(
+            kt_home,
+            "p",
+            [echo_backend(credentials="external")],
+            source=source,
+            presets=[{"name": "echo-m", "provider": "echo", "model": "m"}],
+        )
+        rc = doctor_cli(llm="echo/echo-m")
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "Not logged in" in out
 
     def test_doctor_red_on_llm_failure(self, tmp_path, monkeypatch, capsys):
         import kohakuterrarium.cli.doctor as doc_mod

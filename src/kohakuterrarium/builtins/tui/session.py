@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from textual.containers import VerticalScroll
 from textual.widgets import Markdown, Static
 
+from kohakuterrarium.builtins.kt_ui.inline_text import inline_ui_text
 from kohakuterrarium.builtins.tui.app import IDLE_STATUS, AgentTUI, _safe_id
 from kohakuterrarium.builtins.tui.model_info import TabModelRegistryMixin
 from kohakuterrarium.builtins.tui.widgets import (
@@ -626,7 +627,7 @@ class TUISession(TabModelRegistryMixin):
                 at_bottom = (
                     chat.max_scroll_y == 0 or chat.scroll_y >= chat.max_scroll_y - 2
                 )
-                md = Markdown(text)
+                md = Markdown(inline_ui_text(text))
                 chat.mount(md, after=widget)
                 widget.remove()
                 if at_bottom:
@@ -781,9 +782,10 @@ class TUISession(TabModelRegistryMixin):
         # Framework logs are persisted by session output instead of rendered in chat.
         pass
 
-    def start_thinking(self) -> None:
+    def start_thinking(self, target: str = "") -> None:
+        if target and self._terrarium_tabs and target != self.get_active_tab():
+            return
         if self._app and self._app.is_running:
-            self._app._is_processing = True
             if self._app._queued_widgets:
                 chat = self._app._get_active_chat()
                 for qw in self._app._queued_widgets:
@@ -801,12 +803,6 @@ class TUISession(TabModelRegistryMixin):
                 if chat:
                     chat.scroll_end(animate=False)
                 self._app._queued_widgets.clear()
-            try:
-                self._app.start_thinking_animation()
-            except Exception as e:
-                logger.warning(
-                    "TUI start_thinking_animation failed", error=str(e), exc_info=True
-                )
 
     def stop_thinking(self) -> None:
         if self._app and self._app.is_running:

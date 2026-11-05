@@ -62,7 +62,7 @@ describe("MessageRow order-preserving inline editor", () => {
         image_url: { url: "file:///tmp/a.png" },
         meta: { source_name: "dup.png" },
       },
-      { type: "text", text: "caption" },
+      { type: "text", text: "caption", extension: { nested: [{ value: "original" }] } },
       { type: "file", file: { name: "dup.png", path: "/workspace/dup.png" } },
     ]
     const { wrapper, store } = mountUser(pinia, original)
@@ -85,6 +85,7 @@ describe("MessageRow order-preserving inline editor", () => {
       value: [file("extra.txt", "text/plain", "TAIL")],
     })
     await addInput.trigger("change")
+    await wrapper.get("textarea.message-edit-inline").setValue("changed caption")
     await wrapper.get('[aria-label="Save and rerun"]').trigger("click")
 
     await vi.waitFor(() => expect(editSpy).toHaveBeenCalledTimes(1))
@@ -94,6 +95,11 @@ describe("MessageRow order-preserving inline editor", () => {
     expect(payload[2].file.path).toBe("/workspace/dup.png")
     expect(payload[3].file.content).toBe("TAIL")
     expect(original[0].meta.source_name).toBe("dup.png")
+    expect(payload[1].text).toBe("changed caption")
+    payload[1].extension.nested[0].value = "output mutation"
+    expect(original[1].text).toBe("caption")
+    expect(original[1].extension.nested[0].value).toBe("original")
+    expect(store.messagesByTab.main[0].contentParts[1].extension.nested[0].value).toBe("original")
   })
 
   it("keeps a merged multi-text textarea read-only with a visible explanation", async () => {

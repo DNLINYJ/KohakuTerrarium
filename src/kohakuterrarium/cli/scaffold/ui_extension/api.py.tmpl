@@ -1,0 +1,16 @@
+"""Fallback raw routes for {{name}}, served under /api/ext/{{name}}/.
+
+Prefer the owner RPC (``ui_state`` / ``ui_call``); use raw routes only for
+what it cannot express, such as file downloads.
+"""
+
+from fastapi import APIRouter, Depends
+
+from kohakuterrarium.api.ext import package_name
+
+router = APIRouter()
+
+
+@router.get("/ping")
+async def ping(pkg: str = Depends(package_name)) -> dict:
+    return {"package": pkg, "ok": True}

@@ -34,15 +34,17 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from kohakuvault import KVault
 
-from kohakuterrarium.llm import antigravity_auth as agy_auth
+from kohakuterrarium.llm.antigravity import auth as agy_auth
 from kohakuterrarium.api.app import create_app
 from kohakuterrarium.api.deps import set_service
 from kohakuterrarium.api.routes.catalog import _deps as catalog_deps
 from kohakuterrarium.bootstrap import agent_init as _agent_init
-from kohakuterrarium.studio.catalog import packages as _catalog_packages_ops
-from kohakuterrarium.studio.attach import pty_posix
+from kohakuterrarium.studio.catalog.packages import packages as _catalog_packages_ops
+from kohakuterrarium.studio.attach.pty import posix as pty_posix
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
+from kohakuterrarium.session.vault.io import FIRST_READ_CHUNK
 from kohakuterrarium.terrarium import LocalTerrariumService, Terrarium
 from kohakuterrarium.testing.llm import ScriptedLLM
 
@@ -653,7 +655,8 @@ class TestApiStudioJourney:
         # every creature (the ``goal`` composition + the ``drive_runtime``
         # prompt contributor); every other builtin (sandbox, budget, permgate,
         # …) stays off until explicitly toggled.
-        terrarium_defaults = {"goal", "drive_runtime"}
+        # The renderer-gated UI plugins are on by default on every creature.
+        terrarium_defaults = {"goal", "drive_runtime", "ui.apps", "ui.declarative"}
         assert all(
             p["enabled"] is False
             for p in resp.json()
@@ -770,6 +773,11 @@ class TestApiStudioJourney:
         assert resumed_rows[0]["runtime_id"] == resumed_id
         assert resumed_rows[0]["is_live"] is True
 
+        live_index = client.get(f"/api/sessions/{resumed_id}/history")
+        assert live_index.status_code == 200
+        assert live_index.json()["viewer_agents"] == ["scout"]
+        assert live_index.json()["targets"] == ["scout"]
+
         # Explicit End removes the live runtime and Rail row while preserving
         # the saved History entry.
         resp = client.post(f"/api/sessions/open/{conversation_id}/end")
@@ -792,6 +800,10 @@ class TestApiStudioJourney:
         assert resp.status_code == 200
         assert "scout" in resp.json()["targets"]
         assert resp.json()["meta"]["agents"] == ["scout"]
+        assert resp.json()["viewer_agents"] == ["scout"]
+        summary = client.get(f"/api/sessions/{saved_name}/summary")
+        assert summary.status_code == 200
+        assert summary.json()["agents"] == resp.json()["viewer_agents"]
         resp = client.get(f"/api/sessions/{saved_name}/history/scout")
         assert resp.status_code == 200
         assert resp.json()["history_page"]["stream"] == "events"
@@ -811,6 +823,7 @@ class TestApiStudioJourney:
         client: TestClient,
         workspace_root: Path,
         scripted_llm: ScriptedLLM,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Run a turn → saved-session list → viewer panes → fork → diff
         → resume → attach hints.
@@ -856,6 +869,46 @@ class TestApiStudioJourney:
         )
         assert resp.status_code == 200
         assert resp.json() == {"response": _REPLY_ONE}
+
+        def assert_event_pages(name):
+            url = f"/api/sessions/{name}/events"
+            full_response = client.get(url, params={"limit": 1000})
+            assert full_response.status_code == 200
+            expected = full_response.json()["events"]
+            reads = []
+            original_read = KVault.get_many
+
+            def read_event_values(table, keys, *args, **kwargs):
+                for key in keys:
+                    text = key.decode() if isinstance(key, bytes) else key
+                    if isinstance(text, str) and text.startswith("viewer:e"):
+                        reads.append(text)
+                return original_read(table, keys, *args, **kwargs)
+
+            with monkeypatch.context() as counters:
+                counters.setattr(KVault, "get_many", read_event_values)
+                cursor = None
+                for index in range(2):
+                    reads.clear()
+                    params = {"limit": 1}
+                    if cursor is not None:
+                        params["cursor"] = cursor
+                    response = client.get(url, params=params)
+                    assert response.status_code == 200
+                    page = response.json()
+                    assert page["events"] == expected[index : index + 1]
+                    cursor = expected[index]["event_id"]
+                    assert page["next_cursor"] == cursor
+                    assert len(reads) == min(len(expected), FIRST_READ_CHUNK)
+                reads.clear()
+                response = client.get(url, params={"types": "not-present", "limit": 1})
+                assert response.status_code == 200
+                assert response.json()["events"] == []
+                assert response.json()["next_cursor"] is None
+                assert len(reads) == len(expected)
+            return expected
+
+        live_events = assert_event_pages(session_id)
 
         # Stop the live session first — on Windows the SQLite handle
         # must be released before the viewer / resume re-open the file.
@@ -903,6 +956,8 @@ class TestApiStudioJourney:
         assert all(e["type"] == "user_input" for e in events)
         event_blob = str(events)
         assert "remember this turn" in event_blob
+        saved_events = assert_event_pages(saved_name)
+        assert saved_events[: len(live_events)] == live_events
 
         # Viewer: export pane — every supported format renders the turn.
         resp = client.get(f"/api/sessions/{saved_name}/export", params={"format": "md"})

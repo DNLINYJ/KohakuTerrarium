@@ -20,13 +20,13 @@ and `EventRecorder` capture all output and events for test assertions.
 ## Dependencies
 
 - `kohakuterrarium.builtins.tool_catalog` (get_builtin_tool)
-- `kohakuterrarium.core.controller` (Controller, ControllerConfig)
+- `kohakuterrarium.core.controller.controller` (Controller, ControllerConfig)
 - `kohakuterrarium.core.events` (TriggerEvent)
-- `kohakuterrarium.core.executor` (Executor)
+- `kohakuterrarium.core.jobs.executor` (Executor)
 - `kohakuterrarium.core.registry` (Registry)
 - `kohakuterrarium.core.session` (Session)
 - `kohakuterrarium.llm.base` (LLMProvider, ChatResponse)
 - `kohakuterrarium.llm.message` (Message)
 - `kohakuterrarium.modules.output.base` (BaseOutputModule)
-- `kohakuterrarium.modules.output.router` (OutputRouter)
+- `kohakuterrarium.modules.output.router.router` (OutputRouter)
 - `kohakuterrarium.parsing` (ToolCallEvent, CommandResultEvent)

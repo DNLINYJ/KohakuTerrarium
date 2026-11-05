@@ -23,9 +23,15 @@
               update to {{ latestFor(pkg) }}
             </span>
             <span v-if="pkg.manifest_name && pkg.manifest_name !== pkg.name" class="text-[10px] text-warm-500 dark:text-warm-400 truncate" :title="`manifest declares name=${pkg.manifest_name}`"> ({{ pkg.manifest_name }}) </span>
+            <span v-if="uiRecord(pkg)" class="chip-iolite !text-[9px]" data-test="ui-chip" :title="uiTitle(uiRecord(pkg))">contributes UI</span>
+            <span v-if="uiProblem(uiRecord(pkg))" class="text-[10px] text-coral truncate" data-test="ui-problem" :title="uiProblem(uiRecord(pkg))">
+              <span class="i-carbon-warning-alt text-[9px] mr-0.5" />
+              {{ uiProblem(uiRecord(pkg)) }}
+            </span>
           </div>
 
           <div class="flex items-center gap-1 shrink-0" @click.stop>
+            <el-switch v-if="uiRecord(pkg)" size="small" data-test="ui-toggle" :model-value="uiRecord(pkg).enabled" :loading="uiBusy.has(pkg.name)" :disabled="Boolean(uiRecord(pkg).error)" :title="`Allow ${pkg.name} to add dashboard UI`" @change="(value) => toggleUi(pkg, value)" />
             <button type="button" class="btn-ghost !text-[11px]" :title="`Edit files in ${pkg.name}`" @click="$emit('edit-files', pkg)">
               <span class="i-carbon-edit text-[11px]" />
             </button>
@@ -76,7 +82,11 @@
 </template>
 
 <script setup>
-import { ref } from "vue"
+import { reactive, ref } from "vue"
+import { ElMessage } from "element-plus"
+
+import { setUiExtensionEnabled } from "@/ext/loader"
+import { findPackage } from "@/ext/state"
 
 const props = defineProps({
   packages: { type: Array, required: true },
@@ -161,6 +171,32 @@ function canUpdate(pkg) {
   // handler returns a friendly skip for non-git, so this stays
   // permissive).
   return !pkg.editable
+}
+
+const uiBusy = reactive(new Set())
+
+/** The host's UI-extension record for an installed package, or ``null``. */
+function uiRecord(pkg) {
+  return findPackage(pkg.name)
+}
+function uiTitle(record) {
+  const kinds = (record.contributes || []).map((c) => `${c.kind}: ${c.label}`)
+  return kinds.length ? kinds.join("\n") : "Dashboard UI"
+}
+function uiProblem(record) {
+  if (!record) return ""
+  if (record.status === "error" || record.status === "incompatible") return record.loadError || record.status
+  return ""
+}
+async function toggleUi(pkg, value) {
+  uiBusy.add(pkg.name)
+  try {
+    await setUiExtensionEnabled(pkg.name, value)
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.detail?.message || err?.message || "Failed to change UI setting")
+  } finally {
+    uiBusy.delete(pkg.name)
+  }
 }
 
 function gradientFor(pkg) {

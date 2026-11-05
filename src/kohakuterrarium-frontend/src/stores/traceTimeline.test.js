@@ -48,6 +48,21 @@ describe("trace timeline store", () => {
     expect(store.loading).toBe(false)
   })
 
+  it("clears an error at the start of a same-agent retry", async () => {
+    const store = useTraceTimelineStore("timeline-retry")
+    sessionAPI.getTimeline.mockRejectedValueOnce(new Error("offline"))
+    await store.load("session", "alice")
+    expect(store.error).toContain("offline")
+    const request = deferred()
+    sessionAPI.getTimeline.mockReturnValueOnce(request.promise)
+    const retry = store.load("session", "alice")
+    expect(store.error).toBe("")
+    request.resolve({ agent: "alice", spans: [{ eid: 1, type: "text", ts: 1, turn: 1 }] })
+    await retry
+    expect(store.error).toBe("")
+    expect(store.records.map((r) => r.eid)).toEqual([1])
+  })
+
   it("invalidates an in-flight response when cleared", async () => {
     const request = deferred()
     sessionAPI.getTimeline.mockReturnValueOnce(request.promise)

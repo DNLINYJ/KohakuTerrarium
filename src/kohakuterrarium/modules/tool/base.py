@@ -5,13 +5,14 @@ from abc import abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
 from kohakuterrarium.builtin_skills import get_builtin_tool_doc
+from kohakuterrarium.modules.ui_owner import UIOwnerMixin
 from kohakuterrarium.modules.tool.media_policy import MediaPolicy
 from kohakuterrarium.modules.tool.request_replay import RequestReplay
 from kohakuterrarium.modules.tool.runtime_options import validate_tool_options
-from kohakuterrarium.utils.fs_path import coerce_fs_path
+from kohakuterrarium.utils.file.path import coerce_fs_path
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -75,6 +76,12 @@ class ToolContext:
     def scratchpad(self) -> Any:
         """Backward-compatible accessor for session.scratchpad."""
         return self.session.scratchpad if self.session else None
+
+    @property
+    def widgets(self) -> Any:
+        """The agent's :class:`WidgetService`, or ``None`` without an output router."""
+        router = getattr(self.agent, "output_router", None)
+        return getattr(router, "widgets", None)
 
 
 def resolve_tool_path(path_str: str, context: ToolContext | None = None) -> Path:
@@ -154,7 +161,7 @@ class Tool(Protocol):
         ...
 
 
-class BaseTool:
+class BaseTool(UIOwnerMixin):
     """Provide common configuration, error handling, and documentation lookup."""
 
     needs_context: bool = False
@@ -191,6 +198,13 @@ class BaseTool:
 
     # Buckets order prompt contributions; names remain alphabetical within each bucket.
     prompt_contribution_bucket: str = "normal"
+
+    # Argument name -> "read" | "write" for arguments holding file paths; the
+    # sandbox plugin checks each declared value (a path or a list of paths).
+    path_arguments: ClassVar[dict[str, str]] = {}
+
+    # Widget renderer ids that must be attached for the model to see this tool.
+    requires_renderers: ClassVar[frozenset[str]] = frozenset()
 
     def __init__(self, config: ToolConfig | None = None):
         self.config = config or ToolConfig()
@@ -269,6 +283,13 @@ class BaseTool:
 
     def prompt_contribution(self) -> str | None:
         """Return brief system-prompt guidance, leaving full reference text to info."""
+        return None
+
+    def compact_arguments(self, args: dict[str, Any]) -> dict[str, Any] | None:
+        """Shorter arguments to keep for an old call of this tool after compaction.
+
+        ``None`` keeps the call's arguments unchanged.
+        """
         return None
 
 

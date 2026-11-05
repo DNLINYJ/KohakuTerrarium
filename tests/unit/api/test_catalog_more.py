@@ -23,7 +23,7 @@ def _client(router) -> TestClient:
 
 @pytest.fixture
 def _workspace(tmp_path):
-    from kohakuterrarium.studio.editors.workspace_fs import LocalWorkspace
+    from kohakuterrarium.studio.editors.workspace.fs import LocalWorkspace
 
     ws = LocalWorkspace.open(str(tmp_path))
     catalog_deps.set_workspace(ws)
@@ -75,17 +75,15 @@ class TestBuiltinsRoute:
         r = _client(builtins_mod.router).get(PREFIX + "/subagents")
         assert r.status_code == 200
         names = {e["name"] for e in r.json()}
-        # Built-in sub-agents documented in CLAUDE.md.
         assert {
-            "coordinator",
+            "fork",
             "critic",
             "explore",
-            "plan",
-            "research",
+            "summarize",
             "response",
             "memory_read",
             "memory_write",
-        } <= names
+        } == names
 
     def test_get_subagent_doc_unknown(self):
         r = _client(builtins_mod.router).get(PREFIX + "/subagents/ghost/doc")
@@ -140,7 +138,7 @@ class TestBuiltinsRoute:
     def test_list_models(self):
         r = _client(builtins_mod.router).get(PREFIX + "/models")
         assert r.status_code == 200
-        from kohakuterrarium.llm.profiles import list_all as list_all_models
+        from kohakuterrarium.llm.profiles.resolve import list_all as list_all_models
 
         # Route is a thin pass-through to llm.profiles.list_all.
         assert r.json() == list_all_models()

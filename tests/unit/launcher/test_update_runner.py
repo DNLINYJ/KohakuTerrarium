@@ -75,6 +75,120 @@ def test_first_install_falls_through_when_bundled_corrupt(monkeypatch, cfg_home)
     assert not result.ok
 
 
+# ── _install_from_feed never goes backwards ─────────────────────────
+
+
+class _Target:
+    def __init__(self, version):
+        self.version = version
+
+
+def _feed_install(monkeypatch, cfg_home, *, active, feed, pinned=None):
+    _t.write_active_pointer(active, build_id="b")
+    monkeypatch.setattr(_r, "resolve_feed", lambda cfg: _Target(feed))
+    downloaded = []
+    monkeypatch.setattr(
+        _r,
+        "_download_smoke_swap",
+        lambda target, progress: downloaded.append(target.version)
+        or _r.UpdateResult(ok=True, version=target.version),
+    )
+    cfg = _s.AppSettings()
+    cfg.pinned_version = pinned
+    result = _r._install_from_feed(cfg, lambda *a: None, is_update=True)
+    return result, downloaded
+
+
+def test_an_update_never_replaces_the_active_release_with_an_older_one(
+    monkeypatch, cfg_home
+):
+    result, downloaded = _feed_install(
+        monkeypatch, cfg_home, active="2.2.1.dev20261031", feed="2.2.0"
+    )
+    assert result.ok and result.skipped_reason == "up-to-date"
+    assert downloaded == []
+
+
+def test_an_update_installs_a_newer_release(monkeypatch, cfg_home):
+    result, downloaded = _feed_install(
+        monkeypatch, cfg_home, active="2.2.1.dev11", feed="2.2.1.dev20261031"
+    )
+    assert result.skipped_reason is None
+    assert downloaded == ["2.2.1.dev20261031"]
+
+
+def test_a_pinned_version_may_be_older_than_the_active_release(monkeypatch, cfg_home):
+    result, downloaded = _feed_install(
+        monkeypatch,
+        cfg_home,
+        active="2.2.1.dev20261031",
+        feed="2.2.0",
+        pinned="2.2.0",
+    )
+    assert downloaded == ["2.2.0"]
+
+
+# ── adopt_newer_bundle ──────────────────────────────────────────────
+
+
+def _bundle(monkeypatch, cfg_home, version):
+    bundled = cfg_home / "bundled-release"
+    bundled.mkdir(exist_ok=True)
+    _make_smoke_passing_tarball(
+        bundled / f"kohakuterrarium-{version}-linux-x64-py3.13.tar.gz", version=version
+    )
+    monkeypatch.setattr(_p, "_candidate_bundled_release_dirs", lambda: [bundled])
+    monkeypatch.setattr(_r, "smoke_test_tree", lambda d: version)
+
+
+def test_adopt_newer_bundle_replaces_an_older_active_release(monkeypatch, cfg_home):
+    _t.write_active_pointer("2.0.0.dev20260520092822+45856af", build_id="bundled")
+    _bundle(monkeypatch, cfg_home, "2.2.1.dev20261031")
+
+    result = _r.adopt_newer_bundle()
+
+    assert result.ok and result.skipped_reason is None
+    assert _t.read_active_pointer().version == "2.2.1.dev20261031"
+    assert _p.version_dir("2.2.1.dev20261031").is_dir()
+    assert _s.load().runtime.active_version == "2.2.1.dev20261031"
+
+
+@pytest.mark.parametrize("active", ["2.2.1.dev20261031", "3.0.0"])
+def test_adopt_newer_bundle_keeps_an_active_release_that_is_not_older(
+    monkeypatch, cfg_home, active
+):
+    _t.write_active_pointer(active, build_id="feed")
+    _bundle(monkeypatch, cfg_home, "2.2.1.dev20261031")
+
+    result = _r.adopt_newer_bundle()
+
+    assert result.ok and result.skipped_reason == "active-is-current"
+    assert _t.read_active_pointer().version == active
+    assert not _p.version_dir("2.2.1.dev20261031").exists()
+
+
+def test_adopt_newer_bundle_without_a_bundle_or_pointer_does_nothing(
+    monkeypatch, cfg_home
+):
+    monkeypatch.setattr(_p, "_candidate_bundled_release_dirs", lambda: [])
+    assert _r.adopt_newer_bundle().skipped_reason == "nothing-to-adopt"
+    _bundle(monkeypatch, cfg_home, "2.2.1")
+    assert _r.adopt_newer_bundle().skipped_reason == "nothing-to-adopt"
+
+
+def test_adopt_newer_bundle_failure_leaves_the_active_release(monkeypatch, cfg_home):
+    _t.write_active_pointer("2.0.0", build_id="bundled")
+    bundled = cfg_home / "bundled-release"
+    bundled.mkdir()
+    (bundled / "kohakuterrarium-2.2.1-linux-x64-py3.13.tar.gz").write_bytes(b"")
+    monkeypatch.setattr(_p, "_candidate_bundled_release_dirs", lambda: [bundled])
+
+    result = _r.adopt_newer_bundle()
+
+    assert not result.ok
+    assert _t.read_active_pointer().version == "2.0.0"
+
+
 # ── _install_from_feed via run_update ──────────────────────────────
 
 

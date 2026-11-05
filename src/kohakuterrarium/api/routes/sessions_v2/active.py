@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from kohakuterrarium.api.deps import get_service, resolve_request_session_dir
-from kohakuterrarium.api.routes.persistence.resume_coordinator import (
+from kohakuterrarium.api.routes.persistence.resume.coordinator import (
     conversation_coordination_key,
     resume_coordinator,
 )
@@ -30,7 +30,7 @@ from kohakuterrarium.studio.sessions import lifecycle, remote_meta
 from kohakuterrarium.studio.sessions.recipe_merge import apply_recipe_to_session
 from kohakuterrarium.studio.sessions.registry import session_pwd
 from kohakuterrarium.terrarium.config import CreatureConfig
-from kohakuterrarium.terrarium.service import TerrariumService
+from kohakuterrarium.terrarium.service.service import TerrariumService
 
 router = APIRouter()
 

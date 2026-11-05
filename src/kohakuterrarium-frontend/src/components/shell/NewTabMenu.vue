@@ -22,11 +22,19 @@
       <span class="i-carbon-user-admin" />
       Open Admin
     </button>
+    <template v-if="extensionTabs.length">
+      <div class="border-t border-warm-200 dark:border-warm-700 my-1" />
+      <button v-for="ext in extensionTabs" :key="ext.key" class="w-full text-left px-3 py-1.5 hover:bg-warm-100 dark:hover:bg-warm-800 flex items-center gap-2" :data-ext-tab="ext.key" :title="ext.package" @click="openExtension(ext.key)">
+        <span :class="ext.icon" />
+        <span class="truncate">{{ ext.label }}</span>
+      </button>
+    </template>
   </div>
 </template>
 
 <script setup>
 import { computed } from "vue"
+import { extensionTabLaunchers, openExtensionTab } from "@/ext/registry"
 import { useTabsStore } from "@/stores/tabs"
 import { useAuthStore } from "@/stores/auth"
 
@@ -62,6 +70,13 @@ function openCatalog() {
 function openSettings() {
   focusGroup()
   tabs.openTab({ kind: "settings", id: "settings" })
+  emit("close")
+}
+const extensionTabs = computed(() => extensionTabLaunchers())
+
+function openExtension(key) {
+  focusGroup()
+  openExtensionTab(key)
   emit("close")
 }
 function openAdmin() {

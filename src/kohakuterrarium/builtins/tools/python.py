@@ -8,11 +8,10 @@ import asyncio
 import contextlib
 import io
 import os
-import sys
 import traceback
 from typing import Any
 
-from kohakuterrarium.builtins.tools.bash import (
+from kohakuterrarium.builtins.tools.bash.bash import (
     _format_timeout,
     _subprocess_runner,
     _wait_timeout,
@@ -22,6 +21,7 @@ from kohakuterrarium.builtins.tools.subprocess.shell_utils import (
     windows_process_kwargs,
 )
 from kohakuterrarium.modules.tool.base import BaseTool, ExecutionMode, ToolResult
+from kohakuterrarium.utils.interpreter import python_command
 from kohakuterrarium.utils.timeouts import resolve_timeout_arg
 from kohakuterrarium.utils.logging import get_logger
 from kohakuterrarium.utils.mobile_sandbox import is_mobile_profile
@@ -43,7 +43,10 @@ class PythonTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "Run a Python snippet and return its stdout. Use for computation and data munging. Not for shell pipelines - use bash."
+        return (
+            "Run a Python snippet and return its stdout. Use it for computation, data "
+            "munging and quick checks. Not for shell pipelines - use bash."
+        )
 
     @property
     def execution_mode(self) -> ExecutionMode:
@@ -84,7 +87,7 @@ class PythonTool(BaseTool):
         if is_mobile_profile():
             return await self._execute_in_process(code, cwd, timeout)
 
-        python_cmd = [sys.executable, "-c", code]
+        python_cmd = [*python_command(), "-c", code]
 
         try:
             runner = _subprocess_runner(context)

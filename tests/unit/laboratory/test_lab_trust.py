@@ -11,15 +11,15 @@ is attacker-controllable on the client-to-client hop. So:
 
 import pytest
 
-from kohakuterrarium.laboratory._internal.app import AppMessage, build_app_envelope
-from kohakuterrarium.laboratory._internal.app_acl import is_host_only_client_forward
+from kohakuterrarium.laboratory._internal.app.app import AppMessage, build_app_envelope
+from kohakuterrarium.laboratory._internal.app.acl import is_host_only_client_forward
 from kohakuterrarium.laboratory._internal.protocol import HOST_NODE_ID
-from kohakuterrarium.laboratory.adapters.studio_settings import StudioSettingsAdapter
-from kohakuterrarium.laboratory.adapters.terrarium_runtime_drive import (
+from kohakuterrarium.laboratory.adapters.studio.settings import StudioSettingsAdapter
+from kohakuterrarium.laboratory.adapters.terrarium.runtime_drive import (
     handle_drive_request,
 )
-from kohakuterrarium.studio.identity import drive_settings as _ds
-from kohakuterrarium.terrarium.creature_host import Creature
+from kohakuterrarium.studio.identity.drive_settings import settings as _ds
+from kohakuterrarium.terrarium.creature.host import Creature
 from kohakuterrarium.terrarium.drive.config import (
     DriveRuntimeConfig,
     default_registrations,
@@ -27,8 +27,8 @@ from kohakuterrarium.terrarium.drive.config import (
 from kohakuterrarium.terrarium.drive.models import ActorRef
 from kohakuterrarium.terrarium.drive.requests import CreateDriveRequest
 from kohakuterrarium.terrarium.drive.wire import pack_create_request
-from kohakuterrarium.terrarium.engine import Terrarium
-from kohakuterrarium.terrarium.service import LocalTerrariumService
+from kohakuterrarium.terrarium.engine.engine import Terrarium
+from kohakuterrarium.terrarium.service.service import LocalTerrariumService
 from kohakuterrarium.testing.terrarium import _FakeAgent
 
 pytestmark = pytest.mark.timeout(30)

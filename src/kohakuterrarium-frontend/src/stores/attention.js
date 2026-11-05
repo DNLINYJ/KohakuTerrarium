@@ -1,9 +1,11 @@
 import { computed } from "vue"
 
 const snapshots = new Map()
+const workPeriods = new Map()
 const listeners = new Set()
 const edgeListeners = new Set()
 const INTERACTIVE_TYPES = new Set(["ask_text", "confirm", "selection", "card"])
+const INTERACTIVE_RENDERERS = new Set(["kt.ask_text", "kt.confirm", "kt.selection", "kt.card"])
 
 function notifyListeners() {
   for (const listener of listeners) listener()
@@ -12,38 +14,67 @@ function notifyListeners() {
 export function createAttentionState() {
   return {
     completed: 0,
+    errors: 0,
     processing: false,
     seen: new Set(),
     pending: new Set(),
   }
 }
 
+/** Whether ``event`` reports a turn that failed. */
+function isProcessingError(event) {
+  return (
+    event.type === "processing_error" ||
+    (event.type === "activity" && event.activity_type === "processing_error")
+  )
+}
+
 function attentionEventId(event) {
-  return event?.ui_event_id ?? event?.event_id ?? event?.payload?.event_id
+  return event?.ui_event_id ?? event?.widget_id ?? event?.payload?.event_id ?? event?.event_id
+}
+
+/** Whether ``event`` raises a prompt that waits for the user. */
+function opensAttention(event) {
+  if (event.interactive !== true) return false
+  if (INTERACTIVE_TYPES.has(event.type)) return true
+  if (event.type !== "widget" || event.update_target) return false
+  const renderer = event.payload?.renderer ?? event.renderer
+  const awaiting = event.payload?.awaiting ?? event.awaiting
+  return INTERACTIVE_RENDERERS.has(renderer) || awaiting === true
+}
+
+/** Whether ``event`` resolves a pending prompt. */
+function closesAttention(event) {
+  switch (event.type) {
+    case "ui_supersede":
+    case "timeout":
+    case "widget_close":
+    case "widget_message":
+      return true
+    case "ui_reply_ack":
+      return ["accepted", "superseded"].includes(event.status)
+    case "widget_ack":
+      return event.kind !== "state" && ["accepted", "superseded"].includes(event.status)
+    case "widget":
+      return Boolean(event.update_target) && event.payload?.awaiting === false
+    default:
+      return false
+  }
 }
 
 export function reduceAttention(state, event) {
+  if (event?.type === "activity") event = { ...event, type: event.activity_type }
   if (!event || event.replay) return state
   if (event.history) {
     const eventId = attentionEventId(event)
-    if (
-      event.interactive === true &&
-      INTERACTIVE_TYPES.has(event.type) &&
-      eventId &&
-      !state.seen.has(eventId)
-    ) {
+    if (opensAttention(event) && eventId && !state.seen.has(eventId)) {
       return {
         ...state,
         seen: new Set([...state.seen, eventId]),
         pending: new Set([...state.pending, eventId]),
       }
     }
-    if (
-      eventId &&
-      (event.type === "ui_supersede" ||
-        event.type === "timeout" ||
-        (event.type === "ui_reply_ack" && ["accepted", "superseded"].includes(event.status)))
-    ) {
+    if (eventId && closesAttention(event)) {
       const pending = new Set(state.pending)
       pending.delete(eventId)
       return { ...state, pending }
@@ -51,7 +82,7 @@ export function reduceAttention(state, event) {
     return state
   }
   const next = { ...state, seen: new Set(state.seen), pending: new Set(state.pending) }
-  if (event.interactive === true && INTERACTIVE_TYPES.has(event.type)) {
+  if (opensAttention(event)) {
     const eventId = attentionEventId(event)
     if (eventId && !next.seen.has(eventId)) {
       next.seen.add(eventId)
@@ -62,6 +93,14 @@ export function reduceAttention(state, event) {
 
   if (event.type === "processing_start") {
     next.processing = true
+    next.background = false
+    return next
+  }
+
+  if (isProcessingError(event)) {
+    next.processing = false
+    next.background = false
+    next.errors = (next.errors ?? 0) + 1
     return next
   }
 
@@ -70,6 +109,7 @@ export function reduceAttention(state, event) {
     // a completion: no counter, no attention edge. The auto-wake turn that
     // reports the result raises its own genuine edge later.
     if (next.processing && !event.awaiting_background) next.completed += 1
+    next.background = event.awaiting_background === true
     next.processing = false
     return next
   }
@@ -79,15 +119,31 @@ export function reduceAttention(state, event) {
     return next
   }
 
-  if (event.type === "ui_reply_ack" && !["accepted", "superseded"].includes(event.status)) {
+  if (["processing_error", "turn_error", "interrupt", "stopped"].includes(event.type)) {
+    next.processing = false
+    next.background = false
     return next
   }
 
-  if (["ui_reply_ack", "ui_supersede", "timeout"].includes(event.type)) {
+  if (closesAttention(event)) {
     const eventId = attentionEventId(event)
     if (eventId) next.pending.delete(eventId)
   }
   return next
+}
+
+/** The question and answer buttons of a confirm prompt, as `{ prompt, detail, options }`. */
+function confirmPrompt(event) {
+  if (event.type !== "confirm" || !Array.isArray(event.payload?.options)) return {}
+  const options = event.payload.options
+    .filter((option) => option && typeof option.id === "string" && typeof option.label === "string")
+    .map(({ id, label, style }) => ({ id, label, ...(style ? { style } : {}) }))
+  if (!options.length) return {}
+  return {
+    prompt: String(event.payload.prompt ?? ""),
+    detail: String(event.payload.detail ?? ""),
+    options,
+  }
 }
 
 /** Reduce and report only genuine attention edges. */
@@ -110,6 +166,7 @@ export function reduceAttentionEdge(state, event, target = {}) {
         kind,
         ...(eventId ? { eventId } : {}),
         ...(target.summary ? { summary: target.summary } : {}),
+        ...(kind === "waiting-input" ? confirmPrompt(event) : {}),
       }
     : null
   if (edge?.scope && edge?.tab) {
@@ -141,13 +198,50 @@ export function restoreAttentionFromHistory(events, current = createAttentionSta
   }
 }
 
-export function publishAttention(scope, tab, state) {
+export function publishAttention(scope, tab, state, event) {
   if (!scope || !tab) return
+  if (event?.type === "activity") event = { ...event, type: event.activity_type }
+  const before = workForScope(scope).busy
   snapshots.set(`${scope}\0${tab}`, { scope, tab, state })
+  if (!tab.startsWith("ch:") && !event?.replay && !event?.history) {
+    const period = { ...(workPeriods.get(scope) || { started: 0, outcome: "idle" }) }
+    const busy = workForScope(scope).busy
+    if (!before && busy && (!event || event.type === "processing_start")) {
+      period.outcome = "idle"
+      if (event?.type === "processing_start") period.started++
+    }
+    if (["processing_error", "turn_error"].includes(event?.type)) period.outcome = "failed"
+    if (
+      before &&
+      !busy &&
+      period.outcome !== "failed" &&
+      ["processing_end", "tool_done", "tool_error", "subagent_done", "subagent_error"].includes(
+        event?.type,
+      )
+    )
+      period.outcome = "ready"
+    workPeriods.set(scope, period)
+  }
   notifyListeners()
 }
 
+/** Current observed work across a session; started advances only on live idle-to-work edges. */
+export function workForScope(scope) {
+  let busy = false,
+    waiting = false
+  for (const snapshot of snapshots.values()) {
+    if (snapshot.scope !== scope || snapshot.tab.startsWith("ch:")) continue
+    const state = snapshot.state
+    busy ||= Boolean(state.processing || state.background)
+    waiting ||= state.pending.size > 0
+  }
+  const period = workPeriods.get(scope)
+  const status = waiting ? "waiting" : busy ? "running" : period?.outcome || "idle"
+  return { status, busy, started: period?.started || 0 }
+}
+
 export function removeAttentionScope(scope) {
+  workPeriods.delete(scope)
   let changed = false
   for (const [key, snapshot] of snapshots) {
     if (snapshot.scope !== scope) continue
@@ -187,6 +281,38 @@ export function totalAttention() {
   return { pending, completed }
 }
 
+/** Every state the desktop shell shows: `{ waiting, failed, running, finished }` across all tabs. */
+export function attentionOverview() {
+  const overview = { waiting: 0, failed: 0, running: 0, finished: 0 }
+  for (const { state } of snapshots.values()) {
+    overview.waiting += state?.pending?.size ?? 0
+    overview.failed += state?.errors ?? 0
+    overview.running += state?.processing ? 1 : 0
+    overview.finished += state?.completed ?? 0
+  }
+  return overview
+}
+
+/** The scopes with something waiting for the user: `[{ scope, tab, pending }]`, in registration order. */
+export function waitingAttentionTargets() {
+  const targets = []
+  for (const { scope, tab, state } of snapshots.values()) {
+    const pending = state?.pending?.size ?? 0
+    if (pending > 0) targets.push({ scope, tab, pending })
+  }
+  return targets
+}
+
+/** The first tab that needs the user: one waiting for input, else one with finished work. */
+export function firstAttentionTarget() {
+  let finished = null
+  for (const { scope, tab, state } of snapshots.values()) {
+    if (state?.pending?.size > 0) return { scope, tab }
+    if (!finished && state?.completed > 0) finished = { scope, tab }
+  }
+  return finished
+}
+
 export function subscribeAttention(listener) {
   listeners.add(listener)
   return () => listeners.delete(listener)
@@ -194,6 +320,7 @@ export function subscribeAttention(listener) {
 
 export function clearAttentionRegistry() {
   snapshots.clear()
+  workPeriods.clear()
   notifyListeners()
 }
 
@@ -201,6 +328,7 @@ export function markAttentionRead(state) {
   return {
     ...state,
     completed: 0,
+    errors: 0,
     seen: new Set(state.seen),
     pending: new Set(state.pending),
   }

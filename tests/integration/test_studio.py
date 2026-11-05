@@ -41,7 +41,11 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
+from kohakuvault import KVault
 
+import kohakuterrarium.session.vault.io as vault_io
+from kohakuterrarium.studio.identity.module_defaults import patch_defaults
 from kohakuterrarium.errors import (
     InvalidRequestError,
     NotFoundError,
@@ -52,17 +56,18 @@ from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
 from kohakuterrarium.core.agent import Agent
 from kohakuterrarium.packages.locations import ensure_local_project
-from kohakuterrarium.studio.catalog.packages_scan import scan_creatures_in_dirs
-from kohakuterrarium.session.embedding import BaseEmbedder
+from kohakuterrarium.studio.catalog.packages.scan import scan_creatures_in_dirs
+from kohakuterrarium.session.memory.embedding import BaseEmbedder
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.session.resource_gate import GATE, try_fast
-from kohakuterrarium.studio.identity import grok_subscription
+from kohakuterrarium.session.occupancy.gate import GATE, try_fast
+from kohakuterrarium.studio.identity.grok import subscription as grok_subscription
 from kohakuterrarium.studio.persistence import store as _persistence_store_mod
 from kohakuterrarium.studio.persistence.session_index import close_session_index
-from kohakuterrarium.studio.sessions import memory_search as _session_memory_mod
+from kohakuterrarium.studio.sessions.memory import search as _session_memory_mod
 from kohakuterrarium.studio.studio import Studio
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
-from kohakuterrarium.utils.file_lock import FileLock
+from kohakuterrarium.testing.llm_seam import real_llm_providers
+from kohakuterrarium.utils.file.lock import FileLock
 from kohakuterrarium.session import job_reaper, run_state
 from kohakuterrarium.studio.sessions.live import live_sessions
 from kohakuterrarium.studio.sessions.live.restore import restore_live_sessions
@@ -225,7 +230,7 @@ class TestStudioIntegration:
         workspace_root.mkdir()
         session_dir = isolated_paths["session_dir"]
 
-        from kohakuterrarium.studio.editors.workspace_fs import LocalWorkspace
+        from kohakuterrarium.studio.editors.workspace.fs import LocalWorkspace
 
         async with Studio() as studio:
             # --- editors: scaffold + edit a workspace creature ----------
@@ -444,7 +449,45 @@ class TestStudioIntegration:
             console_line = "typed at the server console\n"
             console = io.StringIO(console_line)
             monkeypatch.setattr(sys, "stdin", console)
+            config_file = creature_dir / "config.yaml"
+            creature_data = yaml.safe_load(config_file.read_text())
+            creature_data.setdefault("tools", []).append(
+                {"name": "web_search", "need_content": False}
+            )
+            creature_data["plugins"] = [
+                {
+                    "name": "budget",
+                    "enabled": False,
+                    "options": {"turn_budget": [20, 40]},
+                }
+            ]
+            config_file.write_text(yaml.safe_dump(creature_data))
+            with pytest.raises(ValueError, match="numeric"):
+                patch_defaults("plugin", "budget", {"turn_budget": {"hard": "abc"}})
+            patch_defaults(
+                "tool", "web_search", {"fallback": "duckduckgo", "need_content": True}
+            )
+            patch_defaults("plugin", "budget", {"walltime_budget": {"hard": 300}})
             session = await studio.sessions.start_creature(str(creature_dir))
+            initialized = studio.sessions.find_creature(
+                session.session_id, "scout"
+            ).agent
+            assert (
+                initialized.tool_options.get("web_search")["fallback"] == "duckduckgo"
+            )
+            assert initialized.tool_options.get("web_search")["need_content"] is False
+            assert initialized.plugins.get_plugin("budget").get_options()[
+                "turn_budget"
+            ] == [20, 40]
+            assert not initialized.plugins.is_enabled("budget")
+            initialized.tool_options.set("web_search", {"need_content": True})
+            patch_defaults(
+                "tool", "web_search", {"fallback": "none", "need_content": False}
+            )
+            assert (
+                initialized.tool_options.get("web_search")["fallback"] == "duckduckgo"
+            )
+            assert initialized.tool_options.get("web_search")["need_content"] is True
             assert session.name == "scout"
             assert len(session.creatures) == 1
             creature_id = session.creatures[0]["creature_id"]
@@ -614,6 +657,35 @@ class TestStudioIntegration:
                 event_types = {e["type"] for e in events["events"]}
                 assert "user_input" in event_types
                 assert "text_chunk" in event_types
+                event_reads = []
+                original_read = KVault.get_many
+
+                def read_event_values(table, keys, *args, **kwargs):
+                    if table is store.events:
+                        event_reads.extend(keys)
+                    return original_read(table, keys, *args, **kwargs)
+
+                with monkeypatch.context() as counters:
+                    counters.setattr(vault_io, "READ_CHUNK", 1)
+                    counters.setattr(KVault, "get_many", read_event_values)
+                    cursor = None
+                    for index in range(2):
+                        event_reads.clear()
+                        page = studio.persistence.viewer.events(
+                            store,
+                            saved_stem,
+                            agent="scout",
+                            turn_index=None,
+                            types=None,
+                            from_ts=None,
+                            to_ts=None,
+                            limit=1,
+                            cursor=cursor,
+                        )
+                        assert page["events"] == events["events"][index : index + 1]
+                        cursor = events["events"][index]["event_id"]
+                        assert page["next_cursor"] == cursor
+                        assert len(event_reads) == index + 1
                 # Filtering events by type narrows the result set to
                 # exactly the requested kind.
                 only_inputs = studio.persistence.viewer.events(
@@ -691,6 +763,20 @@ class TestStudioIntegration:
             } == expected_saved
             assert len(resumed.creatures) == 1
             resumed_cid = resumed.creatures[0]["creature_id"]
+            resumed_agent = studio.sessions.find_creature(
+                resumed.session_id, resumed_cid
+            ).agent
+            assert (
+                resumed_agent.tool_options.get("web_search")["fallback"] == "duckduckgo"
+            )
+            assert resumed_agent.tool_options.get("web_search")["need_content"] is True
+            assert resumed_agent.plugins.get_plugin("budget").get_options()[
+                "walltime_budget"
+            ] == {"hard": 300}
+            assert resumed_agent.plugins.get_plugin("budget").get_options()[
+                "turn_budget"
+            ] == [20, 40]
+            assert not resumed_agent.plugins.is_enabled("budget")
             resumed_history = await studio.sessions.chat.history(
                 resumed.session_id, resumed_cid
             )
@@ -733,6 +819,7 @@ class TestStudioIntegration:
             index = studio.persistence.history_index(saved_path)
             assert index["session_name"] == saved_stem
             assert "scout" in index["targets"]
+            assert index["viewer_agents"] == ["scout"]
             scout_history = studio.persistence.history(saved_path, "scout")
             assert scout_history["session_name"] == saved_stem
             assert scout_history["meta"]["agents"] == ["scout"]
@@ -759,6 +846,30 @@ class TestStudioIntegration:
             assert (
                 diff_scoped["a"]["total_messages"] >= diff_scoped["b"]["total_messages"]
             )
+
+            fork_history_before = studio.persistence.history(fork_path, "scout")
+            attached = "scout:attached:review:0"
+            discovery_store = SessionStore(fork_path)
+            try:
+                discovery_store.append_event(
+                    attached, "user_input", {"content": "review the fork"}
+                )
+                discovery_store.set_viewer_default_agent(attached)
+                viewer_summary = studio.persistence.viewer.summary(
+                    discovery_store, fork_path.stem
+                )
+            finally:
+                discovery_store.close(update_status=False)
+            fork_index = studio.persistence.history_index(fork_path)
+            assert fork_index["viewer_agents"] == [attached, "scout"]
+            assert fork_index["targets"] == ["scout"]
+            assert fork_index["meta"]["agents"] == ["scout"]
+            assert viewer_summary["agents"] == fork_index["viewer_agents"]
+            with pytest.raises(NotFoundError):
+                studio.persistence.history(fork_path, attached)
+            fork_history_after = studio.persistence.history(fork_path, "scout")
+            assert fork_history_after["messages"] == fork_history_before["messages"]
+            assert fork_history_after["events"] == fork_history_before["events"]
 
             # --- persistence.list sees both sessions now ----------------
             fork_stem = fork_path.name.split(".kohakutr")[0]
@@ -1174,9 +1285,10 @@ class TestStudioIntegration:
             # --- model switch: needs a key + a profile ------------------
             studio.identity.keys.set("openai", "sk-integration-test-key")
             studio.identity.llm.save_profile("rt-fast", "gpt-4o-mini", "openai")
-            new_model = studio.sessions.model.switch(
-                session_id, creature_id, "openai/rt-fast"
-            )
+            with real_llm_providers():
+                new_model = studio.sessions.model.switch(
+                    session_id, creature_id, "openai/rt-fast"
+                )
             assert new_model == "openai/rt-fast"
             # The live creature status reflects the swap.
             status = studio.sessions.list_creatures(session_id)[0]
@@ -1188,10 +1300,11 @@ class TestStudioIntegration:
             assert any(p["name"] == "sandbox" for p in plugins)
             assert any(p["name"] == "goal" and p["enabled"] for p in plugins)
             assert any(p["name"] == "drive_runtime" and p["enabled"] for p in plugins)
+            # The renderer-gated UI plugins are on by default; policy plugins are off.
+            on_by_default = {"goal", "drive_runtime", "ui.apps", "ui.declarative"}
+            assert {p["name"] for p in plugins if p["enabled"]} == on_by_default
             assert all(
-                p["enabled"] is False
-                for p in plugins
-                if p["name"] not in {"goal", "drive_runtime"}
+                p["enabled"] is False for p in plugins if p["name"] not in on_by_default
             )
             toggled_on = await studio.sessions.plugins.toggle(
                 session_id, creature_id, "sandbox"
@@ -1323,7 +1436,27 @@ class TestStudioIntegration:
                     },
                 ),
             ]
+            patch_defaults(
+                "plugin", "budget", {"walltime_budget": {"hard": 321}}, enabled=False
+            )
             team = await studio.sessions.start_terrarium(str(recipe))
+            for member in team.creatures:
+                member_agent = studio.sessions.find_creature(
+                    team.session_id, member["creature_id"]
+                ).agent
+                assert member_agent.plugins.get_plugin("budget").get_options()[
+                    "walltime_budget"
+                ] == {"hard": 321}
+                assert not member_agent.plugins.is_enabled("budget")
+            patch_defaults("plugin", "budget", {"walltime_budget": {"hard": 400}})
+            for member in team.creatures:
+                assert studio.sessions.find_creature(
+                    team.session_id, member["creature_id"]
+                ).agent.plugins.get_plugin("budget").get_options()[
+                    "walltime_budget"
+                ] == {
+                    "hard": 321
+                }
             assert team.name == "rt-team"
             team_sid = team.session_id
             assert {c["name"] for c in team.creatures} == {"lead", "worker"}
@@ -1540,9 +1673,8 @@ class TestStudioIntegration:
             # carries a ``name`` selector.
             all_models = studio.identity.llm.list_models()
             assert all_models and all("name" in m for m in all_models)
-            # Native-tool descriptors are a fixed catalog.
-            native_tools = studio.identity.llm.list_native_tools()
-            assert native_tools and all("name" in t for t in native_tools)
+            # No shipped tool is provider-native (image_gen runs locally).
+            assert studio.identity.llm.list_native_tools() == []
 
             # --- identity.llm: delete the user backend ------------------
             assert studio.identity.llm.delete_backend("acme") is True
@@ -1629,7 +1761,10 @@ class TestStudioIntegration:
             assert bash_info["name"] == "bash"
             assert bash_info["source"] == "builtin"
             subagent_entries = studio.catalog.builtins.list("subagents")
-            assert {"explore", "plan"} <= {s["name"] for s in subagent_entries}
+            assert {"explore", "critic"} <= {s["name"] for s in subagent_entries}
+            assert not {"worker", "plan", "research", "coordinator"} & {
+                s["name"] for s in subagent_entries
+            }
             # Triggers are a first-class builtin kind too.
             trigger_names = {
                 t["name"] for t in studio.catalog.builtins.list("triggers")
@@ -1796,8 +1931,8 @@ class TestStudioIntegration:
         Mirrors the managed CLI/TUI/web path: Studio is the settings owner and
         every Drive op funnels through ``TerrariumService`` (design §8.4, §9.2).
         """
-        from kohakuterrarium.studio.identity import drive_settings as ds
-        from kohakuterrarium.studio.identity.drive_settings import (
+        from kohakuterrarium.studio.identity.drive_settings import settings as ds
+        from kohakuterrarium.studio.identity.drive_settings.settings import (
             DriveSettings,
             RegistrationSetting,
         )

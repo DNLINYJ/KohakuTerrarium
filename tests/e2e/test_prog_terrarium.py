@@ -25,7 +25,7 @@ import pytest
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
 from kohakuterrarium.core.channel import ChannelMessage
-from kohakuterrarium.core.config_types import (
+from kohakuterrarium.core.config.types import (
     AgentConfig,
     InputConfig,
     OutputConfig,
@@ -39,22 +39,22 @@ from kohakuterrarium.terrarium.drive.config import (
 )
 from kohakuterrarium.terrarium.drive.models import ActorRef, DriveStatus
 from kohakuterrarium.terrarium.drive.requests import CreateDriveRequest, DrivePatch
-from kohakuterrarium.terrarium.engine import Terrarium
+from kohakuterrarium.terrarium.engine.engine import Terrarium
 from kohakuterrarium.terrarium.events import EventKind
-from kohakuterrarium.terrarium.service import LocalTerrariumService
-from kohakuterrarium.terrarium.tools_group_channel import GroupChannelTool
-from kohakuterrarium.terrarium.tools_group_lifecycle import (
+from kohakuterrarium.terrarium.service.service import LocalTerrariumService
+from kohakuterrarium.terrarium.tools.channel import GroupChannelTool
+from kohakuterrarium.terrarium.tools.lifecycle import (
     GroupAddNodeTool,
     GroupRemoveNodeTool,
     GroupStartNodeTool,
     GroupStopNodeTool,
 )
-from kohakuterrarium.terrarium.tools_group_send import (
+from kohakuterrarium.terrarium.tools.send import (
     GroupSendTool,
     SendChannelTool,
 )
-from kohakuterrarium.terrarium.tools_group_status import GroupStatusTool
-from kohakuterrarium.terrarium.tools_group_wire import GroupWireTool
+from kohakuterrarium.terrarium.tools.status import GroupStatusTool
+from kohakuterrarium.terrarium.tools.wire import GroupWireTool
 from kohakuterrarium.testing.llm import ScriptedLLM
 
 pytestmark = pytest.mark.timeout(30)

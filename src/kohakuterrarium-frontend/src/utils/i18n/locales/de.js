@@ -334,6 +334,40 @@ export default {
     "Zeigt Eingabebedarf oder ungelesene Anzahl im Browser-Symbol.",
   "settings.prefs.desktopAttention": "Desktop-Fenster hervorheben",
   "settings.prefs.desktopAttentionHint": "Markiert das inaktive kt-app-Fenster.",
+  "settings.desktop.title": "Desktop-App",
+  "settings.desktop.terminalTitle": "Terminalbefehl",
+  "settings.desktop.terminalHint":
+    "Führt kt, kt-cli und kt-tui in jedem Terminal mit der Laufzeit dieser App aus.",
+  "settings.desktop.terminalLocation": "Installiert in {dir}",
+  "settings.desktop.terminalReopen": "Öffne ein neues Terminal, damit die Änderung wirksam wird.",
+  "settings.desktop.terminalFailed": "Der Terminalbefehl konnte nicht geändert werden.",
+  "settings.desktop.autostartTitle": "Beim Anmelden starten",
+  "settings.desktop.autostartHint": "KohakuTerrarium beim Anmelden automatisch öffnen.",
+  "settings.desktop.keychainTitle": "API-Schlüssel im System-Schlüsselbund speichern",
+  "settings.desktop.keychainHint":
+    "Die Schlüssel der Anbieter wandern aus der Schlüsseldatei nach {backend}. Beim Ausschalten kommen sie zurück.",
+  "settings.desktop.keychainFailed":
+    "Die Schlüssel konnten nicht verschoben werden. Es wurde nichts geändert.",
+  "desktop.openFailed": "{path} konnte nicht geöffnet werden: {reason}",
+  "settings.desktop.summonTitle": "Tastenkürzel zum Herholen",
+  "settings.desktop.summonHint":
+    "Ein systemweites Tastenkürzel, das KohakuTerrarium aus jeder App nach vorn holt und den Cursor ins Nachrichtenfeld setzt.",
+  "settings.desktop.summonSet": "Tastenkürzel festlegen",
+  "settings.desktop.summonRecording": "Tastenkürzel drücken …",
+  "settings.desktop.summonClear": "Entfernen",
+  "settings.desktop.summonUnavailable":
+    "Dieses Tastenkürzel konnte nicht verwendet werden. Möglicherweise belegt es eine andere App.",
+  "settings.desktop.trayTitle": "Im Infobereich weiterlaufen",
+  "settings.desktop.trayHint":
+    "Beim Schließen wird das Fenster nur ausgeblendet, damit die Agenten weiterarbeiten. Das Symbol zeigt, was auf dich wartet; beende die App über sein Menü.",
+  "settings.desktop.updateTitle": "App-Updates",
+  "settings.desktop.updateHint":
+    "Sucht nach einer neueren Desktop-Shell. Die Python-Laufzeit wird separat aktualisiert.",
+  "settings.desktop.updateCheck": "Nach Updates suchen",
+  "settings.desktop.updateCurrent": "Du hast die neueste Version.",
+  "settings.desktop.updateAvailable": "Version {version} ist verfügbar.",
+  "settings.desktop.updateInstall": "Installieren und neu starten",
+  "settings.desktop.updateFailed": "Die Update-Suche oder Installation ist fehlgeschlagen.",
 
   "settings.prefs.desktopZoom": "Desktop-Zoom",
   "settings.prefs.mobileZoom": "Mobile-Zoom",

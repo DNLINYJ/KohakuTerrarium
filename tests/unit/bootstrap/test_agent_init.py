@@ -14,16 +14,19 @@ from types import SimpleNamespace
 import pytest
 
 from kohakuterrarium.bootstrap.agent_init import AgentInitMixin
-from kohakuterrarium.modules.plugin.base import BasePlugin
-from kohakuterrarium.modules.plugin.manager import PluginManager
+from kohakuterrarium.modules.plugin.base import BasePlugin, ToolVisibility
+from kohakuterrarium.modules.plugin.manager.manager import PluginManager
 from kohakuterrarium.builtins.tool_catalog import get_builtin_tool
-from kohakuterrarium.core.config_types import AgentConfig
-from kohakuterrarium.core.executor import Executor
+from kohakuterrarium.core.config.types import AgentConfig
+from kohakuterrarium.core.conversation.context_snapshot import ContextSnapshot
+from kohakuterrarium.core.jobs.executor import Executor
 from kohakuterrarium.core.registry import Registry
 from kohakuterrarium.core.session import Session
-from kohakuterrarium.modules.output.router import OutputRouter
+from kohakuterrarium.modules.output.router.router import OutputRouter
 from kohakuterrarium.parsing.format import BRACKET_FORMAT, XML_FORMAT
 from kohakuterrarium.testing.output import OutputRecorder
+
+pytestmark = pytest.mark.usefixtures("native_image_gen")
 
 
 class _FakeLLM:
@@ -46,6 +49,9 @@ class _FakeAgent(AgentInitMixin):
     def __init__(self, **attrs):
         for key, value in attrs.items():
             setattr(self, key, value)
+
+    def capture_context(self) -> ContextSnapshot:
+        return ContextSnapshot.from_dict({"messages": [], "provenance": {}})
 
 
 # ── _init_llm ───────────────────────────────────────────────────
@@ -341,6 +347,7 @@ class TestInitSubagents:
             config=AgentConfig(name="a"),
             registry=registry,
             executor=executor,
+            plugins=PluginManager(),
             llm=_FakeLLM(),
             _loader=None,
         )
@@ -349,6 +356,8 @@ class TestInitSubagents:
         # the parent executor for tool-context building.
         assert isinstance(fake.subagent_manager, SubAgentManager)
         assert fake.subagent_manager._parent_executor is executor
+        assert fake.subagent_manager._capture_context == fake.capture_context
+        assert fake.subagent_manager._parent_plugins is fake.plugins
         assert captured["registry"] is registry
 
 
@@ -371,6 +380,7 @@ class TestInitInputOutput:
         # An OutputRouter is constructed; no named outputs declared → empty set.
         assert isinstance(fake.output_router, OutputRouter)
         assert fake._known_outputs == set()
+        assert fake.output_router.widgets.agent is fake
 
     def test_init_output_uses_custom_override(self):
         cfg = AgentConfig(name="a")
@@ -677,7 +687,9 @@ class TestInitController:
             registry=registry,
             executor=executor,
             llm=_FakeLLM(),
-            subagent_manager=SimpleNamespace(get_subagents_prompt=lambda: ""),
+            subagent_manager=SimpleNamespace(
+                get_subagents_prompt=lambda visible=None: ""
+            ),
             _known_outputs=set(),
         )
         defaults.update(overrides)
@@ -699,7 +711,7 @@ class TestInitController:
         agent = self._agent(
             config=AgentConfig(name="ctrl-agent", tool_format="bracket"),
             subagent_manager=SimpleNamespace(
-                get_subagents_prompt=lambda: "SUBAGENT-SECTION-MARKER"
+                get_subagents_prompt=lambda visible=None: "SUBAGENT-SECTION-MARKER"
             ),
         )
         AgentInitMixin._init_controller(agent)
@@ -708,17 +720,39 @@ class TestInitController:
         native = self._agent(
             config=AgentConfig(name="ctrl-agent", tool_format="native"),
             subagent_manager=SimpleNamespace(
-                get_subagents_prompt=lambda: "SUBAGENT-SECTION-MARKER"
+                get_subagents_prompt=lambda visible=None: "SUBAGENT-SECTION-MARKER"
             ),
         )
         AgentInitMixin._init_controller(native)
         assert "SUBAGENT-SECTION-MARKER" not in native._controller_config.system_prompt
 
+    def test_subagents_section_follows_plugin_visibility(self):
+        class HideSubagents(BasePlugin):
+            name = "hide_subagents"
+
+            def get_tool_visibility(self, context):
+                return ToolVisibility(allowed_subagents=frozenset({"critic"}))
+
+        def section(visible=None):
+            names = [n for n in ("explore", "critic") if visible is None or visible(n)]
+            return "SUBAGENTS:" + ",".join(names)
+
+        plugins = PluginManager()
+        plugins.register(HideSubagents())
+        agent = self._agent(
+            config=AgentConfig(name="ctrl-agent", tool_format="bracket"),
+            subagent_manager=SimpleNamespace(get_subagents_prompt=section),
+            plugins=plugins,
+            _apply_plugin_hooks=lambda: None,
+        )
+        AgentInitMixin._init_controller(agent)
+        assert "SUBAGENTS:critic" in agent._controller_config.system_prompt
+
     def test_tools_prompt_opt_out_excludes_subagent_instructions(self):
         agent = self._agent(
             config=AgentConfig(name="ctrl-agent", include_tools_in_prompt=False),
             subagent_manager=SimpleNamespace(
-                get_subagents_prompt=lambda: "SUBAGENT-SECTION-MARKER"
+                get_subagents_prompt=lambda visible=None: "SUBAGENT-SECTION-MARKER"
             ),
         )
         AgentInitMixin._init_controller(agent)
@@ -738,7 +772,7 @@ class TestInitController:
 
     def test_plugins_wired_onto_controller(self):
         from kohakuterrarium.modules.plugin.base import BasePlugin
-        from kohakuterrarium.modules.plugin.manager import PluginManager
+        from kohakuterrarium.modules.plugin.manager.manager import PluginManager
 
         manager = PluginManager()
         plugin = BasePlugin()

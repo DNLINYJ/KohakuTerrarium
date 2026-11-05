@@ -478,6 +478,34 @@ describe("chat store — branch error classification (mayHaveRun)", () => {
     chat._adoptAuthoritativeBranchView("alice", { 1: 2 })
     expect(chat.branchViewByTab.alice).toEqual({ 1: 2 })
   })
+
+  it("sends on the live conversation when its restored path contains an unrecorded turn", async () => {
+    const chat = useChatStore()
+    seedInstance(chat, "alice")
+    const liveView = { 1: 1, 1003: 1, 1004: 1 }
+    chat._handleActivity("alice", {
+      activity_type: "session_info",
+      branch_view: liveView,
+    })
+    const send = openSend(chat)
+
+    await chat.send("current status?")
+
+    expect(JSON.parse(send.mock.lastCall[0])).toMatchObject({ type: "input", target: "alice" })
+    expect(lastBranchView(send)).toBeUndefined()
+    expect(chat.branchViewByTab.alice).toEqual(liveView)
+    expect(chat._pendingBranchPathByTab.alice).toEqual([
+      [1, 1],
+      [1003, 1],
+      [1004, 1],
+    ])
+    chat._scheduleBranchResync = vi.fn()
+    chat._onMessage(wsFrame("processing_start", 1005, 1))
+    chat._onMessage(wsFrame("text", 1005, 1, { content: "live reply" }))
+    chat._onMessage(wsFrame("processing_end", 1005, 1))
+    expect(transcript(chat)).toContain("live reply")
+    expect(chat.processingByTab.alice).toBe(false)
+  })
 })
 
 describe("chat store — branch navigation with live descendants", () => {
@@ -615,7 +643,8 @@ describe("chat store — send ancestry freeze until streaming coordinates arrive
     }
     const runningTurn = mode.endsWith("retry") ? 5 : 4
     await chat.send("continue the original")
-    expect(lastBranchView(send)).toEqual(chat.branchViewByTab.alice)
+    if (mode === "paged-retry") expect(lastBranchView(send)).toEqual(chat.branchViewByTab.alice)
+    else expect(lastBranchView(send)).toBeUndefined()
     chat.eventsByTab.alice = events
     chat.selectBranch(1, 4, "alice")
     if (mode === "queued") await chat.send("queued follow-up")

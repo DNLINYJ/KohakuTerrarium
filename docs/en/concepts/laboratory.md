@@ -175,7 +175,7 @@ need to agree on.
 
 Studio never knows whether a creature lives in-process or on a remote
 machine. The `TerrariumService` Protocol
-(`src/kohakuterrarium/terrarium/service.py`) has methods like
+(`src/kohakuterrarium/terrarium/service/service.py`) has methods like
 `add_creature`, `list_creatures`, `chat`, `connect`. Three
 implementations satisfy it:
 
@@ -199,7 +199,7 @@ every listener (including listeners on worker-2) exactly as if both
 creatures lived in the same process. The Lab achieves this with two
 mechanisms:
 
-- **Cross-node connect** (`terrarium/multi_node_replication.py`).
+- **Cross-node connect** (`terrarium/multi_node/replication.py`).
   When the user calls `service.connect(creatureA, creatureB)` and the
   two creatures live on different workers, the host:
   1. Adds the channel object on both workers' graphs.
@@ -335,7 +335,7 @@ worker's `_ensure_store_meta`
 (`src/kohakuterrarium/laboratory/adapters/_worker_session.py`)
 captures the full `AgentConfig` via `pack_agent_config` and stores it
 under `meta["config_snapshot"]`. The resume path
-(`session/resume.py::_rebuild_agent`) prefers `config_path` when the
+(`session/resume/resume.py::_rebuild_agent`) prefers `config_path` when the
 folder exists, and falls back to `unpack_agent_config(snapshot)`
 otherwise.
 
@@ -429,7 +429,7 @@ Because the snapshot is *full* (not a delta log), user removals are
 also reflected: anything the user removed simply isn't in the
 snapshot.
 
-Implementation: `src/kohakuterrarium/terrarium/topology_snapshot.py`.
+Implementation: `src/kohakuterrarium/terrarium/graph/snapshot.py`.
 Tested by `tests/integration/test_runtime_topology_resume.py`.
 
 ### Known limits today

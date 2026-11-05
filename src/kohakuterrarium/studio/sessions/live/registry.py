@@ -20,6 +20,7 @@ from typing import Any
 
 from kohakuvault import KVault
 
+from kohakuterrarium.session.vault.io import read_prefix
 from kohakuterrarium.utils.config_dir import config_dir
 from kohakuterrarium.utils.logging import get_logger
 
@@ -90,17 +91,14 @@ class LiveSessions:
     def remove(self, path: str | Path) -> bool:
         key = path_key(path)
         with _lock:
-            if key not in self._kv:
-                return False
-            del self._kv[key]
-        return True
+            return self._kv.delete(key)
 
     def rows(self) -> list[dict]:
-        out = []
-        for key in list(self._kv.keys()):
-            value = self._kv.get(key)
-            if isinstance(value, dict):
-                out.append(value)
+        out = [
+            value
+            for _, value in read_prefix(self._kv, what="live session row")
+            if isinstance(value, dict)
+        ]
         return sorted(out, key=lambda r: r.get("added_at") or 0)
 
     def close(self) -> None:

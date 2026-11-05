@@ -130,5 +130,5 @@ class SkillUserCommand(BaseUserCommand):
             header += f"Paths: {', '.join(skill.paths)}\n"
         if skill.allowed_tools:
             header += f"Allowed tools: {', '.join(skill.allowed_tools)}\n"
-        body = skill.body or "(empty body)"
+        body = skill.render_body() or "(empty body)"
         return UserCommandResult(output=header + "\n" + body)

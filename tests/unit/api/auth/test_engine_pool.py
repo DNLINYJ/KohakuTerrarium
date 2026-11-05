@@ -18,8 +18,22 @@ import asyncio
 
 import pytest
 
-from kohakuterrarium.api.auth.engine_pool import EnginePool, _user_session_dir
-from kohakuterrarium.terrarium.creature_host import Creature
+import kohakuterrarium.bootstrap.agent_init as agent_init
+import kohakuterrarium.bootstrap.llm as bootstrap_llm
+from kohakuterrarium.api.auth.db import (
+    _reset_migration_state_for_tests,
+    connection,
+    ensure_migrated,
+)
+from kohakuterrarium.api.auth.engine_pool import (
+    EnginePool,
+    _user_session_dir,
+    user_is_admin,
+)
+from kohakuterrarium.api.auth.users import create_user
+from kohakuterrarium.terrarium import host_resources_allowed
+from kohakuterrarium.terrarium.creature.host import Creature
+from kohakuterrarium.testing.llm import ScriptedLLM
 from kohakuterrarium.testing.terrarium import _FakeAgent
 
 
@@ -63,7 +77,10 @@ class TestGetOrCreate:
 
         assert isinstance(engine, _Terrarium)
         assert created == [
-            {"session_dir": str(fresh_dirs / "users" / "7" / "sessions")}
+            {
+                "session_dir": str(fresh_dirs / "users" / "7" / "sessions"),
+                "host_resources": False,
+            }
         ]
 
     def test_same_user_returns_same_engine(self, fresh_dirs):
@@ -93,6 +110,85 @@ class TestGetOrCreate:
         named = pool.get_or_create(1)
         assert anon is not named
         pool.evict_all()
+
+
+class TestHostResources:
+    def test_only_admin_engines_get_host_resources(self, fresh_dirs):
+        pool = EnginePool(max_active=4)
+        assert pool.get_or_create(1, is_admin=True).host_resources is True
+        assert pool.get_or_create(2, is_admin=False).host_resources is False
+        assert pool.get_or_create(None, is_admin=True).host_resources is False
+        pool.evict_all()
+
+    def test_role_change_updates_the_live_engine(self, fresh_dirs):
+        pool = EnginePool(max_active=4)
+        engine = pool.get_or_create(1, is_admin=True)
+        assert pool.get_or_create(1, is_admin=False) is engine
+        assert engine.host_resources is False
+        pool.get_or_create(1, is_admin=True)
+        assert engine.host_resources is True
+        pool.evict_all()
+
+    def test_resolver_decides_when_the_caller_does_not(self, fresh_dirs):
+        asked = []
+
+        def resolver(user_id):
+            asked.append(user_id)
+            return user_id == 1
+
+        pool = EnginePool(max_active=4, admin_resolver=resolver)
+        assert pool.get_or_create(1).host_resources is True
+        assert pool.get_or_create(2).host_resources is False
+        assert pool.get_or_create(1, is_admin=False).host_resources is False
+        assert asked == [1, 2]
+        assert pool.peek(1).host_resources is False
+        assert pool.peek(99) is None
+        pool.evict_all()
+
+    async def test_feed_triggers_see_their_engine_role(self, fresh_dirs, monkeypatch):
+        def scripted(config, llm=None):
+            return ScriptedLLM(["ok"])
+
+        monkeypatch.setattr(agent_init, "create_llm_provider", scripted)
+        monkeypatch.setattr(bootstrap_llm, "create_llm_provider", scripted)
+        creature_dir = fresh_dirs / "feed"
+        creature_dir.mkdir()
+        (creature_dir / "config.yaml").write_text(
+            "name: feed\ninput:\n  type: none\noutput:\n  type: stdout\n"
+            "triggers:\n  - type: timer\n    name: tick\n    prompt: tick\n"
+            "    options:\n      interval: 3600\n",
+            encoding="utf-8",
+        )
+        pool = EnginePool(max_active=4)
+        try:
+            for user_id, admin in ((1, True), (2, False)):
+                engine = pool.get_or_create(user_id, is_admin=admin)
+                creature = await engine.add_creature(str(creature_dir))
+                tick = creature.agent.trigger_manager.get_trigger("tick")
+                assert host_resources_allowed(tick) is admin
+        finally:
+            await pool.evict_all_async()
+
+    def test_failing_resolver_denies(self, fresh_dirs):
+        def resolver(user_id):
+            raise RuntimeError("db down")
+
+        pool = EnginePool(max_active=4, admin_resolver=resolver)
+        assert pool.get_or_create(1).host_resources is False
+        pool.evict_all()
+
+    def test_db_resolver_reads_the_user_role(self, fresh_dirs, monkeypatch):
+        monkeypatch.setenv("KT_AUTH_DB", str(fresh_dirs / "auth.db"))
+        _reset_migration_state_for_tests()
+        ensure_migrated()
+        with connection() as conn:
+            admin = create_user(conn, "root", "pw", role="admin", bcrypt_rounds=4)
+            user = create_user(conn, "bob", "pw", role="user", bcrypt_rounds=4)
+        assert user_is_admin(admin.id) is True
+        assert user_is_admin(user.id) is False
+        assert user_is_admin(None) is False
+        assert user_is_admin(12345) is False
+        _reset_migration_state_for_tests()
 
 
 class TestLruEviction:

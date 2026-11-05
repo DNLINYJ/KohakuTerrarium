@@ -150,12 +150,12 @@ async def test_cancelled_fork_open_closes_unclaimed_store(tmp_path, monkeypatch)
     release = threading.Event()
     returned = threading.Event()
     vaults = []
-    daemons = []
+    pipelines = []
 
     def gated_open(*args, **kwargs):
         store = SessionStore(*args, **kwargs)
         vaults.append(weakref.ref(store.events))
-        daemons.append(store.events._daemon_thread)
+        pipelines.append(store._flush)
         entered.set()
         assert release.wait(5)
         returned.set()
@@ -177,7 +177,8 @@ async def test_cancelled_fork_open_closes_unclaimed_store(tmp_path, monkeypatch)
         assert await asyncio.to_thread(returned.wait, 3)
         await asyncio.sleep(0)
         assert all(ref() is None or ref()._closed for ref in vaults)
-        assert all(not thread.is_alive() for thread in daemons)
+        assert all(pipeline._closed for pipeline in pipelines)
+        assert all(pipeline._timer is None for pipeline in pipelines)
         assert not fork_mod.fork_target_path(path, "cancelled").exists()
     finally:
         release.set()

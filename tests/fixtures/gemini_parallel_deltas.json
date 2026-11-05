@@ -1,0 +1,18 @@
+[
+  {
+    "extra_content": {"google": {"thought_signature": "opaque-recorded-signature"}},
+    "function": {"arguments": "{\"pattern\":\"*.txt\"}", "name": "glob"},
+    "id": "call_480475",
+    "type": "function"
+  },
+  {
+    "function": {"arguments": "{\"pattern\":\"*.md\"}", "name": "glob"},
+    "id": "call_480476",
+    "type": "function"
+  },
+  {
+    "function": {"arguments": "{\"path\":\"TASK.txt\"}", "name": "read"},
+    "id": "call_480482",
+    "type": "function"
+  }
+]

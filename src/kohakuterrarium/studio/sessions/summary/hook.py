@@ -13,6 +13,7 @@ from kohakuterrarium.studio.identity.session_summary import (
     SummarySettings,
     load_settings,
 )
+from kohakuterrarium.studio.sessions.summary.side import summarize_side
 from kohakuterrarium.studio.sessions.summary.writer import (
     COMPACTED,
     TURN,
@@ -51,6 +52,9 @@ class SummaryHook:
         self._settings = settings
         self._wanted: dict[str, dict[str, Any]] = {}
         self._task: asyncio.Task | None = None
+        self._refresh_lock = asyncio.Lock()
+        self._side_wanted: dict[tuple[str, str], dict] = {}
+        self._side_tasks: dict[tuple[str, str], asyncio.Task] = {}
         self._attached = True
         store.subscribe(self._on_event)
         store._companion_closers.append(self.detach)
@@ -60,6 +64,15 @@ class SummaryHook:
         return self._llm_for
 
     def _on_event(self, key: str, data: dict) -> None:
+        if (data or {}).get("type") in {"btw_result", "activity:btw_result"}:
+            if self._attached:
+                try:
+                    self._loop.call_soon_threadsafe(
+                        self.request_side, event_agent(key), dict(data)
+                    )
+                except RuntimeError:
+                    self.detach()
+            return
         reason = _TRIGGERS.get((data or {}).get("type"))
         if reason is None or not self._attached:
             return
@@ -104,27 +117,76 @@ class SummaryHook:
             request = self._wanted.pop(agent)
             settings = self._settings()
             try:
-                await summarize(
-                    self._store,
-                    settings,
-                    llm_factory=lambda: self._llm_for(agent, settings),
-                    reason=request["reason"],
-                    agent=agent,
-                    compaction=request["compaction"],
-                    new_turns=request["turns"],
-                )
+                async with self._refresh_lock:
+                    await summarize(
+                        self._store,
+                        settings,
+                        llm_factory=lambda: self._llm_for(agent, settings),
+                        reason=request["reason"],
+                        agent=agent,
+                        compaction=request["compaction"],
+                        new_turns=request["turns"],
+                    )
             except Exception as exc:  # noqa: BLE001 - summaries are best-effort
                 logger.warning("session summary refresh failed", error=str(exc))
 
+    def request_side(self, parent: str, event: dict) -> None:
+        """Coalesce side results per parent/job independently of parent summaries."""
+        if (
+            not self._attached
+            or event.get("audience") != "user"
+            or not isinstance(event.get("job_id"), str)
+            or not event["job_id"]
+            or not isinstance(event.get("name"), str)
+            or not event["name"]
+            or type(event.get("run")) is not int
+            or event["run"] < 0
+            or type(event.get("side_turn", 1)) is not int
+            or event.get("side_turn", 1) < 1
+        ):
+            return
+        key = (parent, event["job_id"])
+        pending = self._side_wanted.get(key)
+        if pending is None or event.get("side_turn", 1) >= pending.get("side_turn", 1):
+            self._side_wanted[key] = event
+        if key not in self._side_tasks:
+            self._side_tasks[key] = self._loop.create_task(self._drain_side(key))
+
+    async def _drain_side(self, key: tuple[str, str]) -> None:
+        parent, _ = key
+        try:
+            while key in self._side_wanted and self._attached:
+                event = self._side_wanted.pop(key)
+                try:
+                    settings = self._settings()
+                    async with self._refresh_lock:
+                        await summarize_side(
+                            self._store,
+                            settings,
+                            parent=parent,
+                            event=event,
+                            llm_factory=lambda: self._llm_for(parent, settings),
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("side summary refresh failed", error=str(exc))
+        finally:
+            self._side_tasks.pop(key, None)
+
     async def idle(self) -> None:
-        while self._task is not None and not self._task.done():
-            await asyncio.shield(self._task)
+        while True:
+            tasks = [*self._side_tasks.values()]
+            if self._task is not None and not self._task.done():
+                tasks.append(self._task)
+            if not tasks:
+                return
+            await asyncio.gather(*(asyncio.shield(task) for task in tasks))
 
     def detach(self) -> None:
         if not self._attached:
             return
         self._attached = False
         self._wanted.clear()
+        self._side_wanted.clear()
         try:
             self._store.unsubscribe(self._on_event)
         except Exception:  # noqa: BLE001

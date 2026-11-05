@@ -7,7 +7,7 @@ and hosted exactly the way the real consumers do it:
 * :mod:`kohakuterrarium.bootstrap.agent_init` builds the agent from an
   ``AgentConfig`` (``Agent(config)`` runs the whole ``AgentInitMixin``
   chain — LLM, registry, executor, sub-agents, controller, I/O).
-* :mod:`kohakuterrarium.terrarium.creature_host` wraps that live
+* :mod:`kohakuterrarium.terrarium.creature.host` wraps that live
   ``Agent`` in a :class:`Creature` and adds it to a real
   :class:`Terrarium` engine; ``Creature.chat`` is the canonical
   inject-input + drain-output cycle every HTTP / WS / CLI endpoint
@@ -26,6 +26,7 @@ side effect (conversation contents, tool output text, engine state).
 import asyncio
 import base64
 import copy
+import json
 import re
 import time
 from contextlib import closing
@@ -35,48 +36,52 @@ from typing import Callable
 import pytest
 from PIL import Image
 
-import kohakuterrarium.core.agent_message_history as branch_history
+import kohakuterrarium.core.agent.history.message_history as branch_history
 from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
-from kohakuterrarium.builtins.tools.canvas_image import CanvasImageTool
+from kohakuterrarium.builtins.tools.media.canvas_image import CanvasImageTool
+from kohakuterrarium.builtins.tools.files.read import ReadTool
+from kohakuterrarium.builtins.tools.app.show import ShowAppTool
 from kohakuterrarium.builtins.tools.stop_task import StopTaskTool
 from kohakuterrarium.core.agent import Agent
-from kohakuterrarium.core.branch_continuation import (
+from kohakuterrarium.core.conversation.continuation import (
     live_branch_path,
     load_persisted_branch_view,
     persist_branch_view,
     selected_branch_view,
 )
-from kohakuterrarium.core.config_types import (
+from kohakuterrarium.core.config.types import (
     AgentConfig,
     InputConfig,
     OutputConfig,
 )
 from kohakuterrarium.builtins.user_commands.clear import ClearCommand
-from kohakuterrarium.core.conversation import Conversation
+from kohakuterrarium.builtins.user_commands.repair_images import RepairImagesCommand
+from kohakuterrarium.core.conversation.conversation import Conversation
 from kohakuterrarium.core.events import (
     EventType,
     TriggerEvent,
     create_tool_complete_event,
     create_user_input_event,
 )
+from kohakuterrarium.core.conversation.pinned import pin_message
 from kohakuterrarium.core.turn import Activity, TurnCapture
 from kohakuterrarium.llm.message import FilePart, ImagePart, TextPart
-from kohakuterrarium.llm.artifact_resolve import (
-    file_reference_path,
-    resolve_artifact_url,
-)
+from kohakuterrarium.llm.media.artifacts import resolve_artifact_url
 from kohakuterrarium.llm.base import NativeToolCall
-from kohakuterrarium.llm.codex_format import to_responses_input
-from kohakuterrarium.llm.recovery import drop_last_tool_round
-from kohakuterrarium.session.raw_history import UserMessageSelector
+from kohakuterrarium.llm.codex.format import to_responses_input
+from kohakuterrarium.llm.recovery.errors import drop_last_tool_round
+from kohakuterrarium.session.resume import resume as resume_history
+from kohakuterrarium.session.resume import branch as resume_branch
+from kohakuterrarium.session.history.replay import replay_conversation
+from kohakuterrarium.session.history.raw import UserMessageSelector
 from kohakuterrarium.modules.user_command.base import UserCommandContext
-from kohakuterrarium.session.resume import resume_agent
-from kohakuterrarium.session.resume_build import build_conversation
+from kohakuterrarium.session.resume.resume import resume_agent
+from kohakuterrarium.session.resume.build import build_conversation
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.session.reader import SessionReader
+from kohakuterrarium.session.readonly.reader import SessionReader
 from kohakuterrarium.skills.registry import Skill
-from kohakuterrarium.terrarium.service import LocalTerrariumService
+from kohakuterrarium.terrarium.service.service import LocalTerrariumService
 from kohakuterrarium.modules.plugin.base import BasePlugin, PluginBlockError
 from kohakuterrarium.modules.subagent.config import SubAgentConfig
 from kohakuterrarium.modules.tool.base import (
@@ -87,10 +92,12 @@ from kohakuterrarium.modules.tool.base import (
 )
 from kohakuterrarium.modules.trigger.base import BaseTrigger
 from kohakuterrarium.parsing import ToolCallEvent
-from kohakuterrarium.terrarium.creature_host import Creature
-from kohakuterrarium.terrarium.engine import Terrarium
+from kohakuterrarium.terrarium.creature.host import Creature
+from kohakuterrarium.terrarium.engine.engine import Terrarium
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
 from kohakuterrarium.testing.output import OutputRecorder
+
+from tests.helpers.stable_compact_history import exercise_compact_media_history
 
 # ---------------------------------------------------------------------------
 # Deterministic tool stubs — real BaseTool subclasses, no faked methods.
@@ -186,6 +193,15 @@ class _AssistantMediaLLM(ScriptedLLM):
             yield f"streamed_{version}"
         else:
             yield "continued"
+
+
+class _LegacyImageReadTool(ReadTool):
+    """Emit the live image reference used by pre-snapshot read results."""
+
+    async def execute(self, args, context=None):
+        result = await super().execute(args, context)
+        result.output[1].url = Path(args["path"]).as_uri()
+        return result
 
 
 class _EchoTool(BaseTool):
@@ -959,6 +975,76 @@ async def _exercise_direct_media_history(tmp_path, monkeypatch):
     finally:
         await resumed.stop()
         resumed_store.close()
+
+    for persistent in (False, True):
+        image_path = tmp_path / "snapshot.png"
+        read_args = json.dumps({"path": str(image_path)})
+        llm = _HistoryReplayLLM(
+            True,
+            plan=[
+                [NativeToolCall("read_first", "read", read_args)],
+                "first snapshot read",
+                [NativeToolCall("read_updated", "read", read_args)],
+                "updated snapshot read",
+                "continued after deletion",
+            ],
+        )
+        expected_urls = []
+        async with Terrarium(session_dir=tmp_path / "read-media") as engine:
+            creature = await engine.add_creature(
+                AgentConfig(
+                    name="readmedia", system_prompt="plain", tool_format="native"
+                ),
+                llm=llm,
+                tools=[ReadTool()],
+                pwd=tmp_path,
+                session=persistent,
+                io="headless",
+                start=True,
+            )
+            for color in ("red", "blue"):
+                Image.new("RGB", (2, 2), color).save(image_path)
+                expected_urls.append(
+                    "data:image/png;base64,"
+                    + base64.b64encode(image_path.read_bytes()).decode()
+                )
+                assert (await creature.run("read the image")).ok
+                urls = [
+                    part["image_url"]["url"]
+                    for message in llm.last_messages
+                    if isinstance(message.get("content"), list)
+                    for part in message["content"]
+                    if part.get("type") == "image_url"
+                ]
+                assert urls == expected_urls, str(llm.last_messages[-2:])
+            image_path.unlink()
+            assert (
+                await creature.run("continue after deletion")
+            ).text == "continued after deletion"
+            if persistent:
+                saved_path = creature.agent.session_store.path
+
+        if persistent:
+            restored_llm = ScriptedLLM(["continued after resume"])
+            restored, store = resume_agent(
+                saved_path, io_mode="plain", llm=restored_llm
+            )
+            try:
+                await restored.start()
+                assert (
+                    await restored.run("continue with saved images")
+                ).text == "continued after resume"
+                urls = [
+                    part["image_url"]["url"]
+                    for message in restored_llm.last_messages
+                    if isinstance(message.get("content"), list)
+                    for part in message["content"]
+                    if part.get("type") == "image_url"
+                ]
+                assert urls == expected_urls
+            finally:
+                await restored.stop()
+                store.close()
 
 
 async def _exercise_assistant_media_history(tmp_path):
@@ -1901,8 +1987,7 @@ class TestCoreIntegration:
 
         async with Terrarium() as engine:
             await engine.add_creature(creature)
-            # Both registered sub-agents are visible on the property.
-            assert set(agent.subagents) == {"explore", "planner"}
+            assert set(agent.subagents) == {"fork", "explore", "planner"}
 
             # A background sub-agent's result drives a follow-up turn that can
             # land after chat() returns, so the summary is read once settled.
@@ -2015,11 +2100,22 @@ class TestCoreIntegration:
             assert agent.compact_manager.config.threshold == 0.5
             assert agent.compact_manager.config.target == 0.2
             assert agent._termination_checker.is_active is True
+            pin_message(agent, "persona", "user", "PINNED-PERSONA")
+            summarizer_inputs: list[str] = []
+            real_summarize = agent.compact_manager._summarize
+
+            async def spy_summarize(text):
+                summarizer_inputs.append(text)
+                return await real_summarize(text)
+
+            agent.compact_manager._summarize = spy_summarize
 
             # Run several turns to build a conversation long enough for
             # the compact manager to have something to summarize.
             for word in ("one", "two", "three", "four"):
                 await _drain_chat(creature, f"turn {word}")
+            sent = agent.controller.llm.call_log[-1]
+            assert sent[1]["content"] == "PINNED-PERSONA"
             agent._reload_conversation_under_branch_view({1: 1})
             conversation = agent.controller.conversation
             before_drop = conversation.snapshot_messages()
@@ -2074,6 +2170,13 @@ class TestCoreIntegration:
             # replaced the older turns, so the message count dropped.
             msgs_after = len(agent.controller.conversation.get_messages())
             assert msgs_after < msgs_before
+            # The pin stayed out of the summary and out of the history.
+            assert summarizer_inputs
+            assert all("PINNED-PERSONA" not in text for text in summarizer_inputs)
+            assert [key for key, _ in agent.controller.pinned.pinned()] == ["persona"]
+            assert "PINNED-PERSONA" not in str(
+                agent.controller.conversation.snapshot_messages()
+            )
 
             # A second trigger right after a successful compaction with
             # usage still high fires another compaction (cooldown is 0s),
@@ -2083,6 +2186,39 @@ class TestCoreIntegration:
             agent._maybe_trigger_compact(agent.controller)
             await agent.compact_manager.wait_for_current()
             assert agent.compact_manager._compact_count == count_after_first + 1
+            assert agent.compact_rounds == agent.compact_manager._compact_count
+
+            # A tool's compact_arguments hook shortens its old calls that
+            # survive the splice; the newest call round keeps its arguments.
+            agent.registry.register_tool(ShowAppTool())
+            conversation = agent.controller.conversation
+            for call_id, html in (("app_old", "<p>" + "x" * 4000), ("app_new", "<b>")):
+                conversation.append(
+                    "assistant",
+                    "",
+                    tool_calls=[
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": "show_app",
+                                "arguments": json.dumps({"title": "t", "html": html}),
+                            },
+                        }
+                    ],
+                )
+                conversation.append("tool", "app w_1 shown", tool_call_id=call_id)
+            agent.controller._last_usage = {"prompt_tokens": 5000}
+            agent._maybe_trigger_compact(agent.controller)
+            await agent.compact_manager.wait_for_current()
+            app_args = {
+                call["id"]: json.loads(call["function"]["arguments"])
+                for msg in agent.controller.conversation.get_messages()
+                for call in getattr(msg, "tool_calls", None) or []
+                if call["function"]["name"] == "show_app"
+            }
+            assert app_args["app_new"]["html"] == "<b>"
+            assert app_args["app_old"]["html"].startswith("[app document")
 
             # With usage BELOW the threshold, the turn-end hook is a
             # no-op — the compact count stays put.
@@ -2096,6 +2232,12 @@ class TestCoreIntegration:
             # checker stops the agent inside the controller loop.
             await _drain_chat(creature, "turn five")
             assert "ALL DONE" in _assistant_text(agent)
+            # After compaction the request is: system, pin, summary, live turns.
+            sent = agent.controller.llm.call_log[-1]
+            assert sent[0]["role"] == "system"
+            assert sent[1]["content"] == "PINNED-PERSONA"
+            assert sent[2]["content"].startswith("[Previous context summary")
+            assert str(sent).count("PINNED-PERSONA") == 1
             assert agent.is_running is False
             assert "ALL DONE" in (agent._termination_checker.reason or "")
             # After termination the engine reports the creature stopped.
@@ -2353,12 +2495,75 @@ class TestCoreIntegration:
         and ``Agent.attach_session_store`` is how the engine wires
         persistence onto a creature.
         """
-        from kohakuterrarium.session.store import SessionStore
+        legacy_image = tmp_path / "legacy-image.png"
+        Image.new("RGB", (2, 2), "red").save(legacy_image)
+        repair_command = RepairImagesCommand()
+        async with Terrarium(session_dir=tmp_path / "repair-media") as engine:
+            legacy = await engine.add_creature(
+                AgentConfig(
+                    name="legacy_media", system_prompt="plain", tool_format="native"
+                ),
+                llm=_HistoryReplayLLM(
+                    True,
+                    plan=[
+                        [
+                            NativeToolCall(
+                                "read_old",
+                                "read",
+                                json.dumps({"path": str(legacy_image)}),
+                            )
+                        ],
+                        "image seen",
+                        "continued",
+                    ],
+                ),
+                tools=[_LegacyImageReadTool()],
+                pwd=tmp_path,
+                io="headless",
+                start=True,
+            )
+            assert (await legacy.run("read the image")).ok
+            legacy_image.unlink()
+            failed = await legacy.run("continue", raise_on_error=False)
+            assert not failed.ok and "Required local media is unavailable" in str(
+                failed.error
+            )
+            context = UserCommandContext(agent=legacy.agent)
+            preview = await repair_command.execute("", context)
+            assert preview.success and legacy_image.as_uri() in preview.output
+            assert "message" in preview.output and "turn 1" in preview.output
+            raw_events = legacy.agent.session_store.get_events("legacy_media")
+            repaired = await repair_command.execute(
+                preview.data["action_args"], context
+            )
+            assert repaired.success and "Replaced 1" in repaired.output
+            assert legacy.agent.session_store.get_events("legacy_media") == raw_events
+            assert "No repairable" in (await repair_command.execute("", context)).output
+            repaired_path = legacy.agent.session_store.path
+
+        restored, repaired_store = resume_agent(
+            repaired_path, io_mode="plain", llm=ScriptedLLM(["continued after repair"])
+        )
+        try:
+            await restored.start()
+            for prompt in ("continue after reopen", "continue again"):
+                assert (await restored.run(prompt)).text == "continued after repair"
+            assert "Historical image unavailable" in str(restored.llm.last_messages)
+            assert not any(
+                part.get("type") == "image_url"
+                for message in restored.llm.last_messages
+                if isinstance(message.get("content"), list)
+                for part in message["content"]
+            )
+        finally:
+            await restored.stop()
+            repaired_store.close()
 
         creature, recorder = make_creature(
             script=[
                 ScriptEntry("original reply", match="first question"),
                 ScriptEntry("regenerated reply", match="first question"),
+                ScriptEntry("regenerated again", match="first question"),
                 ScriptEntry("edited reply", match="changed question"),
                 # A second turn, then a turn-targeted regenerate of it.
                 ScriptEntry("second turn reply", match="second question"),
@@ -2376,6 +2581,8 @@ class TestCoreIntegration:
             # persistence-wiring path.
             store = SessionStore(str(creature.agent.config.agent_path / "s.kohakutr"))
             agent.attach_session_store(store)
+            # A pin never shifts history indices and survives every history op.
+            pin_message(agent, "persona", "user", "PINNED-PERSONA")
 
             # --- Run the initial turn ----------------------------------
             await _drain_chat(creature, "first question")
@@ -2405,13 +2612,53 @@ class TestCoreIntegration:
             )
 
             # --- regenerate: same user msg, new branch -----------------
-            await agent.regenerate_last_response()
-            assert "regenerated reply" in _assistant_text(agent)
-            # Still turn 1, but a new branch was opened.
-            assert agent._turn_index == 1
-            assert agent._branch_id == 2
-            # The event log recorded a second branch for turn 1.
-            assert agent._max_branch_id_for_turn(1) == 2
+            before_rerun = store.get_events(agent.config.name)
+            previous_id = next(
+                event["event_id"]
+                for event in before_rerun
+                if event["type"] == "user_message"
+            )
+            for branch, reply in ((2, "regenerated reply"), (3, "regenerated again")):
+                await agent.regenerate_last_response()
+                assert reply in _assistant_text(agent)
+                assert (agent._turn_index, agent._branch_id) == (1, branch)
+                assert agent._max_branch_id_for_turn(1) == branch
+                live_user = next(
+                    message
+                    for message in agent.controller.conversation.get_messages()
+                    if message.role == "user"
+                )
+                canonical = [
+                    event
+                    for event in store.get_events(agent.config.name)
+                    if event["type"] == "user_message"
+                ][-1]
+                assert canonical["event_id"] > previous_id
+                assert live_user.metadata["event_id"] == canonical["event_id"]
+                assert (canonical["turn_index"], canonical["branch_id"]) == (1, branch)
+                assert canonical["content"] == live_user.content == "first question"
+                request = [
+                    message
+                    for message in agent.llm.call_log[-1]
+                    if message["role"] != "system"
+                ]
+                assert request == [
+                    {"role": "user", "content": "PINNED-PERSONA"},
+                    {"role": "user", "content": "first question"},
+                ]
+                await agent._session_output.drain()
+                saved_user = next(
+                    message
+                    for message in store.load_branch_snapshot(
+                        agent.config.name, {1: branch}
+                    )["messages"]
+                    if message["role"] == "user"
+                )
+                assert saved_user["metadata"]["event_id"] == canonical["event_id"]
+                previous_id = canonical["event_id"]
+            assert (
+                store.get_events(agent.config.name)[: len(before_rerun)] == before_rerun
+            )
 
             # --- edit_and_rerun: replace the user message, re-run ------
             # System message is index 0, the user message is index 1.
@@ -2429,11 +2676,11 @@ class TestCoreIntegration:
             assert user_msgs[-1].get_text_content() == "changed question"
             # Editing turn 1 opened yet another branch on it.
             assert agent._turn_index == 1
-            assert agent._branch_id == 3
+            assert agent._branch_id == 4
 
             # --- a fresh second turn -----------------------------------
             # A new user input after an edit advances to turn 2; the
-            # parent_branch_path now records (turn 1, branch 3) so a
+            # parent_branch_path now records (turn 1, branch 4) so a
             # later branch switch on turn 1 can hide turn 2's events.
             await _drain_chat(creature, "second question")
             assert "second turn reply" in _assistant_text(agent)
@@ -2464,7 +2711,15 @@ class TestCoreIntegration:
             # Only the system prompt survives a rewind to index 1.
             assert roles == ["system"]
             # rewind does not invoke the LLM.
-            assert agent.llm.call_count == 5
+            assert agent.llm.call_count == 6
+            assert [key for key, _ in agent.controller.pinned.pinned()] == ["persona"]
+            assert all(
+                log[1]["content"] == "PINNED-PERSONA" for log in agent.llm.call_log
+            )
+            assert not any(
+                m.metadata.get("pinned")
+                for m in agent.controller.conversation.get_messages()
+            )
 
             # --- workspace: runtime working-directory switch -----------
             # ``agent.workspace`` is wired by ``init_agent_helpers``; it
@@ -2552,9 +2807,17 @@ class TestCoreIntegration:
             # A message_idx past the end resolves to None → returns False
             # and runs no LLM call.
             calls_pre = agent.llm.call_count
-            bad = await agent.edit_and_rerun(message_idx=999, new_content="nope")
+            context_before = agent.controller.conversation.to_json()
+            path_before = live_branch_path(agent)
+            events_before = store.get_events(agent.config.name)
+            bad = await agent.edit_and_rerun(
+                message_idx=999, new_content="nope", branch_view={1: 1}
+            )
             assert bad is False
             assert agent.llm.call_count == calls_pre
+            assert agent.controller.conversation.to_json() == context_before
+            assert live_branch_path(agent) == path_before
+            assert store.get_events(agent.config.name) == events_before
 
             # --- native_tool_options on a non-native tool is rejected --
             # ``echo``-style tools are NOT provider-native, so setting
@@ -2598,10 +2861,10 @@ class TestCoreIntegration:
             assert continuation["turn_index"] == 2
             assert continuation["branch_id"] == max(previous_branches) + 1
             assert continuation["parent_branch_path"] == [[1, 1]]
+            assert agent.llm.call_log[-1][1]["content"] == "PINNED-PERSONA"
             continued = [
                 (message.get("role"), message.get("content"))
-                for message in agent.llm.call_log[-1]
-                if message.get("role") != "system"
+                for message in agent.llm.call_log[-1][2:]
             ]
             assert continued[0] == ("user", "first question")
             assert ("assistant", "original reply") in continued
@@ -2882,7 +3145,59 @@ class TestCoreIntegration:
                         assert [(m.name, m.content) for m in restored_bg] == [
                             ("slowbg", "background-finished")
                         ]
+                        assert [
+                            (m.tool_call_id, m.name, m.content)
+                            for m in agent.controller.conversation.get_messages()
+                            if m.role == "tool"
+                        ] == [
+                            ("c1", "echo", "echoed:a"),
+                            ("c2", "echo", "echoed:b"),
+                            ("b1", "slowbg", "background-finished"),
+                        ]
+                        assert restored_bg[0].metadata == {
+                            "job_id": job_id,
+                            "tool_result_phase": "final",
+                            "result_event_id": next(
+                                e["event_id"]
+                                for e in cold_store.get_events("settled")
+                                if e["type"] == "tool_result"
+                                and e.get("call_id") == job_id
+                            ),
+                        }
+                        assert (agent._turn_index, agent._branch_id) == (4, 1)
+                        assert agent._parent_branch_path == [(1, 1), (2, 1), (3, 1)]
+                        assert agent._context_cutoff_event_id == 0
+                        pending = cold_store.get_resumable_events("settled")
+                        assert agent._pending_resume_events == pending
+                        repaired_messages = copy.deepcopy(
+                            [
+                                dict(m.to_dict(), metadata=m.metadata)
+                                for m in agent.controller.conversation.get_messages()
+                            ]
+                        )
+                        cold_store.close(update_status=False)
+                        agent, cold_store = resume_agent(path, io_mode="plain", llm=llm)
+                        assert [
+                            dict(m.to_dict(), metadata=m.metadata)
+                            for m in agent.controller.conversation.get_messages()
+                        ] == repaired_messages
+                        assert agent._pending_resume_events == pending
+                        assert agent._context_cutoff_event_id == 0
+                        assert (agent._turn_index, agent._branch_id) == (4, 1)
+                        assert agent._parent_branch_path == [(1, 1), (2, 1), (3, 1)]
                         await agent.start()
+                    raw_settled = agent.session_store.get_events("settled")
+                    call_event = next(
+                        e
+                        for e in raw_settled
+                        if e["type"] == "tool_call" and e.get("call_id") == job_id
+                    )
+                    result_event = next(
+                        e
+                        for e in raw_settled
+                        if e["type"] == "tool_result" and e.get("call_id") == job_id
+                    )
+                    assert result_event["turn_index"] > call_event["turn_index"]
                     original = dict(live_branch_path(agent))
                     await agent.regenerate_last_response(turn_index=agent._turn_index)
                     sibling = dict(live_branch_path(agent))
@@ -2955,6 +3270,13 @@ class TestCoreIntegration:
                         ("assistant", "sib cont"),
                     ]
                     saved_view = selected_branch_view(agent)
+                    full_selected = copy.deepcopy(
+                        [
+                            dict(m.to_dict(), metadata=m.metadata)
+                            for m in agent.controller.conversation.get_messages()
+                        ]
+                    )
+                    saved_cutoff = agent._context_cutoff_event_id
                     path = agent.session_store.path
                 finally:
                     bg.release.set()
@@ -2973,11 +3295,32 @@ class TestCoreIntegration:
                         prefix(restored.controller.conversation.to_messages())
                         == selected
                     )
+                    assert [
+                        dict(m.to_dict(), metadata=m.metadata)
+                        for m in restored.controller.conversation.get_messages()
+                    ] == full_selected
+                    assert restored._context_cutoff_event_id == saved_cutoff
+                    assert (
+                        restored._pending_resume_events
+                        == store.get_resumable_events("settled")
+                    )
                     await restored.start()
                     await restored.inject_input(prompt)
                     selected += [("user", prompt)]
                     assert prefix(llm.last_messages) == selected
                     selected += [("assistant", response)]
+                    assert (
+                        prefix(restored.controller.conversation.to_messages())
+                        == selected
+                    )
+                    await restored._session_output.drain()
+                    full_selected = copy.deepcopy(
+                        [
+                            dict(m.to_dict(), metadata=m.metadata)
+                            for m in restored.controller.conversation.get_messages()
+                        ]
+                    )
+                    saved_cutoff = restored._context_cutoff_event_id
                     saved_view = selected_branch_view(restored)
                     path = store.path
                 finally:
@@ -3097,6 +3440,24 @@ class TestCoreIntegration:
             assert echo.calls == 2
             assert bg.calls == 1
 
+        for compact_origin in ("known", "null-edit", "null-rerun", "null-internal"):
+            variant_path = tmp_path / compact_origin
+            variant_path.mkdir()
+            with monkeypatch.context() as variant_patch:
+                await self._exercise_compact_tail(
+                    variant_path, variant_patch, compact_origin, prefix
+                )
+
+        await exercise_compact_media_history(tmp_path, monkeypatch)
+        await _exercise_user_attachment_history(tmp_path)
+        await _exercise_direct_media_history(tmp_path, monkeypatch)
+        await _exercise_assistant_media_history(tmp_path)
+        await _exercise_settled_media_history(tmp_path)
+
+    async def _exercise_compact_tail(
+        self, tmp_path, monkeypatch, compact_origin, prefix
+    ):
+        """Exercise one isolated compact-tail mutation and its cold restoration."""
         compact_bg = _SlowBackgroundTool(gated=True)
         compact_bg.config.notify_controller_on_background_complete = True
         compact_llm = _HistoryReplayLLM(
@@ -3106,6 +3467,7 @@ class TestCoreIntegration:
                 "launched",
                 "completion done",
                 "third done",
+                *(["feedback accepted"] if compact_origin != "known" else []),
                 "fourth done",
             ],
         )
@@ -3143,6 +3505,25 @@ class TestCoreIntegration:
                     == "completion done"
                 )
                 await creature.run("third", timeout=8)
+                if compact_origin != "known":
+                    # A legal injected feedback event, not edited storage or a
+                    # fabricated compact: the real producer marks origin unknown.
+                    await agent.inject_event(
+                        TriggerEvent(
+                            type=EventType.SUBAGENT_OUTPUT,
+                            content="subagent feedback before compact",
+                        )
+                    )
+                    feedback = next(
+                        message
+                        for message in agent.controller.conversation.get_messages()
+                        if "subagent feedback before compact" in str(message.content)
+                    )
+                    assert feedback.metadata["origin_known"] is False
+                    assert (
+                        agent.controller.conversation.get_last_assistant_message().content
+                        == "feedback accepted"
+                    )
                 await creature.run("fourth", timeout=8)
                 await agent._session_output.drain()
 
@@ -3169,9 +3550,10 @@ class TestCoreIntegration:
                     event for event in raw if event["type"] == "compact_complete"
                 ][-1]
                 assert compact_event["summary"] == "summary OLD_LAUNCH"
-                assert compact_event["compact_source_path"] == [
-                    [t, 1] for t in range(1, 4)
-                ]
+                expected_source = (
+                    [[t, 1] for t in range(1, 4)] if compact_origin == "known" else None
+                )
+                assert compact_event["compact_source_path"] == expected_source
                 tool_events = [
                     event
                     for event in raw
@@ -3194,6 +3576,19 @@ class TestCoreIntegration:
                 )
                 compact_path = agent.session_store.path
                 raw_before_resume = list(raw)
+                capture_checkpoint = agent.session_store.load_branch_snapshot(
+                    "compactcold", dict(live_branch_path(agent))
+                )
+                checkpoint_summary = next(
+                    message
+                    for message in capture_checkpoint["messages"]
+                    if (message.get("metadata") or {}).get("compact_summary")
+                )
+                assert (
+                    checkpoint_summary["metadata"]["compact_source_path"]
+                    == expected_source
+                )
+                assert compact_event["event_id"] <= capture_checkpoint["watermark"]
             finally:
                 compact_bg.release.set()
 
@@ -3202,15 +3597,39 @@ class TestCoreIntegration:
                 "after compact",
                 "edited tail",
                 "rerun tail",
+                "edited fourth",
+                "rerun fourth",
                 "edited launch",
                 "switch A reply",
             ]
         )
-        restored, restored_store = resume_agent(
-            compact_path, io_mode="plain", llm=resumed_llm
-        )
+        replayed_ids = []
+        original_replay = branch_history.replay_with_settled_tools
+
+        def observe_replay(events, **kwargs):
+            replayed_ids.extend(evt["event_id"] for evt in events if "event_id" in evt)
+            return original_replay(events, **kwargs)
+
+        # With only the captured checkpoint, cold restore must not replay its prefix.
+        with monkeypatch.context() as observation:
+            observation.setattr(
+                branch_history, "replay_with_settled_tools", observe_replay
+            )
+            observation.setattr(
+                resume_history, "replay_with_settled_tools", observe_replay
+            )
+            observation.setattr(
+                resume_branch, "replay_with_settled_tools", observe_replay
+            )
+            restored, restored_store = resume_agent(
+                compact_path, io_mode="plain", llm=resumed_llm
+            )
         try:
+            assert all(
+                event_id > capture_checkpoint["watermark"] for event_id in replayed_ids
+            )
             await restored.start()
+            restored.controller.config.include_job_status = False
             await restored.inject_input("after reopen")
             assert prefix(resumed_llm.last_messages) == compacted + [
                 ("user", "after reopen")
@@ -3229,23 +3648,202 @@ class TestCoreIntegration:
             assert [
                 event["type"] for event in appended if event["type"] == "user_message"
             ] == ["user_message"]
+            original_view = dict(live_branch_path(restored))
+            # ScriptedLLM observes message dictionaries before provider adaptation;
+            # this is not a wire-byte, provider-kwargs, or cache-hit assertion.
+            model_prefix = copy.deepcopy(resumed_llm.last_messages[:-1])
             tail = next(
+                evt
+                for evt in appended
+                if evt["type"] == "user_message" and evt["content"] == "after reopen"
+            )
+            assert tail["event_id"] > capture_checkpoint["watermark"]
+            assert compact_event["turn_index"] < tail["turn_index"]
+            assert tail["event_id"] not in {
+                event["event_id"] for event in raw_before_resume
+            }
+            tail_selector = UserMessageSelector(
+                tail["event_id"], tail["turn_index"], tail["branch_id"]
+            )
+            if compact_origin != "known":
+                # Each variant starts from its own unmodified persisted branch.
+                if compact_origin == "null-internal":
+                    launch = next(
+                        event
+                        for event in raw_before_resume
+                        if event["type"] == "user_message"
+                        and event["content"] == "launch"
+                    )
+                    assert await restored.edit_and_rerun(
+                        -1,
+                        "launch edited",
+                        target=UserMessageSelector(
+                            launch["event_id"],
+                            launch["turn_index"],
+                            launch["branch_id"],
+                        ),
+                        branch_view=original_view,
+                    )
+                    assert prefix(resumed_llm.last_messages) == [
+                        ("user", "launch edited")
+                    ]
+                    assert "OLD_LAUNCH" not in str(resumed_llm.last_messages)
+                    assert restored.compact_manager._compact_count == 0
+                    expected_request = resumed_llm.last_messages
+                else:
+                    if compact_origin == "null-edit":
+                        assert await restored.edit_and_rerun(
+                            -1,
+                            "after reopen edited",
+                            target=tail_selector,
+                            branch_view=original_view,
+                        )
+                        target_content = "after reopen edited"
+                    else:
+                        await restored.regenerate_last_response(
+                            target=tail_selector, branch_view=original_view
+                        )
+                        target_content = "after reopen"
+                    expected_request = model_prefix + [
+                        {"role": "user", "content": target_content}
+                    ]
+                assert summary_llm.call_count == 1
+                evidence = {
+                    "operation": compact_origin,
+                    "compact_source_path": compact_event["compact_source_path"],
+                    "compact_event_id": compact_event["event_id"],
+                    "compact_turn": compact_event["turn_index"],
+                    "checkpoint_watermark": capture_checkpoint["watermark"],
+                    "target_event_id": tail["event_id"],
+                    "target_turn": tail["turn_index"],
+                    "expected_request": expected_request,
+                    "actual_request": resumed_llm.last_messages,
+                    "restored_compact_count": restored.compact_manager._compact_count,
+                }
+                print(json.dumps(evidence, indent=2))
+                assert resumed_llm.last_messages == expected_request, evidence
+                if compact_origin == "null-rerun":
+                    # Replayed users legitimately carry IDs retained by implicit regen.
+                    event = next(
+                        event
+                        for event in reversed(restored_store.get_events("compactcold"))
+                        if event["type"] == "user_message"
+                    )
+                    conversation = restored.controller.conversation
+                    conversation.get_messages()[
+                        conversation.find_last_user_index()
+                    ].metadata.update(
+                        replay_conversation([event], include_metadata=True)[0][
+                            "metadata"
+                        ]
+                    )
+                    for _ in range(2):
+                        await restored.regenerate_last_response()
+                        assert resumed_llm.last_messages == expected_request
+                if compact_origin != "null-internal":
+                    mutated_view = dict(live_branch_path(restored))
+                    await restored.inject_input(
+                        "visit original", branch_view=original_view
+                    )
+                    assert (
+                        resumed_llm.last_messages[: len(model_prefix)] == model_prefix
+                    )
+                    assert [
+                        message["content"]
+                        for message in resumed_llm.last_messages[len(model_prefix) :]
+                        if message["role"] == "user"
+                    ] == ["after reopen", "visit original"]
+                    await restored.inject_input(
+                        "back to mutation", branch_view=mutated_view
+                    )
+                    assert (
+                        resumed_llm.last_messages[: len(model_prefix)] == model_prefix
+                    )
+                    assert [
+                        message["content"]
+                        for message in resumed_llm.last_messages[len(model_prefix) :]
+                        if message["role"] == "user"
+                    ] == [target_content, "back to mutation"]
+                    selected_view = dict(live_branch_path(restored))
+                    await restored.stop()
+                    checkpoint = restored_store.load_branch_snapshot(
+                        "compactcold", selected_view
+                    )
+                    assert any(
+                        message["role"] == "user"
+                        and message["content"] == target_content
+                        and message.get("metadata", {}).get("branch_id")
+                        == mutated_view[tail["turn_index"]]
+                        for message in checkpoint["messages"]
+                    )
+                    restored_store.close()
+                    resumed_llm = ScriptedLLM(["continued after normal stop"])
+                    restored, restored_store = resume_agent(
+                        compact_path, io_mode="plain", llm=resumed_llm
+                    )
+                    await restored.start()
+                    restored.controller.config.include_job_status = False
+                    assert dict(live_branch_path(restored)) == selected_view
+                    await restored.inject_input("after final reopen")
+                    assert (
+                        resumed_llm.last_messages[: len(model_prefix)] == model_prefix
+                    )
+                    assert [
+                        message["content"]
+                        for message in resumed_llm.last_messages[len(model_prefix) :]
+                        if message["role"] == "user"
+                    ] == [target_content, "back to mutation", "after final reopen"]
+                    assert summary_llm.call_count == 1
+                    assert compact_bg.calls == 1
+                return
+            assert await restored.edit_and_rerun(
+                -1,
+                "after reopen edited",
+                target=tail_selector,
+                branch_view=original_view,
+            )
+            assert resumed_llm.last_messages == model_prefix + [
+                {"role": "user", "content": "after reopen edited"}
+            ]
+            await restored.regenerate_last_response(
+                target=tail_selector, branch_view=original_view
+            )
+            assert resumed_llm.last_messages == model_prefix + [
+                {"role": "user", "content": "after reopen"}
+            ]
+            assert summary_llm.call_count == 1
+            # Retain the pre-capture target contract as well as the new tail case.
+            fourth = next(
                 evt
                 for evt in raw_before_resume
                 if evt["type"] == "user_message" and evt["content"] == "fourth"
             )
-            await restored.edit_and_rerun(
+            assert await restored.edit_and_rerun(
                 -1,
                 "fourth edited",
                 target=UserMessageSelector(
-                    tail["event_id"], tail["turn_index"], tail["branch_id"]
+                    fourth["event_id"], fourth["turn_index"], fourth["branch_id"]
                 ),
+                branch_view=original_view,
             )
             assert prefix(resumed_llm.last_messages) == [
                 compacted[0],
                 ("user", "fourth edited"),
             ]
-            await restored.regenerate_last_response()
+            edited_view = dict(live_branch_path(restored))
+            edited_fourth = next(
+                evt
+                for evt in reversed(restored_store.get_events("compactcold"))
+                if evt["type"] == "user_message" and evt["content"] == "fourth edited"
+            )
+            await restored.regenerate_last_response(
+                target=UserMessageSelector(
+                    edited_fourth["event_id"],
+                    edited_fourth["turn_index"],
+                    edited_fourth["branch_id"],
+                ),
+                branch_view=edited_view,
+            )
             assert prefix(resumed_llm.last_messages) == [
                 compacted[0],
                 ("user", "fourth edited"),
@@ -3261,6 +3859,7 @@ class TestCoreIntegration:
                 target=UserMessageSelector(
                     launch["event_id"], launch["turn_index"], launch["branch_id"]
                 ),
+                branch_view=original_view,
             )
             assert prefix(resumed_llm.last_messages) == [("user", "launch edited")]
             assert "OLD_LAUNCH" not in str(resumed_llm.last_messages)
@@ -3268,25 +3867,27 @@ class TestCoreIntegration:
             await restored.stop()
             await restored.start()
             assert restored.compact_manager._compact_count == 0
-            original_view = {turn: 1 for turn in range(1, 6)}
             checkpoint = restored_store.load_branch_snapshot(
                 "compactcold", original_view
             )
-            replayed_ids = []
-            original_replay = branch_history.replay_with_settled_tools
+            prepared_snapshots = []
+            original_prepare = branch_history.prepare_snapshot
 
-            def observe_replay(events, **kwargs):
-                replayed_ids.extend(
-                    evt["event_id"] for evt in events if "event_id" in evt
-                )
-                return original_replay(events, **kwargs)
+            def observe_prepare(*args, **kwargs):
+                prepared = original_prepare(*args, **kwargs)
+                prepared_snapshots.append(copy.deepcopy(prepared))
+                return prepared
 
             with monkeypatch.context() as observation:
-                observation.setattr(
-                    branch_history, "replay_with_settled_tools", observe_replay
-                )
+                observation.setattr(branch_history, "prepare_snapshot", observe_prepare)
                 await restored.inject_input("switch A", branch_view=original_view)
-            assert all(event_id > checkpoint["watermark"] for event_id in replayed_ids)
+            # Preparation may replay tails for non-winning sibling candidates.
+            # Assert the adopted checkpoint, not the aggregate speculative work.
+            assert len(prepared_snapshots) == 1
+            assert prepared_snapshots[0]["messages"] == checkpoint["messages"]
+            assert prepared_snapshots[0]["compact_state"] == checkpoint["compact_state"]
+            assert prepared_snapshots[0]["selected"] == original_view
+            assert resumed_llm.last_messages[: len(model_prefix)] == model_prefix
             assert prefix(resumed_llm.last_messages) == compacted + [
                 ("user", "after reopen"),
                 ("assistant", "after compact"),
@@ -3323,8 +3924,10 @@ class TestCoreIntegration:
         )
         try:
             await retained.start()
+            retained.controller.config.include_job_status = False
             assert retained.compact_manager._compact_count == 1
             await retained.inject_input("from retained A")
+            assert retained_llm.last_messages[: len(model_prefix)] == model_prefix
             assert prefix(retained_llm.last_messages) == compacted + [
                 ("user", "after reopen"),
                 ("assistant", "after compact"),
@@ -3346,11 +3949,6 @@ class TestCoreIntegration:
         finally:
             await retained.stop()
             retained_store.close()
-
-        await _exercise_user_attachment_history(tmp_path)
-        await _exercise_direct_media_history(tmp_path, monkeypatch)
-        await _exercise_assistant_media_history(tmp_path)
-        await _exercise_settled_media_history(tmp_path)
 
     async def test_inject_event_and_unified_trigger_model(self, make_creature):
         """The unified ``TriggerEvent`` model: a non-user-input event
@@ -3602,8 +4200,7 @@ class TestCoreIntegration:
             image_call_parts = [
                 part for part in image_user_message["content"] if isinstance(part, dict)
             ]
-            # ReadTool hands the image over as a ``file://`` reference (nothing
-            # is copied into the session); the provider boundary inlines it.
+            # ReadTool captures the validated bytes before the next model call.
             image_ref = next(
                 (
                     part["image_url"]["url"]
@@ -3613,8 +4210,7 @@ class TestCoreIntegration:
                 None,
             )
             assert image_ref is not None, image_call_parts
-            assert image_ref.startswith("file://"), image_ref
-            assert Path(file_reference_path(image_ref)).is_file()
+            assert image_ref == "data:image/png;base64," + png_b64
             assert resolve_artifact_url(image_ref) == (
                 "data:image/png;base64," + png_b64
             )

@@ -34,7 +34,7 @@ order:
 
 ## Creature config (`config.yaml`)
 
-Loaded by `kohakuterrarium.core.config.load_agent_config`. File lookup
+Loaded by `kohakuterrarium.core.config.load.load_agent_config`. File lookup
 order: `config.yaml` → `config.yml` → `config.json` → `config.toml`.
 
 ### Top-level fields
@@ -57,14 +57,15 @@ order: `config.yaml` → `config.yml` → `config.json` → `config.toml`.
 | `input` | dict | `{}` | no | Input module config. See [Input](#input). |
 | `output` | dict | `{}` | no | Output module config. See [Output](#output). |
 | `tools` | list | `[]` | no | Tool entries. See [Tools](#tools). |
-| `subagents` | list | `[]` | no | Sub-agent entries. See [Sub-agents](#sub-agents). |
+| `subagents` | list | `[]` | no | Explicit sub-agent entries; an entry named `fork` overrides the implicit preset. See [Sub-agents](#sub-agents). |
+| `fork_enabled` | bool | `true` | no | Register the builtin context `fork` by default. `false` disables it and rejects `/btw`; does not change the `/fork` session-copy command. |
 | `triggers` | list | `[]` | no | Trigger entries. See [Triggers](#triggers). |
 | `compact` | dict | `null` | no | Compaction config. See [Compact](#compact). |
 | `startup_trigger` | dict | `null` | no | One-shot trigger fired on start. `{prompt: "..."}`. |
 | `termination` | dict | `null` | no | Termination conditions. See [Termination](#termination). |
 | `tool_format` | str \| dict | `"bracket"` | no | `bracket`, `xml`, `native`, or a custom dict format. `native` requires the configured LLM provider to support structured tool calling. |
 | `mcp_servers` | list | `[]` | no | Per-agent MCP servers. See [MCP servers](#mcp-servers-in-agent-config). |
-| `plugins` | list | `[]` | no | Lifecycle plugins. See [Plugins](#plugins). |
+| `plugins` | list | `[]` | no | Plugins. See [Plugins](#plugins). |
 | `no_inherit` | list[str] | `[]` | no | Keys that replace (not merge) base values. E.g. `[tools, subagents]`. |
 | `memory` | dict | `{}` | no | `memory.embedding.{provider,model}`. See [Memory](#memory). |
 | `output_wiring` | list | `[]` | no | Per-creature automatic round-output routing. See [Output wiring](#output-wiring). |
@@ -99,7 +100,7 @@ All fields may also be set at the top level for backward compatibility.
 
 Canonical model identifiers are now `provider/name[@group=option,...]`. The runtime stores and surfaces this full identifier (for `/model`, session-info events, and UI display), so a round-trip like `/model openai/gpt-5.4-api@reasoning=high` is stable.
 
-Resolution order per turn (see `llm/profiles.py:resolve_controller_llm`):
+Resolution order per turn (see `llm/profiles/resolve.py:resolve_controller_llm`):
 
 1. `--llm` CLI flag wins over the YAML `controller.llm`.
 2. Otherwise `controller.llm` (preset name + optional `@group=option` selector).
@@ -299,15 +300,14 @@ An implementation can set the `BaseTool.request_replay` class attribute to
 
 ```yaml
 tools:
-  - name: image_gen
-    type: builtin
+  - name: my_provider_tool
+    type: custom
     options:
       request_replay: forbid
 ```
 
-Programmatic construction uses `ImageGenTool(config=ToolConfig(request_replay="forbid"))`.
-Both classes are available from `kohakuterrarium.builtins.tools.image_gen` and
-`kohakuterrarium.modules.tool.base`, respectively. Custom and package tool
+Programmatic construction uses `MyTool(config=ToolConfig(request_replay="forbid"))`,
+with `ToolConfig` from `kohakuterrarium.modules.tool.base`. Custom and package tool
 configuration accepts the same reserved option without forwarding it to the
 tool constructor. There is no Studio control for this field.
 
@@ -317,9 +317,8 @@ removes this field from outgoing HTTP and WebSocket tool specifications;
 invalid declarations are rejected. The selected policy is fixed for the
 request's WebSocket attempts; edits apply to subsequent requests.
 
-The default `image_gen` policy accepts possible duplicate generation, additional
-cost, and different output on replay. Images from failed WebSocket attempts are
-discarded, and image results are published only after the successful attempt.
+Images from failed WebSocket attempts are discarded, and image results are
+published only after the successful attempt.
 Merely supporting the Responses background API does not enable background mode.
 Only an actual top-level `background: true` request activates that separate guard.
 
@@ -396,7 +395,8 @@ Tool types:
 Provider-native tools are auto-injected from the active backend's
 `provider_native_tools` declaration. The creature does not need to list
 such a tool under `tools:` unless it wants to override per-tool knobs.
-The shipped example is `image_gen` for Codex-backed creatures.
+The shipped example is `image_gen` for Codex-backed creatures (an ordinary tool
+the Codex backend offers).
 
 Shorthand:
 
@@ -419,14 +419,14 @@ tools:
 | `tools` | list[str] | `[]` | Tools this sub-agent is allowed to use. |
 | `can_modify` | bool | `false` | Whether the sub-agent can perform mutating operations. |
 | `interactive` | bool | `false` | Stay alive across turns; receive context updates. |
-| `options` | dict | `{}` | Sub-agent-specific options. Inline sub-agent config fields such as `notify_controller_on_background_complete` are read from here when supported by `SubAgentConfig`. |
+| Additional inline fields | varies | varies | YAML fields such as `model`, `timeout`, `max_turns`, `plugins`, and `notify_controller_on_background_complete` are collected into `SubAgentConfigItem.options` by the loader. Put them directly on the entry, not under a nested YAML `options:` block. |
 
 Shorthand: a bare string is treated as a builtin sub-agent name:
 
 ```yaml
 subagents:
   - explore
-  - worker
+  - critic
 ```
 
 YAML-only inline config: use `type: custom` without `module`/`config`; unknown
@@ -446,9 +446,15 @@ subagents:
           tool_call_budget: [75, 100]
 ```
 
-Builtin sub-agents already declare `default_plugins: ["auto-compact"]` and a
-`budget` plugin with `turn_budget: [40, 60]`, `tool_call_budget: [75, 100]`,
-and no `walltime_budget`.
+The inspection presets `explore`, `critic`, and `fork` use only `read`, `glob`,
+`grep`, and `tree`, with `turn_budget: [8, 12]`, `tool_call_budget: [24, 40]`,
+`max_turns: 14`, `timeout: 600`, and no automatic compaction. `fork` is registered
+without an explicit entry unless `fork_enabled: false`; it captures the parent's
+effective context and defaults to `model: inherit` with an isolated provider.
+`explore` and `critic` still start with fresh task contexts. Service presets
+(`response`, `summarize`, `memory_read`, `memory_write`) retain
+`default_plugins: ["auto-compact"]`, `turn_budget: [40, 60]`, and
+`tool_call_budget: [75, 100]`. See the [sub-agent guide](../guides/sub-agents.md).
 
 Background completion note:
 
@@ -459,7 +465,7 @@ tools:
     notify_controller_on_background_complete: false
 
 subagents:
-  - name: research
+  - name: explore
     type: builtin
     notify_controller_on_background_complete: false
 ```
@@ -785,7 +791,7 @@ explicit arguments:
 - Canonical path: `config_dir() / "drive-settings.yaml"`, normally
   `~/.kohakuterrarium/drive-settings.yaml` (honours `KT_CONFIG_DIR`). It
   is **not** the launcher's `app-settings.json`.
-- Loaded/validated by `kohakuterrarium.studio.identity.drive_settings`.
+- Loaded/validated by `kohakuterrarium.studio.identity.drive_settings.settings`.
 - Stores serializable selections and options only — never live Python
   objects and never Drive records (those live in the Drive repository /
   session sidecar).
@@ -883,7 +889,7 @@ For an explicitly constructed engine, configure the registration before passing 
 to `Terrarium(drive_registrations=[registration])`:
 
 ```python
-from kohakuterrarium.terrarium.drive.registration_options import (
+from kohakuterrarium.terrarium.drive.registration.options import (
     apply_registration_wake_policy,
 )
 
@@ -944,6 +950,12 @@ subagent_models:
   explore: openrouter/mimo-v2.5-pro
   worker: codex/gpt-5.5
 
+# Optional defaults for creatures spawned by group_add_node and
+# group_spawn_child. Keys are normalized @pkg/... refs; default is global.
+child_models:
+  default: openrouter/mimo-v2.5-pro
+  "@kt-biome/creatures/swe": codex/gpt-5.5
+
 backends:
   <provider-name>:
     backend_type: openai | anthropic | codex  # transport implementation
@@ -991,14 +1003,28 @@ Per-agent overrides via `controller.base_url` / `controller.api_key_env`
 still work.
 
 `subagent_models` supplies user-level defaults without editing packaged creature
-configs. Keys match the final `SubAgentConfig.name` exactly. A concrete `model`
-on the creature or sub-agent module still wins; `parent`, `inherit`, and `default`
-explicitly inherit the parent LLM. An absent model, `subagent-default`, or
-`subagent_default` uses the named entry when present, otherwise it inherits the
-parent. The mapping is read when a sub-agent is created, so edits affect future
+configs. Keys match the final `SubAgentConfig.name` exactly. A matching entry
+overrides an absent model and the config sentinels `parent`, `inherit`, `default`,
+`subagent-default`, and `subagent_default`. A concrete selector written directly
+on that sub-agent config still wins, and a missing table entry inherits the parent
+LLM. The mapping is read when a sub-agent is created, so edits affect future
 jobs only. Conversation and Inspector Trace rows record the model actually bound
 to each new job, preferring its canonical profile selector and falling back to
 the raw model id.
+
+`child_models` supplies the same kind of user default for creatures spawned by
+`group_add_node` and `group_spawn_child`. It does not affect `kt run`, Studio,
+recipes, or direct Python API calls. An explicit `llm` argument wins. A named
+`@pkg/...` entry overrides a concrete config model, while table `default` does not;
+it applies only to an absent model or `parent`, `inherit`, or `default`. The result
+reports `requested_llm`, `llm`, `llm_source`, `matched_key`, `llm_fallback_from`,
+and `fallback_reason`. The table matches normalized
+`@pkg/...` refs from the creature through its `base_config` ancestors, nearest
+first. It does not match `config.name`, the spawn `name`, or a local filesystem
+path. The table key `default` is the global child fallback. An unavailable table
+selector falls back to the caller model, then `default_model`, and the tool
+result reports `llm`, `llm_source`, and `llm_fallback_from`. The file is read
+when the child is spawned, so edits affect future spawns only.
 
 ### OpenAI-compatible retries
 

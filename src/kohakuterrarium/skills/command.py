@@ -54,7 +54,7 @@ class SkillCommand(BaseCommand):
                 )
             )
 
-        body = skill.body or ""
+        body = skill.render_body()
         preamble = f"## Skill: {skill.name}\n\n{skill.description or ''}".rstrip()
         parts_out = [preamble]
         if rest:

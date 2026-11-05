@@ -65,7 +65,7 @@ studio}` 加上多节点。e2e 回答一个问题：*系统端到端能跑起来
 ### 例外
 
 有些文件被故意排除在 95% 单文件覆盖目标之外：第三方 provider
-（`llm/codex_provider.py`）、平台 PTY（`api/ws/pty.py`）、终端
+（`llm/codex/provider.py`）、平台 PTY（`api/ws/pty.py`）、终端
 用户 CLI/UI（`builtins/cli_rich/*`、`builtins/tui/*`）、
 pywebview 启动路径。完整列表在 `tests/README.md` 中。
 
@@ -278,14 +278,14 @@ er.assert_before("tool_complete", "channel_message")
 | 你改了什么 | 测试加到哪里 |
 |---|---|
 | `core/agent.py` | `tests/unit/test_phase5.py` 或新文件 |
-| `core/controller.py` | `tests/unit/test_phase3_4.py` |
-| `core/executor.py` | `tests/unit/test_phase3_4.py` |
+| `core/controller/controller.py` | `tests/unit/test_phase3_4.py` |
+| `core/jobs/executor.py` | `tests/unit/test_phase3_4.py` |
 | `parsing/` | `tests/unit/test_phase2.py` |
 | `modules/subagent/` | `tests/unit/test_phase6.py` |
 | `modules/trigger/` | `tests/unit/test_phase7.py` |
 | `core/environment.py` | `tests/unit/test_environment.py` |
 | `session/store.py` | `tests/unit/test_session_store.py` |
-| `session/resume.py` | `tests/unit/test_session_resume.py` |
+| `session/resume/resume.py` | `tests/unit/test_session_resume.py` |
 | `bootstrap/` | `tests/unit/test_bootstrap.py` |
 | `terrarium/` | `tests/unit/test_terrarium_modules.py` |
 
@@ -327,7 +327,7 @@ session 同步、cluster fold）至少需要一个工作节点才有意义。
 
 对于横跨真实 Lab 派发逻辑的工作流（握手 → APP request →
 response），使用
-`laboratory/_internal/transport_inproc.py` 中的
+`laboratory/_internal/transport/inproc.py` 中的
 `InProcTransport`。它实现了与 WebSocket 传输相同的
 `LabTransport` Protocol，但把一切都保留在同一个 event loop
 里。规范的 setup helper 请见

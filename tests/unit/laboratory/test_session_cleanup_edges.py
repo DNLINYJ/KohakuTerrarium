@@ -7,11 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from kohakuterrarium.laboratory.adapters.terrarium_session import (
+from kohakuterrarium.laboratory.adapters.terrarium.session import (
     _MAX_RESUME_TOKENS,
     _transfer_path,
 )
-from kohakuterrarium.session.resource_gate import GATE, try_fast
+from kohakuterrarium.session.occupancy.gate import GATE, try_fast
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.testing.terrarium import TestTerrariumBuilder
 from tests.unit.laboratory.file_mutation_enrollment_helpers import wait_pending

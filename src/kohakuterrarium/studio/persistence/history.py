@@ -9,13 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from kohakuterrarium.errors import NotFoundError, SessionError, SessionNotFoundError
-from kohakuterrarium.session.history_paging import physical_refs
-from kohakuterrarium.session.history_records import history_page
+from kohakuterrarium.session.history.paging import physical_refs
+from kohakuterrarium.session.history.records import history_page
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.studio.persistence.store import (
     session_history_payload,
     session_targets,
 )
+from kohakuterrarium.studio.persistence.viewer.agents import viewer_agent_names
 
 
 def history_index_from_store(store: SessionStore, session_name: str) -> dict[str, Any]:
@@ -23,7 +24,12 @@ def history_index_from_store(store: SessionStore, session_name: str) -> dict[str
     try:
         meta = store.load_meta()
         targets = session_targets(store, meta)
-        return {"session_name": session_name, "meta": meta, "targets": targets}
+        return {
+            "session_name": session_name,
+            "meta": meta,
+            "targets": targets,
+            "viewer_agents": viewer_agent_names(meta, store),
+        }
     except Exception as e:
         raise SessionError(f"History index load failed: {e}") from e
 

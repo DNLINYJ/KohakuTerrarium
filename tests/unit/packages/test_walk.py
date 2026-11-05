@@ -6,6 +6,8 @@ and asserts the enumerated shape reflects what is on disk.
 """
 
 import asyncio
+import os
+import shutil
 
 import pytest
 
@@ -14,6 +16,7 @@ from kohakuterrarium.packages.walk import (
     get_package_modules,
     list_packages,
     package_snapshot,
+    packages_fingerprint,
 )
 
 
@@ -30,6 +33,40 @@ def _make_pkg(parent, name, manifest_body=""):
     p.mkdir()
     (p / "kohaku.yaml").write_text(f"name: {name}\n{manifest_body}")
     return p
+
+
+class TestPackagesFingerprint:
+    def test_changes_on_install_manifest_edit_and_uninstall(self, pkg_dir, tmp_path):
+        empty = packages_fingerprint()
+        assert packages_fingerprint() == empty
+        pkg = _make_pkg(pkg_dir, "a")
+        installed = packages_fingerprint()
+        assert installed != empty
+        assert packages_fingerprint() == installed
+        manifest = pkg / "kohaku.yaml"
+        manifest.write_text("name: a\nversion: 2\n")
+        stamp = manifest.stat().st_mtime_ns + 1_000_000
+        os.utime(manifest, ns=(stamp, stamp))
+        edited = packages_fingerprint()
+        assert edited != installed
+        src = tmp_path / "linked-src"
+        src.mkdir()
+        (src / "kohaku.yaml").write_text("name: b\n")
+        (pkg_dir / "b.link").write_text(str(src))
+        linked = packages_fingerprint()
+        assert linked != edited
+        stamp = (src / "kohaku.yaml").stat().st_mtime_ns + 1_000_000
+        os.utime(src / "kohaku.yaml", ns=(stamp, stamp))
+        assert packages_fingerprint() != linked
+        (pkg_dir / "b.link").unlink()
+        shutil.rmtree(pkg)
+        assert packages_fingerprint() != edited
+
+    def test_differs_between_package_roots(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(loc_mod, "PACKAGES_DIR", tmp_path / "one")
+        first = packages_fingerprint()
+        monkeypatch.setattr(loc_mod, "PACKAGES_DIR", tmp_path / "two")
+        assert packages_fingerprint() != first
 
 
 class TestListPackages:

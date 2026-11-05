@@ -9,14 +9,14 @@ import pytest
 
 from kohakuterrarium.builtins.user_commands import get_builtin_user_command
 from kohakuterrarium.modules.user_command.base import UserCommandContext
-from kohakuterrarium.terrarium.creature_host import Creature
+from kohakuterrarium.terrarium.creature.host import Creature
 from kohakuterrarium.terrarium.drive.config import (
     DriveRuntimeConfig,
     default_registrations,
 )
 from kohakuterrarium.terrarium.drive.models import ActorRef
-from kohakuterrarium.terrarium.engine import Terrarium
-from kohakuterrarium.terrarium.service import LocalTerrariumService
+from kohakuterrarium.terrarium.engine.engine import Terrarium
+from kohakuterrarium.terrarium.service.service import LocalTerrariumService
 from kohakuterrarium.testing.terrarium import _FakeAgent
 
 pytestmark = pytest.mark.timeout(30)
@@ -147,7 +147,7 @@ class TestAuthorization:
 
 
 async def _drive_rows(service):
-    from kohakuterrarium.studio.sessions import drives as facade
+    from kohakuterrarium.studio.sessions.drives import drives as facade
 
     info = await service.list_creatures()
     gid = info[0].graph_id

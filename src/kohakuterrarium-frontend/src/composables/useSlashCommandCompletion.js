@@ -47,7 +47,9 @@ export function useSlashCommandCompletion({ chat, inputText, activeTabKey }) {
           !commandNamespace.has(entry.name.toLowerCase()),
       )
       .map((entry) => ({ ...entry, type: "skill" }))
-    const visibleCommands = commands.filter((entry) => entry.name.toLowerCase() === "goal")
+    const visibleCommands = commands.filter((entry) =>
+      ["goal", "btw"].includes(entry.name.toLowerCase()),
+    )
     return [...visibleCommands, ...skills]
       .filter(
         (entry) =>

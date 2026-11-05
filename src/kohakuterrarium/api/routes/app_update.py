@@ -11,6 +11,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 
+from kohakuterrarium.api.routes._local import is_source_development
 from kohakuterrarium.launcher import settings as _launcher_settings
 from kohakuterrarium.launcher.feeds import (
     FeedError,
@@ -23,6 +24,7 @@ from kohakuterrarium.launcher.migration import (
     is_launcher_install,
     is_legacy_bundle,
 )
+from kohakuterrarium.launcher.runtime_info import describe as describe_runtime
 from kohakuterrarium.launcher.tree_ops import (
     list_installed_versions,
     read_active_pointer,
@@ -33,6 +35,7 @@ from kohakuterrarium.launcher.update_runner import (
     rollback,
     run_update,
 )
+from kohakuterrarium.launcher.versions import is_newer
 
 router = APIRouter()
 # The WebSocket uses a separate router to preserve its root-level canonical
@@ -42,6 +45,8 @@ ws_router = APIRouter()
 
 def _wrapper_mode_only(request: Request) -> None:
     """Reject the call when the host isn't a wrapper / standalone install."""
+    if is_source_development(request):
+        raise HTTPException(409, "runtime maintenance is unavailable in source mode")
     lab_mode = getattr(request.app.state, "lab_mode", "standalone")
     if lab_mode == "lab-client":
         raise HTTPException(
@@ -114,6 +119,13 @@ async def get_state(request: Request) -> dict[str, Any]:
     }
 
 
+@router.get("/runtime")
+async def get_runtime(request: Request) -> dict[str, Any]:
+    """Return the active release, the installed ones and the shipped one."""
+    _wrapper_mode_only(request)
+    return await asyncio.to_thread(describe_runtime)
+
+
 @router.post("/feeds/probe")
 async def post_feeds_probe(request: Request) -> dict[str, Any]:
     """Fetch the channel manifest and list compatible releases newest first."""
@@ -133,8 +145,22 @@ async def post_feeds_probe(request: Request) -> dict[str, Any]:
         "platform": plat,
         "py_abi": abi,
         "latest_version": latest,
+        "update_available": _update_available(cfg, latest),
         "releases": releases,
     }
+
+
+def _update_available(cfg, latest: str | None) -> bool:
+    """Whether an update would install: the target differs, and is newer unless pinned."""
+    target = cfg.pinned_version or latest
+    if not target:
+        return False
+    active = read_active_pointer()
+    if active is None:
+        return True
+    if target == active.version:
+        return False
+    return bool(cfg.pinned_version) or is_newer(target, active.version)
 
 
 @router.post("/update")
@@ -237,7 +263,7 @@ async def _stream_update(ws: WebSocket) -> None:
 async def ws_update(ws: WebSocket) -> None:
     """Stream an eligible launcher update or close with a mode-specific refusal."""
     lab_mode = getattr(ws.app.state, "lab_mode", "standalone")
-    if lab_mode == "lab-client":
+    if lab_mode == "lab-client" or is_source_development(ws):
         await ws.close(code=4404)
         return
     if not is_launcher_install():

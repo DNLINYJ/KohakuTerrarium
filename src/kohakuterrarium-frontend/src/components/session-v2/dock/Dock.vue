@@ -1,6 +1,6 @@
 <template>
-  <div ref="rootEl" class="flex flex-col items-end gap-2" data-test="v2-dock">
-    <div v-if="moreOpen" class="kt-v2-float kt-v2-edge rounded-lg border shadow-lg py-1 w-52" data-test="v2-dock-more-menu">
+  <div ref="rootEl" class="relative flex flex-col items-end gap-2" data-test="v2-dock">
+    <div v-if="moreOpen" class="kt-v2-float kt-v2-edge absolute bottom-full right-0 z-10 mb-2 rounded-lg border shadow-lg py-1 w-52" data-test="v2-dock-more-menu">
       <button v-for="item in MORE_ITEMS" :key="item.id" class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left text-warm-700 dark:text-warm-200 hover:bg-warm-100 dark:hover:bg-warm-800" :data-test="`v2-more-${item.id}`" @click="openMore(item)"><span :class="item.icon" />{{ t(item.target === "side" ? `side.${item.id}.title` : `widget.${item.id}.title`) }}</button>
     </div>
 
@@ -30,6 +30,7 @@ import { formatTokens } from "@/components/session-v2/model/status/statusModel"
 import { useUsage } from "@/components/session-v2/model/status/useUsage"
 import { useSessionDrives } from "@/components/session-v2/model/useSessionDrives"
 import { useV2T } from "@/components/session-v2/model/v2Strings"
+import { dockPanelList } from "@/ext/dockPanels"
 import { useCanvasStore } from "@/stores/canvas"
 import { readLocalPref, writeLocalPref } from "@/utils/uiPrefs"
 
@@ -50,7 +51,9 @@ const rootEl = ref(null)
 const expanded = ref(readLocalPref(EXPANDED_KEY) !== "0")
 const moreOpen = ref(false)
 
-const items = computed(() =>
+const extensionItems = computed(() => dockPanelList().map((panel) => ({ id: panel.key, icon: panel.icon, label: "", title: panel.label })))
+const items = computed(() => [...builtinItems.value, ...extensionItems.value])
+const builtinItems = computed(() =>
   dockItems({
     drives: drives.order.length,
     jobs: Object.keys(ctx.chat.runningJobs || {}).length,
@@ -62,7 +65,7 @@ const items = computed(() =>
     },
   }),
 )
-const total = computed(() => items.value.reduce((sum, i) => sum + (i.count || 0), 0))
+const total = computed(() => builtinItems.value.reduce((sum, i) => sum + (i.count || 0), 0))
 
 function isActive(id) {
   return ctx.widget.value === id || (ctx.side.value?.kind === "widget" && ctx.side.value.payload?.id === id)

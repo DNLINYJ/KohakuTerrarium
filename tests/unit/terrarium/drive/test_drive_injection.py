@@ -6,18 +6,18 @@ a fresh agent reports no injection until installed.
 """
 
 import kohakuterrarium as kt
-from kohakuterrarium.core.config_types import AgentConfig, InputConfig, OutputConfig
+from kohakuterrarium.core.config.types import AgentConfig, InputConfig, OutputConfig
 from kohakuterrarium.terrarium.drive.injection import (
     has_drive_injection,
     install_drive_runtime,
     refresh_drive_prompt,
 )
-from kohakuterrarium.terrarium.drive.registration import (
+from kohakuterrarium.terrarium.drive.registration.registration import (
     DriveRegistrationDescriptor,
     GenericDriveRegistration,
 )
-from kohakuterrarium.terrarium.drive.snapshot import EnabledRegistrySnapshot
-from kohakuterrarium.terrarium.drive.tools import SELF_SERVICE_TOOL_NAMES
+from kohakuterrarium.terrarium.drive.snapshot.snapshot import EnabledRegistrySnapshot
+from kohakuterrarium.terrarium.drive.tools.self_service import SELF_SERVICE_TOOL_NAMES
 from kohakuterrarium.testing.llm import ScriptedLLM
 
 
@@ -154,7 +154,7 @@ async def test_non_privileged_agent_gets_no_group_drive(tmp_path):
 async def test_privileged_agent_gets_group_drive(tmp_path):
     # Once the privileged group tools are registered (add_creature / assign_root),
     # injection detects privilege and adds group_drive — idempotently.
-    from kohakuterrarium.terrarium.tools_group import force_register_privileged_tools
+    from kohakuterrarium.terrarium.tools.group import force_register_privileged_tools
 
     agent = await _agent(tmp_path)
     try:

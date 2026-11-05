@@ -3,8 +3,8 @@
 import pytest
 
 from kohakuterrarium.llm.deepseek_presets import PRESETS
-from kohakuterrarium.llm.profile_types import LLMPreset
-from kohakuterrarium.llm.variations import (
+from kohakuterrarium.llm.profiles.types import LLMPreset
+from kohakuterrarium.llm.profiles.variations import (
     apply_variation_groups,
     normalize_variation_selections,
 )

@@ -51,6 +51,7 @@ const mounted = []
 afterEach(() => {
   for (const wrapper of mounted.splice(0)) wrapper.unmount()
   errorSpy.mockClear()
+  vi.restoreAllMocks()
 })
 
 function mountActions({
@@ -585,31 +586,43 @@ describe("useMessageRowActions order-preserving save", () => {
 
   it("captures a deep snapshot of sourceContent at confirm so later mutation cannot rewrite the save", async () => {
     const rawContent = [
-      { type: "text", text: "hello" },
       { type: "file", file: { name: "note.txt", path: "/workspace/note.txt" } },
+      { type: "text", text: "hello", extension: { nested: [{ value: "original" }] } },
     ]
     const gate = deferred()
     const editMessage = vi.fn(async () => ({ ok: true }))
     const message = rawRow(rawContent)
     const { api } = mountActions({ message, editMessage, messagesByTab: { main: [message] } })
     api.startEdit()
-    const extra = {
-      id: "new_async",
+    const replacement = {
+      id: "replace_async",
+      originalIndex: 0,
       name: "late.txt",
       kind: "file",
       file: { name: "late.txt", type: "text/plain", size: 4, text: () => gate.promise },
     }
-    api.editAttachments.value.push(extra)
+    api.editAttachments.value[0] = replacement
+    const stringify = vi.spyOn(JSON, "stringify")
+    const parse = vi.spyOn(JSON, "parse")
     const pending = api.confirmEdit()
     api.editSourceContent.value.reverse()
-    api.editSourceContent.value[0].file.path = "/mutated-during-await"
+    api.editSourceContent.value[1].file.path = "/mutated-during-await"
+    api.editSourceContent.value[0].extension.nested[0].value = "mutated-during-await"
     gate.resolve("body")
     await pending
     const payload = editMessage.mock.calls[0][1]
-    expect(payload.map((part) => part.type)).toEqual(["text", "file", "file"])
-    expect(payload[0].text).toBe("hello")
-    expect(payload[1].file.path).toBe("/workspace/note.txt")
-    expect(payload[2].file.content).toBe("body")
+    expect(payload.map((part) => part.type)).toEqual(["file", "text"])
+    expect(payload[0].file.content).toBe("body")
+    expect(payload[1].text).toBe("hello")
+    expect(payload[1].extension.nested[0].value).toBe("original")
+    expect(rawContent[0].file.path).toBe("/workspace/note.txt")
+    expect(rawContent[1].extension.nested[0].value).toBe("original")
+    expect(
+      stringify.mock.calls.some(
+        ([value]) => Array.isArray(value) && value.some((part) => part?.type),
+      ),
+    ).toBe(false)
+    expect(parse).not.toHaveBeenCalled()
   })
 
   it("surfaces a numeric placeholder rebind as a visible edit error and does not dispatch", async () => {

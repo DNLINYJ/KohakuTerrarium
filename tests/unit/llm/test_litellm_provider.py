@@ -12,7 +12,10 @@ from pathlib import Path
 
 import pytest
 
-from kohakuterrarium.llm.media_reference import session_media_scope
+from kohakuterrarium.llm.media.reference import session_media_scope
+
+# The first test in a worker imports litellm, which is slow under parallel load.
+pytestmark = [pytest.mark.real_llm_provider, pytest.mark.timeout(240)]
 
 
 class _FakeLitellm:
@@ -68,11 +71,27 @@ class _Response:
 _fake_litellm = _FakeLitellm()
 
 
+PROVIDER_MODULE = "kohakuterrarium.llm.litellm_provider"
+
+
 @pytest.fixture
 def lpm(monkeypatch):
+    """Import the provider afresh against the fake SDK, then restore what was there.
+
+    A provider module imported earlier in the same worker is bound to the real
+    SDK, which would then run instead of the fake.
+    """
+    parent = importlib.import_module("kohakuterrarium.llm")
+    previous = sys.modules.pop(PROVIDER_MODULE, None)
+    previous_attribute = parent.__dict__.get("litellm_provider")
     monkeypatch.setitem(sys.modules, "litellm", _fake_litellm)
-    module = importlib.import_module("kohakuterrarium.llm.litellm_provider")
-    return module, _fake_litellm
+    module = importlib.import_module(PROVIDER_MODULE)
+    yield module, _fake_litellm
+    sys.modules.pop(PROVIDER_MODULE, None)
+    parent.__dict__.pop("litellm_provider", None)
+    if previous is not None:
+        sys.modules[PROVIDER_MODULE] = previous
+        parent.__dict__["litellm_provider"] = previous_attribute
 
 
 class TestMediaReferences:

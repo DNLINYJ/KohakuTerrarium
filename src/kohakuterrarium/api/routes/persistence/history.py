@@ -25,11 +25,11 @@ from kohakuterrarium.errors import (
     SessionError,
     SessionNotFoundError,
 )
-from kohakuterrarium.session.history_paging import (
+from kohakuterrarium.session.history.paging import (
     HistoryPagingError,
     require_bounded_history_page,
 )
-from kohakuterrarium.session.history_records import history_detail
+from kohakuterrarium.session.history.records import history_detail
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.studio._runtime import host_engine_or_none
 from kohakuterrarium.studio.persistence.history import (
@@ -38,8 +38,8 @@ from kohakuterrarium.studio.persistence.history import (
     history_page_from_store,
 )
 from kohakuterrarium.studio.persistence.store import resolve_session_path_default
-from kohakuterrarium.terrarium.creature_ops import agent_live_job_ids
-from kohakuterrarium.terrarium.service import TerrariumService
+from kohakuterrarium.terrarium.creature.ops import agent_live_job_ids
+from kohakuterrarium.terrarium.service.service import TerrariumService
 
 router = APIRouter()
 

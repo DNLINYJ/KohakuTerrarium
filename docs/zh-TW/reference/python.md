@@ -240,7 +240,7 @@ async for ev in agent.run_stream("Refactor utils.py"):
 
 ## Terrarium 引擎
 
-模組：`kohakuterrarium.terrarium.engine` (re-export 為
+模組：`kohakuterrarium.terrarium.engine.engine` (re-export 為
 `kohakuterrarium.Terrarium`)。多代理執行期引擎：托管行程內
 所有運行中的生物 (creature)；獨立 agent 就是一張單生物圖。
 
@@ -362,7 +362,7 @@ async with kt.Terrarium(session_dir="runs/") as engine:
 
 ## Creature
 
-模組：`kohakuterrarium.terrarium.creature_host` (re-export 為
+模組：`kohakuterrarium.terrarium.creature.host` (re-export 為
 `kohakuterrarium.Creature`)。引擎對一隻運行中 agent 的 handle。
 由 `add_creature` / `with_creature` 回傳；不直接建構。
 
@@ -404,7 +404,7 @@ async with kt.Terrarium(session_dir="runs/") as engine:
 
 ### `SessionReader`：唯讀檢視
 
-模組：`kohakuterrarium.session.reader` (re-export 為
+模組：`kohakuterrarium.session.readonly.reader` (re-export 為
 `kohakuterrarium.SessionReader`)。針對 `.kohakutr` 檔案的一站式
 唯讀介面。透過 `SessionStore.open_readonly` 開啟，讀取永遠不會
 更新 `last_active` 或改動 `status`。支援 context manager。

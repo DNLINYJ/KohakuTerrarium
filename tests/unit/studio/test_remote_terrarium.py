@@ -4,8 +4,8 @@ from types import SimpleNamespace
 import pytest
 
 from kohakuterrarium.studio.sessions import remote_terrarium
-from kohakuterrarium.terrarium.service import CreatureInfo
-from kohakuterrarium.terrarium.topology import GraphTopology
+from kohakuterrarium.terrarium.service.service import CreatureInfo
+from kohakuterrarium.terrarium.graph.topology import GraphTopology
 
 
 class TestStartRemoteTerrarium:

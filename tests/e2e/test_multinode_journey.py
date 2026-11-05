@@ -49,8 +49,9 @@ from tests.e2e._lab_harness import (
     install_scripted_llm,
 )
 from kohakuterrarium.api.deps import get_service_legacy as get_service
-from kohakuterrarium.session.embedding import BaseEmbedder
-from kohakuterrarium.studio.sessions import cluster_fold, memory_search
+from kohakuterrarium.session.memory.embedding import BaseEmbedder
+from kohakuterrarium.studio.sessions.cluster import fold as cluster_fold
+from kohakuterrarium.studio.sessions.memory import search as memory_search
 from kohakuterrarium.terrarium.drive.models import ActorRef
 from kohakuterrarium.terrarium.drive.requests import CreateDriveRequest
 from kohakuterrarium.testing.llm import ScriptEntry
@@ -144,7 +145,7 @@ class _CapturingHandler(logging.Handler):
 
     The project's logger sets ``propagate=False`` on the
     ``kohakuterrarium`` root, so pytest's stock ``caplog`` doesn't see
-    records emitted by ``kohakuterrarium.terrarium.output_wiring``. The
+    records emitted by ``kohakuterrarium.terrarium.wiring.output``. The
     journey attaches one of these directly to that logger to assert on
     B7's misleading "target unresolved" WARN.
     """
@@ -429,7 +430,7 @@ class TestMultinodeJourney:
                 # ``caplog`` would not see them).
                 wiring_handler = _CapturingHandler()
                 wiring_logger = logging.getLogger(
-                    "kohakuterrarium.terrarium.output_wiring"
+                    "kohakuterrarium.terrarium.wiring.output"
                 )
                 wiring_prior_level = wiring_logger.level
                 wiring_logger.addHandler(wiring_handler)
@@ -2631,7 +2632,7 @@ async def _drive_journey(
             )
 
     # === 29b2. recipe-driven terrarium spawn on the host ============
-    # Exercises ``terrarium/recipe.py``, ``terrarium/root.py``,
+    # Exercises ``terrarium/recipe/loader.py``, ``terrarium/root.py``,
     # ``terrarium/factory.py`` and the recipe → topology pipeline
     # that the dashboard's "New Terrarium" modal uses.
     async with bugs.step("29b2 recipe-driven terrarium spawn"):
@@ -2666,6 +2667,12 @@ async def _drive_journey(
         }
         recipe_path = terra_dir / "terrarium.yaml"
         recipe_path.write_text(yaml.safe_dump(recipe), encoding="utf-8")
+        default_url = "/api/settings/module-defaults/plugin/budget"
+        saved = await host.http.put(
+            default_url, json={"values": {"walltime_budget": {"hard": 321}}}
+        )
+        assert saved.status_code == 200, saved.text
+
         rr = await asyncio.wait_for(
             host.http.post(
                 "/api/sessions/active/terrarium",
@@ -2680,6 +2687,12 @@ async def _drive_journey(
         )
         if rr.status_code == 200:
             deployed = rr.json()["creatures"]
+            for member in deployed:
+                module_url = f"/api/sessions/{rr.json()['session_id']}/creatures/{member['creature_id']}/modules/plugin/budget/options"
+                current = await host.http.get(module_url)
+                assert current.status_code == 200, current.text
+                assert current.json()["options"]["walltime_budget"] == {"hard": 321}
+
             bugs.check(
                 "29b2 recipe members are deployed together on w1",
                 {member["name"] for member in deployed} == {"intake", "worker"}

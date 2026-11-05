@@ -7,12 +7,10 @@
     <div>
       <label class="text-[11px] text-warm-400 mb-1 block">{{ t("settings.backends.backendType") }}</label>
       <el-select :model-value="form.backend_type" size="small" class="w-full" @update:model-value="updateField('backend_type', $event)">
-        <el-option value="openai" label="openai" />
-        <el-option value="codex" label="openai-responses (codex)" />
-        <el-option value="anthropic" label="anthropic" />
+        <el-option v-for="type in typeOptions" :key="type.name" :value="type.name" :label="type.label" />
       </el-select>
     </div>
-    <div class="col-span-2">
+    <div v-if="needsEndpoint" class="col-span-2">
       <label class="text-[11px] text-warm-400 mb-1 block">{{ t("settings.backends.baseUrl") }}</label>
       <el-input :model-value="form.base_url" size="small" placeholder="https://api.example.com/v1" @update:model-value="updateField('base_url', $event)" />
     </div>
@@ -48,9 +46,11 @@
 </template>
 
 <script setup>
+import { computed, onMounted, ref } from "vue"
+import { settingsAPI } from "@/utils/api"
 import { useI18n } from "@/utils/i18n"
 
-defineProps({
+const props = defineProps({
   form: { type: Object, required: true },
   nativeToolCatalog: { type: Array, default: () => [] },
   isEditing: { type: Boolean, default: false },
@@ -59,6 +59,24 @@ defineProps({
 const emit = defineEmits(["save", "cancel", "update-field"])
 
 const { t } = useI18n()
+
+const DEFAULT_TYPES = [
+  { name: "openai", label: "openai", credentials: "api_key" },
+  { name: "codex", label: "openai-responses (codex)", credentials: "api_key" },
+  { name: "anthropic", label: "anthropic", credentials: "api_key" },
+]
+const packageTypes = ref([])
+const typeOptions = computed(() => [...DEFAULT_TYPES, ...packageTypes.value])
+const needsEndpoint = computed(() => !["external", "none"].includes(typeOptions.value.find((type) => type.name === props.form.backend_type)?.credentials))
+
+onMounted(async () => {
+  try {
+    const data = await settingsAPI.getBackendTypes()
+    packageTypes.value = (data.backend_types || []).filter((type) => type.source === "package").map((type) => ({ name: type.name, label: `${type.display_name || type.name} (${type.package})`, credentials: type.credentials }))
+  } catch {
+    packageTypes.value = []
+  }
+})
 
 function updateField(key, value) {
   emit("update-field", { key, value })

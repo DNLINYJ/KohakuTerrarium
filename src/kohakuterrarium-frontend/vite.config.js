@@ -8,6 +8,8 @@ import { ElementPlusResolver } from "unplugin-vue-components/resolvers"
 import UnoCSS from "unocss/vite"
 import { fileURLToPath, URL } from "node:url"
 
+import extSharedPlugin from "./scripts/vite-ext-shared.mjs"
+
 // Backend the dev server proxies to; set KT_API_TARGET when the API runs on another port.
 const apiTarget = process.env.KT_API_TARGET || "http://127.0.0.1:8001"
 
@@ -26,6 +28,7 @@ export default defineConfig({
       dirs: ["src/components"],
       resolvers: [ElementPlusResolver()],
     }),
+    extSharedPlugin(),
   ],
   resolve: {
     alias: [
@@ -57,6 +60,8 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks(id) {
+          // The template compiler for UI extensions stays in its own lazy chunk.
+          if (id.includes("vue/dist/vue.esm-bundler")) return undefined
           if (id.includes("highlight.js")) return "highlight"
           if (id.includes("element-plus")) return "element-plus"
           if (id.includes("vue-flow")) return "vue-flow"

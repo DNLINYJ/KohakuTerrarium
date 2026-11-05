@@ -1,0 +1,617 @@
+"""Unit tests for small lifecycle / compat helper modules:
+:mod:`agent_lifecycle`, :mod:`agent_budget_recovery`, :mod:`agent_compact`.
+"""
+
+import asyncio
+import types
+from contextlib import closing
+from unittest.mock import AsyncMock
+
+
+from kohakuterrarium.core.agent.turn.budget_recovery import (
+    _message_to_conversation_json,
+    _metadata_for_messages,
+    sync_emergency_drop_conversation,
+)
+from kohakuterrarium.core.agent.history.compact import (
+    AgentCompactMixin,
+    restore_compact_state_from_session,
+)
+from kohakuterrarium.core.agent.lifecycle import AgentLifecycleMixin
+from kohakuterrarium.core.conversation.conversation import (
+    Conversation,
+    ConversationConfig,
+)
+from kohakuterrarium.core.conversation.pinned import PinnedContext
+from kohakuterrarium.session.store import SessionStore
+
+# ── agent_lifecycle.AgentLifecycleMixin ──────────────────────────
+
+
+class _Stopper:
+    def __init__(self, fail=False):
+        self.stopped = 0
+        self.cancelled = 0
+        self.fail = fail
+
+    async def stop(self):
+        self.stopped += 1
+
+    async def cancel(self):
+        self.cancelled += 1
+
+    async def cancel_all(self):
+        self.cancelled += 1
+
+    async def stop_all(self):
+        self.stopped += 1
+
+
+def _build_lifecycle_agent(*, has_mcp=False, has_compact=True, compact_llm=None):
+    """Build a duck-typed agent that satisfies the lifecycle mixin's surface."""
+
+    class _Agent(AgentLifecycleMixin):
+        pass
+
+    a = _Agent()
+    a.plugins = AsyncMock()
+    a.plugins.notify = AsyncMock()
+    a.plugins.unload_all = AsyncMock()
+    a.compact_manager = (
+        types.SimpleNamespace(
+            cancel=AsyncMock(),
+            _llm=compact_llm,
+        )
+        if has_compact
+        else None
+    )
+    a.llm = AsyncMock()
+    a.llm.close = AsyncMock()
+    a.output_router = types.SimpleNamespace(stop=AsyncMock())
+    a.subagent_manager = types.SimpleNamespace(cancel_all=AsyncMock())
+    a.trigger_manager = types.SimpleNamespace(stop_all=AsyncMock())
+    a.input = types.SimpleNamespace(stop=AsyncMock())
+    a.config = types.SimpleNamespace(name="alice")
+    a._running = True
+    a._shutdown_event = asyncio.Event()
+    a.executor = types.SimpleNamespace(_tasks={})
+    if has_mcp:
+        a._mcp_manager = types.SimpleNamespace(shutdown=AsyncMock())
+    return a
+
+
+class TestAgentLifecycle:
+    async def test_full_stop_cascade(self):
+        a = _build_lifecycle_agent()
+        await a.stop()
+        assert a._running is False
+        assert a._shutdown_event.is_set()
+        # Every dependency stopped.
+        a.plugins.notify.assert_awaited_once_with("on_agent_stop")
+        a.plugins.unload_all.assert_awaited_once()
+        a.subagent_manager.cancel_all.assert_awaited()
+        a.trigger_manager.stop_all.assert_awaited()
+        a.input.stop.assert_awaited()
+        a.compact_manager.cancel.assert_awaited()
+        a.output_router.stop.assert_awaited()
+        a.llm.close.assert_awaited()
+
+    async def test_mcp_manager_shut_down_when_present(self):
+        a = _build_lifecycle_agent(has_mcp=True)
+        await a.stop()
+        assert a._mcp_manager.shutdown.await_count == 1
+
+    async def test_compact_llm_closed_when_distinct(self):
+        compact_llm = AsyncMock()
+        compact_llm.close = AsyncMock()
+        a = _build_lifecycle_agent(compact_llm=compact_llm)
+        await a.stop()
+        assert compact_llm.close.await_count == 1
+        assert a.llm.close.await_count == 1
+
+    async def test_compact_llm_same_as_main_not_double_closed(self):
+        a = _build_lifecycle_agent()
+        # Same instance as main → not closed twice.
+        a.compact_manager._llm = a.llm
+        await a.stop()
+        # llm.close was awaited exactly once (from the final llm.close call).
+        assert a.llm.close.await_count == 1
+
+    async def test_no_plugins_safe(self):
+        a = _build_lifecycle_agent()
+        a.plugins = None
+        # Should not raise.
+        await a.stop()
+
+    async def test_no_compact_manager_safe(self):
+        a = _build_lifecycle_agent(has_compact=False)
+        await a.stop()
+        assert a._running is False
+        assert a.llm.close.await_count == 1
+
+    async def test_cancel_executor_tasks_no_executor(self):
+        a = _build_lifecycle_agent()
+        a.executor = None
+        # Direct call — must not raise.
+        await a._cancel_executor_tasks()
+
+    async def test_cancel_executor_tasks_no_tasks(self):
+        a = _build_lifecycle_agent()
+        # Empty dict — nothing to cancel.
+        await a._cancel_executor_tasks()
+
+    async def test_cancel_executor_tasks_with_running(self):
+        a = _build_lifecycle_agent()
+
+        async def sleeper():
+            await asyncio.sleep(5)
+
+        t = asyncio.create_task(sleeper())
+        a.executor._tasks["x"] = t
+        await a._cancel_executor_tasks()
+        assert t.cancelled() or t.done()
+
+
+# ── agent_lifecycle warm pause/resume ────────────────────────────
+
+
+class TestPauseResumeMixin:
+    def _agent(self):
+        class _Agent(AgentLifecycleMixin):
+            pass
+
+        a = _Agent()
+        a.config = types.SimpleNamespace(name="alice")
+        a._paused = False
+        a._running = True
+        a._suspended = []
+        a._resumed = []
+        a._gate_calls = []
+        a._woke = []
+        a.trigger_manager = types.SimpleNamespace(
+            suspend_all=lambda: a._suspended.append(True),
+            resume_all=lambda: a._resumed.append(True),
+        )
+        a._consumer_resume = types.SimpleNamespace(
+            clear=lambda: a._gate_calls.append("clear"),
+            set=lambda: a._gate_calls.append("set"),
+        )
+        a._event_inbox = types.SimpleNamespace(wake=lambda: a._woke.append(True))
+        return a
+
+    def test_pause_sets_flag_and_suspends_triggers(self):
+        a = self._agent()
+        a.pause()
+        assert a.paused is True
+        assert a._suspended == [True]
+        # Consumer gate cleared so the consumer parks.
+        assert a._gate_calls == ["clear"]
+        # Idempotent — a second pause does not re-suspend.
+        a.pause()
+        assert a._suspended == [True]
+
+    def test_resume_clears_flag_resumes_and_drains(self):
+        a = self._agent()
+        a.pause()
+        a.resume()
+        assert a.paused is False
+        assert a._resumed == [True]
+        # Resume releases the consumer gate and wakes the inbox so the
+        # consumer drains everything queued while paused.
+        assert a._gate_calls == ["clear", "set"]
+        assert a._woke == [True]
+        # Idempotent — resume when not paused is a no-op.
+        a.resume()
+        assert a._resumed == [True]
+
+
+# ── agent_budget_recovery ────────────────────────────────────────
+
+
+class TestSyncEmergencyDropConversation:
+    def test_no_controller_no_op(self):
+        agent = types.SimpleNamespace()  # no controller
+        sync_emergency_drop_conversation(agent, [])  # must not raise
+
+    def test_replaces_messages_in_place_and_keeps_the_agents_settings(self):
+        original = Conversation(
+            ConversationConfig(
+                max_messages=7, keep_system=False, sanitize_orphan_tool_calls=False
+            )
+        )
+        original.append("user", "first")
+        agent = types.SimpleNamespace(
+            controller=types.SimpleNamespace(conversation=original)
+        )
+        new_messages = [
+            {"role": "user", "content": "fresh"},
+            {"role": "assistant", "content": "ok"},
+        ]
+        sync_emergency_drop_conversation(agent, new_messages)
+        # Anything holding the conversation keeps seeing the live one.
+        assert agent.controller.conversation is original
+        msgs = original.get_messages()
+        assert [m.role for m in msgs] == ["user", "assistant"]
+        assert msgs[0].content == "fresh"
+        assert original.config == ConversationConfig(
+            max_messages=7, keep_system=False, sanitize_orphan_tool_calls=False
+        )
+        assert original._metadata.message_count == 2
+
+    def test_failure_swallowed(self):
+        # A controller whose conversation can't supply metadata triggers
+        # an exception that the helper swallows.
+        agent = types.SimpleNamespace(
+            controller=types.SimpleNamespace(conversation=None)
+        )
+        # The helper crashes trying to read conversation._metadata; should not raise.
+        sync_emergency_drop_conversation(agent, [{"role": "user", "content": "x"}])
+
+
+class TestMessageToConversationJson:
+    def test_known_fields_preserved(self):
+        m = {
+            "role": "assistant",
+            "content": "hi",
+            "name": "n",
+            "tool_call_id": None,
+            "tool_calls": [{"id": "1"}],
+        }
+        out = _message_to_conversation_json(m)
+        assert out["role"] == "assistant"
+        assert out["content"] == "hi"
+        assert out["tool_calls"] == [{"id": "1"}]
+        assert out["extra_fields"] == {}
+
+    def test_extra_fields_captured(self):
+        m = {"role": "assistant", "content": "x", "reasoning_content": "secret"}
+        out = _message_to_conversation_json(m)
+        assert out["extra_fields"] == {"reasoning_content": "secret"}
+
+
+class TestMetadataForMessages:
+    def test_total_chars(self):
+        conv = Conversation()
+        conv.append("user", "")
+        agent = types.SimpleNamespace(
+            controller=types.SimpleNamespace(conversation=conv)
+        )
+        msgs = [{"content": "abc"}, {"content": "de"}]
+        meta = _metadata_for_messages(agent, msgs)
+        assert meta["message_count"] == 2
+        assert meta["total_chars"] == 5
+
+
+# ── agent_compact ────────────────────────────────────────────────
+
+
+class TestRestoreCompactState:
+    def test_no_state_no_op(self):
+        mgr = types.SimpleNamespace()
+        store = types.SimpleNamespace(state=None)
+        restore_compact_state_from_session(mgr, store, "alice")
+        assert not hasattr(mgr, "_compact_count")
+
+    def test_loads_compact_count(self):
+        mgr = types.SimpleNamespace()
+        store = types.SimpleNamespace(state={"alice:compact_count": "5"})
+        restore_compact_state_from_session(mgr, store, "alice")
+        assert mgr._compact_count == 5
+
+    def test_loads_last_compact_time(self, tmp_path):
+        mgr = types.SimpleNamespace()
+        store = types.SimpleNamespace(
+            state={
+                "alice:compact_count": 2,
+                "alice:last_compact_time": "1234.5",
+            }
+        )
+        restore_compact_state_from_session(mgr, store, "alice")
+        assert mgr._last_compact_time == 1234.5
+        with closing(SessionStore(tmp_path / "state.kohakutr")) as store:
+            store.append_event(
+                "alice",
+                "user_message",
+                {"content": "original"},
+                turn_index=1,
+                branch_id=1,
+            )
+            conv = Conversation()
+            conv.append("user", "original", metadata={"turn_index": 1, "branch_id": 1})
+            store.save_branch_snapshot(
+                "alice",
+                conv.snapshot_messages(),
+                branch={"turn_index": 1, "branch_id": 1},
+                watermark=store.max_event_id("alice"),
+                compact_state={"compact_count": 2, "last_compact_time": 1234.5},
+            )
+            store.state["alice:compact_count"] = 9
+            store.state["alice:last_compact_time"] = 9999.0
+            conv.append("user", "new tail", metadata={"turn_index": 2, "branch_id": 1})
+            agent = types.SimpleNamespace(
+                _turn_index=2,
+                _branch_id=1,
+                _parent_branch_path=[(1, 1)],
+                controller=types.SimpleNamespace(conversation=conv),
+            )
+            mgr = types.SimpleNamespace(_agent=agent)
+            restore_compact_state_from_session(mgr, store, "alice")
+            assert (mgr._compact_count, mgr._last_compact_time) == (2, 1234.5)
+
+    def test_bad_value_silently_ignored(self):
+        mgr = types.SimpleNamespace()
+        store = types.SimpleNamespace(state={"alice:compact_count": "not-a-num"})
+        restore_compact_state_from_session(mgr, store, "alice")
+        assert not hasattr(mgr, "_compact_count")
+
+
+class TestCompactOverflowRescue:
+    def _agent(self):
+        class _Agent(AgentCompactMixin):
+            pass
+
+        a = _Agent()
+        a.config = types.SimpleNamespace(name="alice")
+        return a
+
+    async def test_starts_compact_when_none_running_and_returns_spliced(self):
+        a = self._agent()
+        spliced = [{"role": "system", "content": "summary"}]
+        calls = []
+
+        def trigger():
+            calls.append("trigger")
+            manager.is_compacting = True
+            return True
+
+        async def wait():
+            calls.append("wait")
+            manager.is_compacting = False
+
+        manager = types.SimpleNamespace(
+            is_compacting=False,
+            config=types.SimpleNamespace(enabled=True),
+            trigger_compact=trigger,
+            wait_for_current=wait,
+        )
+        a.compact_manager = manager
+        a.controller = types.SimpleNamespace(
+            conversation=types.SimpleNamespace(to_messages=lambda: spliced)
+        )
+        assert await a._compact_overflow_rescue() == spliced
+        assert calls == ["trigger", "wait"]
+
+    async def test_returns_none_when_compact_cannot_start(self):
+        a = self._agent()
+        waited = []
+
+        async def wait():  # pragma: no cover - must not be awaited
+            waited.append(True)
+
+        a.compact_manager = types.SimpleNamespace(
+            is_compacting=False,
+            config=types.SimpleNamespace(enabled=True),
+            trigger_compact=lambda: False,
+            wait_for_current=wait,
+        )
+        assert await a._compact_overflow_rescue() is None
+        assert waited == []
+
+    async def test_does_not_start_compact_when_compaction_disabled(self):
+        a = self._agent()
+        triggered = []
+        a.compact_manager = types.SimpleNamespace(
+            is_compacting=False,
+            config=types.SimpleNamespace(enabled=False),
+            trigger_compact=lambda: triggered.append(True) or True,
+            wait_for_current=None,
+        )
+        assert await a._compact_overflow_rescue() is None
+        assert triggered == []
+
+    async def test_rescue_from_inside_compact_task_returns_none(self):
+        # Compactor fell back to the ACTIVE provider: the overflow hook
+        # fires from within the compact task — waiting on ourselves
+        # deadlocks. The drop path must run instead.
+        import asyncio
+
+        a = self._agent()
+
+        async def probe():
+            a.compact_manager = types.SimpleNamespace(
+                is_compacting=True,
+                _compact_task=asyncio.current_task(),
+                wait_for_current=None,
+            )
+            return await a._compact_overflow_rescue()
+
+        assert await asyncio.wait_for(asyncio.ensure_future(probe()), 2) is None
+
+    async def test_waits_for_compact_and_returns_spliced_messages(self):
+        a = self._agent()
+        waited = []
+
+        async def wait():
+            waited.append(True)
+
+        spliced = [{"role": "system", "content": "s"}]
+        a.compact_manager = types.SimpleNamespace(
+            is_compacting=True, wait_for_current=wait
+        )
+        a.controller = types.SimpleNamespace(
+            conversation=types.SimpleNamespace(to_messages=lambda: spliced)
+        )
+        assert await a._compact_overflow_rescue() == spliced
+        assert waited == [True]
+
+    async def test_rescue_retry_carries_the_pins(self):
+        a = self._agent()
+
+        async def wait():
+            return None
+
+        pins = PinnedContext()
+        pins.pin("persona", "user", "PIN")
+        a.compact_manager = types.SimpleNamespace(
+            is_compacting=True, wait_for_current=wait
+        )
+        a.controller = types.SimpleNamespace(
+            pinned=pins,
+            conversation=types.SimpleNamespace(
+                to_messages=lambda: [
+                    {"role": "system", "content": "s"},
+                    {"role": "user", "content": "summary"},
+                ]
+            ),
+        )
+        retried = await a._compact_overflow_rescue()
+        assert [m["content"] for m in retried] == ["s", "PIN", "summary"]
+
+    def test_wire_overflow_rescue_attaches_hook(self):
+        a = self._agent()
+        a.llm = types.SimpleNamespace()
+        a.compact_manager = types.SimpleNamespace()
+        a._wire_overflow_rescue()
+        assert a.llm._overflow_rescue == a._compact_overflow_rescue
+
+    def test_wire_overflow_rescue_tolerates_slotted_provider(self):
+        # The injected-LLM contract is the LLMProvider protocol, which
+        # does not guarantee writable attributes — a __slots__ provider
+        # must not blow up Agent.start().
+        class _SlottedLLM:
+            __slots__ = ("config",)
+
+            async def chat(self, messages, **kwargs):
+                yield "x"
+
+        a = self._agent()
+        a.llm = _SlottedLLM()
+        a.compact_manager = types.SimpleNamespace()
+        a._wire_overflow_rescue()
+        assert not hasattr(a.llm, "_overflow_rescue")
+
+
+class TestBuildCompactLLM:
+    def test_falls_back_to_main_when_profile_resolution_fails(self, monkeypatch):
+        # When no profile name is resolvable, falls back to ``self.llm``.
+        from kohakuterrarium.core.agent.history import compact as ac
+
+        monkeypatch.setattr(ac, "resolve_controller_llm", lambda *a, **k: None)
+
+        class _Agent(AgentCompactMixin):
+            pass
+
+        a = _Agent()
+        a.llm = object()  # sentinel
+        a.config = types.SimpleNamespace(
+            llm_profile="",
+            model="",
+            provider="",
+            variation_selections={},
+            name="alice",
+        )
+        a._llm_selector = None
+        from kohakuterrarium.core.compact.manager import CompactConfig
+
+        out = a._build_compact_llm(CompactConfig())
+        assert out is a.llm
+
+    def test_uses_explicit_compact_model(self, monkeypatch):
+        from kohakuterrarium.core.agent.history import compact as ac
+
+        seen = []
+
+        def fake_create(name):
+            seen.append(name)
+            return "compact-llm-instance"
+
+        monkeypatch.setattr(ac, "create_llm_from_profile_name", fake_create)
+
+        class _Agent(AgentCompactMixin):
+            pass
+
+        a = _Agent()
+        a.llm = object()
+        a.config = types.SimpleNamespace(
+            llm_profile="",
+            model="",
+            provider="",
+            variation_selections={},
+            name="alice",
+        )
+        a._llm_selector = None
+        from kohakuterrarium.core.compact.manager import CompactConfig
+
+        out = a._build_compact_llm(CompactConfig(compact_model="my-profile"))
+        assert out == "compact-llm-instance"
+        assert seen == ["my-profile"]
+
+    def test_create_failure_falls_back(self, monkeypatch):
+        from kohakuterrarium.core.agent.history import compact as ac
+
+        def boom(name):
+            raise RuntimeError("create failed")
+
+        monkeypatch.setattr(ac, "create_llm_from_profile_name", boom)
+
+        class _Agent(AgentCompactMixin):
+            pass
+
+        a = _Agent()
+        a.llm = object()
+        a.config = types.SimpleNamespace(
+            llm_profile="",
+            model="",
+            provider="",
+            variation_selections={},
+            name="alice",
+        )
+        a._llm_selector = None
+        from kohakuterrarium.core.compact.manager import CompactConfig
+
+        out = a._build_compact_llm(CompactConfig(compact_model="bad-profile"))
+        assert out is a.llm
+
+    def test_resolves_via_controller_data(self, monkeypatch):
+        """When no explicit compact_model / override / profile, falls back to
+        resolve_controller_llm and uses its result (covers line 46)."""
+        from kohakuterrarium.core.agent.history import compact as ac
+
+        called = []
+
+        def fake_resolve(data, **kw):
+            called.append(data)
+            return object()  # Truthy "profile"
+
+        def fake_id(p):
+            return "resolved/profile"
+
+        def fake_create(name):
+            return "compact-llm"
+
+        monkeypatch.setattr(ac, "resolve_controller_llm", fake_resolve)
+        monkeypatch.setattr(ac, "profile_to_identifier", fake_id)
+        monkeypatch.setattr(ac, "create_llm_from_profile_name", fake_create)
+
+        class _Agent(AgentCompactMixin):
+            pass
+
+        a = _Agent()
+        a.llm = object()
+        # All identifiers empty → falls through to resolve_controller_llm.
+        a.config = types.SimpleNamespace(
+            llm_profile="",
+            model="m",
+            provider="p",
+            variation_selections={"k": "v"},
+            name="alice",
+        )
+        a._llm_selector = None
+        from kohakuterrarium.core.compact.manager import CompactConfig
+
+        out = a._build_compact_llm(CompactConfig())
+        # resolve_controller_llm was invoked.
+        assert called
+        # profile_to_identifier was invoked, returning "resolved/profile",
+        # then create_llm_from_profile_name was called with that name.
+        assert out == "compact-llm"

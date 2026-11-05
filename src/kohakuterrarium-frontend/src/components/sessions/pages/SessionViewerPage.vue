@@ -160,22 +160,17 @@ function formatDate(iso) {
 }
 
 watch(
-  sessionName,
-  (name) => {
+  () => [sessionName.value, props.live, isEmbed.value ? null : route.query.tab],
+  ([name, live, queryTab], previous) => {
     if (!name) return
-    // Publish the live/saved source on the shared scoped store BEFORE
-    // load so the Drives tab (grandchild) picks the matching route.
-    detail.live = props.live
-    detail.load(name)
-    probeDrives(name)
-  },
-  { immediate: true },
-)
-
-watch(
-  () => route.query.tab,
-  (q) => {
-    if (typeof q === "string") detail.setTab(q)
+    const tab = typeof queryTab === "string" ? queryTab : detail.activeTab
+    if (!previous || name !== previous[0] || live !== previous[1]) {
+      detail.live = live
+      detail.load(name, { tab })
+      probeDrives(name)
+    } else {
+      detail.setTab(tab)
+    }
   },
   { immediate: true },
 )

@@ -1,0 +1,27 @@
+// Optional build preset (for .vue SFCs). The default ui/index.js needs no build.
+// Build: point `ui.entry` in kohaku.yaml at ui/dist/index.js, then `npx vite build`.
+// Dev: `npx vite` and run the dashboard with KT_UI_DEV={{name}}=http://localhost:5174/ui/index.js
+import { defineConfig } from "vite"
+
+const SHARED = ["vue", "element-plus", "@kohakuterrarium/ui-sdk"]
+const KT_ORIGIN = process.env.KT_ORIGIN || "http://localhost:8001"
+
+export default defineConfig(({ command }) => ({
+  server: { port: 5174, cors: true },
+  // In dev the dashboard's own copies are used through absolute URLs.
+  resolve:
+    command === "serve"
+      ? {
+          alias: {
+            vue: `${KT_ORIGIN}/ext-shared/vue.js`,
+            "element-plus": `${KT_ORIGIN}/ext-shared/element-plus.js`,
+            "@kohakuterrarium/ui-sdk": `${KT_ORIGIN}/ext-shared/sdk.js`,
+          },
+        }
+      : {},
+  build: {
+    outDir: "ui/dist",
+    lib: { entry: "ui/index.js", formats: ["es"], fileName: () => "index.js" },
+    rollupOptions: { external: SHARED },
+  },
+}))

@@ -35,6 +35,19 @@ class Skill:
     paths: list[str] = field(default_factory=list)
     allowed_tools: list[str] = field(default_factory=list)
 
+    def render_body(self) -> str:
+        """Return instructions with the known directory for bundled resources."""
+        body = self.body or ""
+        if self.base_dir is None:
+            return body
+        return (
+            f"Skill directory: {self.base_dir}\n"
+            "Resolve relative paths to bundled references, scripts, and assets "
+            "against this directory; use absolute paths in tool calls. "
+            "Keep explicit project-relative paths relative to the project.\n\n"
+            f"{body}"
+        )
+
     @property
     def invocation_blocked(self) -> bool:
         """Return whether automatic model discovery should hide this skill.

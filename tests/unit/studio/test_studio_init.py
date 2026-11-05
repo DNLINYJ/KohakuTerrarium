@@ -9,7 +9,7 @@ from kohakuterrarium import studio as studio_pkg
 
 class TestStudioInitHooks:
     def test_import_registers_group_hooks(self):
-        from kohakuterrarium.terrarium import group_hooks
+        from kohakuterrarium.terrarium.tools import hooks as group_hooks
 
         assert group_hooks._store_attach is not None
         assert group_hooks._spawnable is not None
@@ -32,7 +32,7 @@ class TestStudioInitHooks:
         # The hook bridges engine creature-add into the session layer:
         # after it runs, the creature's graph must have a live store.
         from kohakuterrarium.studio.sessions import lifecycle, store_attach
-        from kohakuterrarium.terrarium.service import LocalTerrariumService
+        from kohakuterrarium.terrarium.service.service import LocalTerrariumService
         from kohakuterrarium.testing.terrarium import TestTerrariumBuilder
 
         monkeypatch.setattr(store_attach, "session_dir", lambda: str(tmp_path))

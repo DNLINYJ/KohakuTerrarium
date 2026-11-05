@@ -22,6 +22,18 @@ describe("MarkdownRenderer streaming", () => {
     expect(renderedHtml(wrapper)).toContain("<strong>world</strong>")
   })
 
+  it("renders emphasis that closes on CJK punctuation before CJK text", () => {
+    const wrapper = mount(MarkdownRenderer, {
+      props: { content: "**#31 說幾句的目的地沒寫明：**在回宿舍的路上" },
+    })
+    const html = renderedHtml(wrapper)
+    expect(html).toContain("<strong>#31 說幾句的目的地沒寫明：</strong>在回宿舍的路上")
+    expect(html).not.toContain("**")
+
+    const spaced = mount(MarkdownRenderer, { props: { content: "a ** b ** c" } })
+    expect(renderedHtml(spaced)).not.toContain("<strong>")
+  })
+
   it("escapes raw HTML and preserves optional line breaks", () => {
     const escaped = mount(MarkdownRenderer, { props: { content: "<script>x</script>" } })
     expect(renderedHtml(escaped)).toContain("&lt;script&gt;x&lt;/script&gt;")

@@ -26,6 +26,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from kohakuterrarium.utils.interpreter import is_briefcase_runtime
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -40,7 +41,10 @@ KT_SHIM_MARKER = "kohakuterrarium-shim"
 
 MODE_CONSOLE = "console-symlink"
 MODE_BUNDLE = "bundle-wrapper"
+MODE_RUNTIME = "bundled-python"
 MODE_DEFER_PIPX = "defer-pipx"
+
+_FROM_ENVIRONMENT = object()
 
 
 @dataclass
@@ -69,13 +73,7 @@ class ShimPlan:
 
 def in_bundle() -> bool:
     """True when running inside the Briefcase desktop bundle."""
-    if os.environ.get("KT_LAUNCHER_EXEC") == "1":
-        return True
-    try:
-        exe_dir = Path(sys.executable).resolve().parent
-    except OSError:
-        return False
-    return any(exe_dir.glob("python3*._pth"))
+    return is_briefcase_runtime()
 
 
 def _default_target_dir(system: str) -> Path:
@@ -111,6 +109,45 @@ def _wrapper_content(system: str, executable: str, subcmd: str | None) -> str:
     return f'#!/bin/sh\n# {KT_SHIM_MARKER}\nexec "{executable}"{sub} "$@"\n'
 
 
+def bundled_runtime() -> tuple[str, str] | None:
+    """The interpreter and launcher directory a native shell ships, if any."""
+    python = os.environ.get("KT_PYTHON")
+    bootstrap = os.environ.get("KT_BOOTSTRAP_DIR")
+    return (python, bootstrap) if python and bootstrap else None
+
+
+def _drop_verbatim_prefix(path: str) -> str:
+    """``\\\\?\\C:\\x`` as ``C:\\x``: cmd.exe cannot run or search a verbatim path."""
+    if path.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + path[8:]
+    if path.startswith("\\\\?\\"):
+        return path[4:]
+    return path
+
+
+def _runtime_wrapper_content(
+    system: str, runtime: tuple[str, str], subcmd: str | None
+) -> str:
+    """Build a wrapper that runs the launcher on the shipped interpreter."""
+    python, bootstrap = runtime
+    sub = f" {subcmd}" if subcmd else ""
+    if system == "Windows":
+        python, bootstrap = _drop_verbatim_prefix(python), _drop_verbatim_prefix(
+            bootstrap
+        )
+        return (
+            f"@echo off\nrem {KT_SHIM_MARKER}\nsetlocal\n"
+            f'set "PYTHONPATH={bootstrap}"\nset "PYTHONNOUSERSITE=1"\n'
+            f'"{python}" -m kohakuterrarium.launcher{sub} %*\n'
+            "exit /b %ERRORLEVEL%\n"
+        )
+    return (
+        f"#!/bin/sh\n# {KT_SHIM_MARKER}\n"
+        f'PYTHONPATH="{bootstrap}" PYTHONNOUSERSITE=1 '
+        f'exec "{python}" -m kohakuterrarium.launcher{sub} "$@"\n'
+    )
+
+
 def _dest_for(target_dir: Path, name: str, system: str) -> Path:
     """Return the platform-specific destination for a shim name."""
     return target_dir / (f"{name}.cmd" if system == "Windows" else name)
@@ -124,14 +161,16 @@ def build_plan(
     target_dir: Path | None = None,
     executable: str | None = None,
     path_env: str | None = None,
+    runtime: tuple[str, str] | None | object = _FROM_ENVIRONMENT,
 ) -> ShimPlan:
     """Decide what shims to create. Pure: no filesystem writes.
 
-    All inputs are injectable so the matrix (console|bundle)×(posix|windows)
-    is unit-testable.  ``scripts_dir`` existence is *probed* (read-only) only
-    to mark missing console scripts as skipped.
+    All inputs are injectable so the matrix (console|bundle|runtime)×
+    (posix|windows) is unit-testable.  ``scripts_dir`` existence is *probed*
+    (read-only) only to mark missing console scripts as skipped.
     """
     system = system or platform.system()
+    runtime = bundled_runtime() if runtime is _FROM_ENVIRONMENT else runtime
     executable = executable or sys.executable
     bundle = in_bundle() if bundle is None else bundle
     scripts_dir = scripts_dir or Path(executable).resolve().parent
@@ -139,6 +178,19 @@ def build_plan(
     path_env = os.environ.get("PATH", "") if path_env is None else path_env
 
     on_path = _path_contains(target_dir, path_env)
+
+    if runtime:
+        items = [
+            ShimItem(
+                name=name,
+                action="wrapper",
+                dest=_dest_for(target_dir, name, system),
+                content=_runtime_wrapper_content(system, runtime, sub),
+            )
+            for name, sub in SHIM_SUBCOMMANDS.items()
+        ]
+        note = "Desktop app: wrappers run the app's bundled interpreter."
+        return ShimPlan(MODE_RUNTIME, target_dir, system, items, on_path, note)
 
     if bundle:
         items = [
@@ -201,7 +253,7 @@ def apply_plan(plan: ShimPlan) -> list[str]:
         # Replacement is intentional only for shims we own, so reinstalling
         # repairs stale targets without deleting an unrelated user command.
         if item.dest.is_symlink() or item.dest.exists():
-            if not _is_ours(item.dest):
+            if not is_ours(item.dest):
                 messages.append(
                     f"skip {item.name}: {item.dest} is not a kohakuterrarium shim"
                 )
@@ -223,7 +275,12 @@ def apply_plan(plan: ShimPlan) -> list[str]:
     return messages
 
 
-def _is_ours(dest: Path) -> bool:
+def shim_path(plan: ShimPlan, name: str) -> Path:
+    """Where ``plan`` puts the shim called ``name``."""
+    return _dest_for(plan.target_dir, name, plan.system)
+
+
+def is_ours(dest: Path) -> bool:
     """True if ``dest`` is a shim we created (symlink to a kt script, or a
     wrapper carrying our marker)."""
     if dest.is_symlink():
@@ -263,9 +320,36 @@ def shims_status() -> int:
         print(f"note:       {plan.note}")
     for name in SHIM_SUBCOMMANDS:
         dest = _dest_for(plan.target_dir, name, plan.system)
-        state = "installed" if (dest.exists() and _is_ours(dest)) else "missing"
+        state = "installed" if (dest.exists() and is_ours(dest)) else "missing"
         print(f"  {name:<7} {state}  ({dest})")
     return 0
+
+
+def refresh_installed_shims() -> list[str]:
+    """Rewrite installed wrapper shims whose contents differ from what this install
+    would write, so a reinstall or a move does not leave them pointing at nothing.
+
+    Only shims we own are touched, and none are created.
+    """
+    plan = build_plan()
+    if plan.mode == MODE_DEFER_PIPX:
+        return []
+    stale = []
+    for item in plan.items:
+        if item.action != "wrapper" or item.content is None:
+            continue
+        if not (item.dest.is_file() and is_ours(item.dest)):
+            continue
+        try:
+            current = item.dest.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if current != item.content:
+            stale.append(item)
+    if not stale:
+        return []
+    plan.items = stale
+    return apply_plan(plan)
 
 
 def shims_uninstall() -> int:
@@ -275,7 +359,7 @@ def shims_uninstall() -> int:
     for name in SHIM_SUBCOMMANDS:
         dest = _dest_for(plan.target_dir, name, plan.system)
         if dest.exists() or dest.is_symlink():
-            if _is_ours(dest):
+            if is_ours(dest):
                 try:
                     dest.unlink()
                     print(f"removed {dest}")
@@ -298,7 +382,7 @@ def shims_summary() -> str:
     installed = [
         name
         for name in SHIM_SUBCOMMANDS
-        if (lambda d: d.exists() and _is_ours(d))(
+        if (lambda d: d.exists() and is_ours(d))(
             _dest_for(plan.target_dir, name, plan.system)
         )
     ]

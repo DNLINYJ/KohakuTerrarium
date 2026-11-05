@@ -61,10 +61,15 @@ input:
   type: none
 output:
   type: stdout
+tools:
+  - name: web_search
+    type: builtin
+  - name: web_fetch
+    type: builtin
 plugins:
   - name: budget
     options:
-      turn_budget: {soft: 20, hard: 40}
+      turn_budget: [20, 40]
 """
 
 
@@ -489,6 +494,60 @@ class TestApiSettingsJourney:
         # 1.0 = the 100% default aligned with the frontend (7222561c).
         assert values["kt-desktop-zoom"] == 1.0
 
+        defaults_url = "/api/settings/module-defaults"
+        catalog = client.get(defaults_url)
+        assert catalog.status_code == 200
+        assert any(m["name"] == "web_search" for m in catalog.json()["modules"])
+        assert (
+            client.put(
+                f"{defaults_url}/tool/web_search",
+                json={"values": {"fallback": "duckduckgo"}},
+            ).status_code
+            == 200
+        )
+        assert (
+            client.put(
+                f"{defaults_url}/tool/web_search",
+                json={"values": {"need_content": True}},
+            ).status_code
+            == 200
+        )
+        assert (
+            client.put(
+                f"{defaults_url}/plugin/budget",
+                json={"values": {"walltime_budget": {"hard": 300}}, "enabled": False},
+            ).status_code
+            == 200
+        )
+        assert (
+            client.put(
+                f"{defaults_url}/tool/web_search",
+                json={"values": {"backend": "invalid"}},
+            ).status_code
+            == 400
+        )
+        assert (
+            client.put(
+                f"{defaults_url}/plugin/missing", json={"enabled": True}
+            ).status_code
+            == 404
+        )
+        assert (
+            client.put(
+                f"{defaults_url}/tool/web_fetch", json={"enabled": True}
+            ).status_code
+            == 400
+        )
+
+        before_invalid = client.get(defaults_url).json()
+        invalid_budget = client.put(
+            f"{defaults_url}/plugin/budget",
+            json={"values": {"turn_budget": {"hard": "abc"}}},
+        )
+        assert invalid_budget.status_code == 400
+        assert "numeric" in invalid_budget.json()["detail"]
+        assert client.get(defaults_url).json() == before_invalid
+
         # ── 7. Per-creature settings on a live creature ───────────────
         # Start a 1-creature session (frontend: agentAPI.create).
         resp = client.post(
@@ -508,6 +567,83 @@ class TestApiSettingsJourney:
         modules = {(m["type"], m["name"]): m for m in resp.json()["modules"]}
         assert ("plugin", "budget") in modules
         assert modules[("plugin", "budget")]["enabled"] is True
+        assert modules[("plugin", "budget")]["options"]["turn_budget"] == [20, 40]
+        assert modules[("plugin", "budget")]["options"]["walltime_budget"] == {
+            "hard": 300
+        }
+        assert modules[("tool", "web_search")]["options"]["fallback"] == "duckduckgo"
+        assert modules[("tool", "web_search")]["options"]["need_content"] is True
+        assert (
+            client.put(
+                f"{defaults_url}/tool/web_search",
+                json={"values": {"fallback": "none", "need_content": False}},
+            ).status_code
+            == 200
+        )
+        current_url = f"/api/sessions/{session_id}/creatures/{creature_id}/modules/tool/web_search/options"
+        assert client.get(current_url).json()["options"]["fallback"] == "duckduckgo"
+        assert client.get(current_url).json()["options"]["need_content"] is True
+        newer = client.post(
+            "/api/sessions/active/creature",
+            json={"config_path": str(creature_dir), "name": "new-defaults"},
+        )
+        assert newer.status_code == 200, newer.text
+        newer = newer.json()
+        newer_url = f"/api/sessions/{newer['session_id']}/creatures/new-defaults/modules/tool/web_search/options"
+        assert client.get(newer_url).json()["options"]["fallback"] == "none"
+        assert client.get(newer_url).json()["options"]["need_content"] is False
+        assert (
+            client.delete(f"/api/sessions/active/{newer['session_id']}").status_code
+            == 200
+        )
+
+        for name, backend, baseline in (
+            ("web_search", "deepseek_api", "duckduckgo"),
+            ("web_fetch", "deepseek", "auto"),
+        ):
+            url = (
+                f"/api/sessions/{session_id}/creatures/{creature_id}"
+                f"/modules/tool/{name}/options"
+            )
+            assert modules[("tool", name)]["options"]["backend"] == baseline
+            resp = client.put(url, json={"values": {"backend": backend}})
+            assert resp.status_code == 400
+            assert "key" in resp.json()["detail"].lower()
+            assert client.get(url).json()["options"]["backend"] == baseline
+
+        resp = client.post(
+            "/api/settings/keys",
+            json={"provider": "deepseek", "key": "test-only-deepseek-key"},
+        )
+        assert resp.status_code == 200
+        for name, backend, baseline in (
+            ("web_search", "deepseek_api", "duckduckgo"),
+            ("web_fetch", "deepseek", "auto"),
+        ):
+            url = (
+                f"/api/sessions/{session_id}/creatures/{creature_id}"
+                f"/modules/tool/{name}/options"
+            )
+            resp = client.put(url, json={"values": {"backend": backend}})
+            assert resp.status_code == 200
+            assert client.get(url).json()["options"]["backend"] == backend
+            if name == "web_search":
+                resp = client.put(
+                    url, json={"values": {"deepseek_model": "deepseek-v4-flash"}}
+                )
+                assert resp.status_code == 200
+                current = client.get(url).json()
+                assert current["options"]["deepseek_model"] == "deepseek-flash"
+                assert current["schema"]["deepseek_model"]["values"] == [
+                    "deepseek-v4-pro",
+                    "deepseek-flash",
+                ]
+            resp = client.put(url, json={"values": {"backend": "invalid-backend"}})
+            assert resp.status_code == 400
+            assert client.get(url).json()["options"]["backend"] == backend
+            resp = client.put(url, json={"values": {}})
+            assert resp.status_code == 200
+            assert client.get(url).json()["options"]["backend"] == baseline
 
         # 7b. Read the plugin's option schema + current values.
         resp = client.get(
@@ -517,7 +653,7 @@ class TestApiSettingsJourney:
         assert resp.status_code == 200
         opts = resp.json()
         assert "turn_budget" in opts["schema"]
-        assert opts["options"]["turn_budget"] == {"soft": 20, "hard": 40}
+        assert opts["options"]["turn_budget"] == [20, 40]
 
         # 7c. Apply new plugin options through the module API.
         resp = client.put(
@@ -633,7 +769,7 @@ class TestApiSettingsJourney:
         assert resp.status_code == 404
         # native_tool does not support toggle — that is a hard 400.
         resp = client.post(f"{cbase}/modules/native_tool/anything/toggle")
-        assert resp.status_code in (400, 404)
+        assert resp.status_code == 400
         # Re-enable the budget plugin and reset its options to defaults
         # by applying an empty values payload — the live creature reads
         # back the plugin's declared defaults again.
@@ -702,7 +838,7 @@ class TestApiSettingsJourney:
         # SCHEMA validation (raw save = validated-persist only, design §8.4):
         # an invalid runtime block is a 400, never a silent enable.
         from kohakuterrarium.api.deps import get_service_legacy
-        from kohakuterrarium.studio.identity import drive_settings as ds
+        from kohakuterrarium.studio.identity.drive_settings import settings as ds
 
         current_drive_file = client.get(
             "/api/settings/config-files/drive-settings/content"

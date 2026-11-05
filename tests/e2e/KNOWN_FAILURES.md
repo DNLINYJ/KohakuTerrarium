@@ -34,10 +34,10 @@ file, and the active-store guard rejects the stale registration.
 Relevant code:
 
 - `src/kohakuterrarium/studio/sessions/stop.py`: remote teardown and host cleanup.
-- `src/kohakuterrarium/laboratory/adapters/terrarium_runtime.py`: remove-creature dispatch.
-- `src/kohakuterrarium/terrarium/engine.py`: last-creature removal.
-- `src/kohakuterrarium/laboratory/adapters/terrarium_files.py`: active-store protection.
-- `src/kohakuterrarium/api/routes/persistence/remote_resume_transfer.py`: repeated transfer destination.
+- `src/kohakuterrarium/laboratory/adapters/terrarium/runtime.py`: remove-creature dispatch.
+- `src/kohakuterrarium/terrarium/engine/engine.py`: last-creature removal.
+- `src/kohakuterrarium/laboratory/adapters/terrarium/files.py`: active-store protection.
+- `src/kohakuterrarium/api/routes/persistence/resume/remote_transfer.py`: repeated transfer destination.
 
 The separate fix must release worker store registrations and resources with
 correct ownership and checkpoint semantics. Retain the protection against

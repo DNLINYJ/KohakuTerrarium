@@ -1,14 +1,68 @@
 import asyncio
 
 import pytest
-from textual.widgets import Label
+from textual.widgets import Label, TabbedContent
 from textual.widgets._markdown import MarkdownFence
 
+from kohakuterrarium.builtins.tui import attention
 from kohakuterrarium.builtins.tui.output import TUIOutput
+from kohakuterrarium.builtins.tui.app import _safe_id
 from kohakuterrarium.builtins.tui.session import TUISession
-from kohakuterrarium.builtins.tui.widgets import UserMessage
+from kohakuterrarium.builtins.tui.widgets import ChatInput, UserMessage
 from kohakuterrarium.builtins.tui.widgets.blocks import ToolBlock
 from kohakuterrarium.modules.output.event import OutputEvent
+from kohakuterrarium.modules.output.router.router import OutputRouter
+
+
+async def test_processing_tracks_active_tab_during_overlapping_turns():
+    session = TUISession()
+    session.set_terrarium_tabs(["alice", "bob"])
+    await session.start()
+    alice, bob = TUIOutput(), TUIOutput()
+    alice._tui = bob._tui = session
+    alice._default_target, bob._default_target = "alice", "bob"
+    app = session._app
+    async with app.run_test() as pilot:
+        await alice.on_processing_start()
+        await pilot.pause()
+        timer = app._thinking_timer
+        app.on_chat_input_submitted(ChatInput.Submitted("queued for alice"))
+        await pilot.pause()
+        await bob.on_processing_start()
+        await pilot.pause()
+        assert app._thinking_timer is timer
+        assert len(app._queued_widgets) == 1
+        await bob.on_processing_end()
+        await pilot.pause()
+        assert app._is_processing
+        assert app._thinking_active
+        tabs = app.query_one("#chat-tabs", TabbedContent)
+        tabs.active = f"tab-{_safe_id('bob')}"
+        await pilot.pause()
+        assert not app._is_processing
+        assert not app._thinking_active
+        tabs.active = f"tab-{_safe_id('alice')}"
+        await pilot.pause()
+        assert app._is_processing
+        assert app._thinking_active
+        await alice._on_stop()
+        await pilot.pause()
+        assert not app._is_processing
+        assert not app._thinking_active
+
+
+async def test_single_creature_processing_lifecycle():
+    session = TUISession()
+    await session.start()
+    output = TUIOutput()
+    output._tui = session
+    async with session._app.run_test() as pilot:
+        await output.on_processing_start()
+        await pilot.pause()
+        assert session._app._is_processing
+        await output.on_processing_end()
+        await pilot.pause()
+        assert not session._app._is_processing
 
 
 class FakeTUI:
@@ -26,6 +80,27 @@ class FakeTUI:
                 "target": target,
             }
         )
+
+
+@pytest.mark.parametrize("kind", ["btw_started", "btw_result"])
+def test_btw_activity_keeps_parent_stream_state(kind):
+    tui = FakeTUI()
+    output = TUIOutput()
+    output._tui = tui
+    output._default_target = "alice"
+    output._turn_started = True
+    output.on_activity_with_metadata(
+        kind, "side answer", {"job_id": "side-1", "error": "failure"}
+    )
+    assert output._turn_started
+    assert tui.notices == [
+        {
+            "text": "side answer",
+            "command": "btw · side conversation side-1",
+            "error": True,
+            "target": "alice",
+        }
+    ]
 
 
 def test_command_result_activity_renders_notice():
@@ -252,3 +327,52 @@ async def test_resume_survives_slow_mount_without_raising(
         await output.on_resume([{"type": "user_input", "content": "turn"}])
         monkeypatch.setattr(session._app, "call_later", original_call_later)
         await pilot.pause()
+
+
+async def test_router_delivers_legacy_kinds_to_the_tui_through_on_widget():
+    tui = FakeTUI()
+    output = TUIOutput()
+    output._tui = tui
+    output._default_target = "alice"
+    router = OutputRouter(output)
+
+    await router.emit(
+        OutputEvent(type="notification", payload={"text": "built", "level": "ok"})
+    )
+    await router.emit(
+        OutputEvent(type="widget", id="w1", payload={"renderer": "kt.ui"})
+    )
+
+    assert tui.notices == [
+        {"text": "built", "command": "ok", "error": False, "target": "alice"}
+    ]
+
+
+class CardTUI(FakeTUI):
+    def __init__(self):
+        super().__init__()
+        self.cards = []
+
+    def add_card_block(self, payload, *, event_id, on_action, target):
+        self.cards.append((payload, event_id, on_action))
+
+
+async def test_tui_reports_kt_ui_and_draws_it_as_card_blocks(monkeypatch):
+    monkeypatch.setattr(attention, "add_pending", lambda *a: None)
+    monkeypatch.setattr(attention, "clear", lambda *a: None)
+    tui = CardTUI()
+    output = TUIOutput()
+    output._tui = tui
+    router = OutputRouter(output)
+    assert router.ui_renderers() == {"kt.ui": 1}
+    spec = {
+        "title": "Count",
+        "state": {"n": 1},
+        "root": {"type": "button", "label": "Add", "set": {"n": "n + 1"}},
+    }
+    handle = await router.widgets.open("kt.ui", spec, state={"n": 1}, title="Count")
+    payload, event_id, on_action = tui.cards[-1]
+    assert payload["actions"] == [{"id": "c0", "label": "Add"}]
+    on_action(event_id, "c0")
+    assert handle.state == {"n": 2}
+    assert len(tui.cards) == 2

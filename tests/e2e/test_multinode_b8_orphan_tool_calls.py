@@ -12,7 +12,7 @@ User clarification:
 
 Mechanism (see ``temp/bugs/B8.md`` Stage 3):
     * The worker writes ``tool_call`` and ``tool_result`` events
-      (`session/output.py:_handle_tool_start`/`_handle_tool_done`),
+      (`session/output/output.py:_handle_tool_start`/`_handle_tool_done`),
       both keyed by ``call_id == metadata["job_id"]``. Within the
       events table these pair correctly.
     * The runtime does NOT emit a corresponding ``assistant_tool_calls``
@@ -21,7 +21,7 @@ Mechanism (see ``temp/bugs/B8.md`` Stage 3):
       because ``SessionEventTee`` only subscribes to ``append_event``).
     * The host mirror therefore has a ``tool_result`` with a
       ``call_id`` that no preceding ``assistant_tool_calls`` event
-      announced. When ``session/history.py:replay_conversation``
+      announced. When ``session/history/replay.py:replay_conversation``
       rebuilds the message list from that mirror, every ``role=tool``
       message lacks an announcing assistant; then
       ``Conversation.sanitize_orphan_tool_pairs`` drops it as orphan
@@ -38,7 +38,7 @@ The test pins both halves:
 
 The framework logger sets ``propagate=False`` on the
 ``kohakuterrarium`` root; we attach a plain ``logging.Handler``
-directly to ``kohakuterrarium.core.conversation`` for capture.
+directly to ``kohakuterrarium.core.conversation.conversation`` for capture.
 """
 
 import asyncio
@@ -48,8 +48,8 @@ from pathlib import Path
 
 import pytest
 
-from kohakuterrarium.core.conversation import Conversation
-from kohakuterrarium.session.history import (
+from kohakuterrarium.core.conversation.conversation import Conversation
+from kohakuterrarium.session.history.replay import (
     normalize_resumable_events,
     replay_conversation,
 )
@@ -176,7 +176,9 @@ class TestMultinodeB8OrphanToolCalls:
 
         # Attach our log handler BEFORE any creature is built so we
         # capture the WARNINGs that the orphan-sanitiser logs.
-        conv_logger = logging.getLogger("kohakuterrarium.core.conversation")
+        conv_logger = logging.getLogger(
+            "kohakuterrarium.core.conversation.conversation"
+        )
         handler = _CapturingHandler()
         prior_level = conv_logger.level
         conv_logger.addHandler(handler)
@@ -334,7 +336,7 @@ class TestMultinodeB8OrphanToolCalls:
                     # right logger before asserting on absence.
                     assert handler.records or sanitised == messages, (
                         "no log records captured from "
-                        "kohakuterrarium.core.conversation — the test's "
+                        "kohakuterrarium.core.conversation.conversation — the test's "
                         "handler attachment is wrong, not the framework."
                     )
                     surviving_tool_msgs = [

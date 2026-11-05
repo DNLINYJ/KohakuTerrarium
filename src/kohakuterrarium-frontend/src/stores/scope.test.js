@@ -16,7 +16,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { createPinia, setActivePinia } from "pinia"
+import { createPinia, getActivePinia, setActivePinia } from "pinia"
 
 import {
   _resetForTests,
@@ -27,6 +27,14 @@ import {
 import { useChatStore } from "@/stores/chat"
 import { useMessagesStore } from "@/stores/messages"
 import { useStatusStore } from "@/stores/status"
+import { useEditorStore } from "@/stores/editor"
+import { useEventStreamStore } from "@/stores/eventStream"
+import { useLayoutStore } from "@/stores/layout"
+import { useCanvasStore } from "@/stores/canvas"
+import { useDrivesStore } from "@/stores/drives"
+import { useTurnRollupStore } from "@/stores/turnRollup"
+import { useTraceTimelineStore } from "@/stores/traceTimeline"
+import { useSessionDetailStore } from "@/stores/sessionDetail"
 
 beforeEach(() => {
   const map = new Map()
@@ -153,6 +161,64 @@ describe("per-scope messages store", () => {
 })
 
 describe("scope ref-counting + disposers", () => {
+  it("keeps repeated registration of the same disposer idempotent", () => {
+    const fn = vi.fn()
+    registerScopeDisposer("same-disposer", fn)
+    registerScopeDisposer("same-disposer", fn)
+    releaseScope("same-disposer")
+    expect(fn).toHaveBeenCalledTimes(1)
+  })
+  it("deletes all scoped state only on final release and reopens cleanly", () => {
+    const pinia = getActivePinia()
+    const scope = "release-state"
+    acquireScope(scope)
+    acquireScope(scope)
+    const factories = [
+      useChatStore,
+      useEditorStore,
+      useMessagesStore,
+      useStatusStore,
+      useEventStreamStore,
+      useLayoutStore,
+      useCanvasStore,
+      useDrivesStore,
+      useTurnRollupStore,
+      useTraceTimelineStore,
+      useSessionDetailStore,
+    ]
+    const stores = factories.map((factory) => factory(scope))
+    stores[0].messagesByTab.worker = [{ content: "x".repeat(100000) }]
+    stores[1].openFiles["/file.txt"] = { content: "old", dirty: false }
+    const sibling = useChatStore("release-sibling")
+    sibling.messagesByTab.worker = [{ content: "keep" }]
+    const singleton = useChatStore()
+    singleton.messagesByTab.worker = [{ content: "default" }]
+    releaseScope(scope)
+    expect(useChatStore(scope)).toBe(stores[0])
+    expect(stores[0].messagesByTab.worker[0].content).toHaveLength(100000)
+    releaseScope(scope)
+    for (const store of stores) expect(Object.hasOwn(pinia.state.value, store.$id)).toBe(false)
+    expect(sibling.messagesByTab.worker[0].content).toBe("keep")
+    expect(singleton.messagesByTab.worker[0].content).toBe("default")
+    acquireScope(scope)
+    expect(useChatStore(scope).messagesByTab).toEqual({})
+    expect(useEditorStore(scope).openFiles).toEqual({})
+    releaseScope(scope)
+    releaseScope("release-sibling")
+  })
+
+  it("cleans the owning Pinia when another instance becomes active", () => {
+    const owner = getActivePinia()
+    acquireScope("owner-pinia")
+    const store = useChatStore("owner-pinia")
+    store.messagesByTab.worker = [{ content: "old" }]
+    const other = createPinia()
+    setActivePinia(other)
+    releaseScope("owner-pinia")
+    expect(Object.hasOwn(owner.state.value, store.$id)).toBe(false)
+    expect(other.state.value).toEqual({})
+  })
+
   it("acquire/release fires disposer when count hits zero", () => {
     const fn = vi.fn()
     registerScopeDisposer("scope-1", fn)
@@ -185,9 +251,6 @@ describe("scope ref-counting + disposers", () => {
     acquireScope("disposable-1")
     releaseScope("disposable-1")
     // _cleanup nulls the WS handle and flips status back to "closed".
-    // (Pinia's $dispose semantics around state retention are
-    // implementation-defined, so we verify the side-effect we care
-    // about: the WebSocket is actually torn down.)
     expect(a._ws).toBeNull()
     expect(a.wsStatus).toBe("closed")
   })

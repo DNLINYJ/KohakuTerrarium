@@ -7,17 +7,17 @@ import yaml
 
 from kohakuterrarium.bootstrap.llm import coerce_llm_provider
 from kohakuterrarium.bootstrap.tools import create_tool
-from kohakuterrarium.core.config_types import AgentConfig, ToolConfigItem
-from kohakuterrarium.core.execution_context import ExecutionBinding
-from kohakuterrarium.core.executor import Executor
+from kohakuterrarium.core.config.types import AgentConfig, ToolConfigItem
+from kohakuterrarium.core.tools.execution_context import ExecutionBinding
+from kohakuterrarium.core.jobs.executor import Executor
 from kohakuterrarium.core.loader import ModuleLoader
 from kohakuterrarium.core.registry import Registry
-from kohakuterrarium.modules.plugin.manager import PluginManager
+from kohakuterrarium.modules.plugin.manager.manager import PluginManager
 from kohakuterrarium.modules.subagent.config import SubAgentConfig
 from kohakuterrarium.modules.subagent.manager import SubAgentManager
 from kohakuterrarium.modules.tool.base import ToolContext
 from kohakuterrarium.packages.resolve import resolve_any_path
-from kohakuterrarium.utils.file_guard import FileReadState
+from kohakuterrarium.utils.file.guard import FileReadState
 
 
 class SubagentHost:

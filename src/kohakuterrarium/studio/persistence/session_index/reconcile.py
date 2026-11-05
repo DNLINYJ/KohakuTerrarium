@@ -17,8 +17,9 @@ from pathlib import Path
 from typing import Any
 
 from kohakuterrarium.session.errors import SessionNotReadyError
-from kohakuterrarium.session.readonly_view import SessionReadView
-from kohakuterrarium.session.store import SessionStore, iter_kv_keys
+from kohakuterrarium.session.readonly.view import SessionReadView
+from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.session.vault.io import read_prefix
 from kohakuterrarium.studio.persistence.session_index.entry import (
     SessionIndexEntry,
     _max_mtime_with_wal,
@@ -128,12 +129,8 @@ def _first_user_input_preview(store: SessionStore, meta: dict | None = None) -> 
         if not agent:
             return ""
         store.events.flush_cache()
-        for key in sorted(iter_kv_keys(store.events, prefix=f"{agent}:e")):
-            try:
-                evt = store.events[key]
-            except Exception as exc:
-                logger.warning("Failed to read preview event", error=str(exc))
-                continue
+        rows = read_prefix(store.events, f"{agent}:e", what="preview event")
+        for _, evt in rows:
             if isinstance(evt, dict) and evt.get("type") == "user_input":
                 preview = _extract_text_preview(evt.get("content"))
                 if preview:

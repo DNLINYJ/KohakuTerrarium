@@ -25,7 +25,7 @@ tags:
 
 CLI 入口位于 `cli/run.py:run_agent_cli()`。它会先检查配置路径，再选择 I/O 模式（`cli` / TUI），然后一切都走 Terrarium 引擎：`Terrarium(pwd=…)` 加 `engine.add_creature(…)`（配方则用 `engine.apply_recipe(…)`），再把引擎交给 `run_engine_with_rich_cli()` / `run_engine_with_tui()`。编程式嵌入方直接用 `await Agent.build(…)` 构造 agent。
 
-`Agent.__init__`（`src/kohakuterrarium/core/agent.py`）会按固定顺序初始化：`_init_llm`、`_init_registry`、`_init_executor`、`_init_subagents`、`_init_output`、`_init_controller`、`_init_input`、`_init_user_commands`、`_init_triggers`。mixin 布局为 `AgentInitMixin`（`bootstrap/agent_init.py`）+ `AgentHandlersMixin`（`core/agent_handlers.py`）+ `AgentToolsMixin`（`core/agent_tools.py`），外加 2.0 之后的 mixin：`AgentConstructMixin`（`Agent.build` / `Agent.from_path`）、`AgentTurnMixin`（带类型的 `run` / `run_stream`）、`AgentExtensionsMixin`、`AgentMessagesMixin`、`AgentModelMixin`、`AgentCompactMixin`、`AgentLifecycleMixin`。
+`Agent.__init__`（`src/kohakuterrarium/core/agent/assembly.py`）会按固定顺序初始化：`_init_llm`、`_init_registry`、`_init_executor`、`_init_subagents`、`_init_output`、`_init_controller`、`_init_input`、`_init_user_commands`、`_init_triggers`。mixin 布局为 `AgentInitMixin`（`bootstrap/agent_init.py`）+ `AgentHandlersMixin`（`core/agent/turn/handlers.py`）+ `AgentToolsMixin`（`core/agent/tools/dispatch.py`），外加 2.0 之后的 mixin：`AgentConstructMixin`（`Agent.build` / `Agent.from_path`）、`AgentTurnMixin`（带类型的 `run` / `run_stream`）、`AgentExtensionsMixin`、`AgentMessagesMixin`、`AgentModelMixin`、`AgentCompactMixin`、`AgentLifecycleMixin`。
 
 `await agent.start()`（`core/agent.py`）会启动 input 和 output 模块；如果存在 TUI，就挂上回调；接着启动 trigger manager、注册 completion callback、初始化 MCP、将 tool 描述注入 prompt、初始化 `CompactManager`、加载 plugin、发布 session 信息，最后启动 termination checker。
 
@@ -40,7 +40,7 @@ CLI 入口位于 `cli/run.py:run_agent_cli()`。它会先检查配置路径，�
 `type, content, context, timestamp, job_id?, prompt_override?, stackable`。
 类型包括 `user_input`、`idle`、`timer`、`context_update`、`tool_complete`、`subagent_output`、`channel_message`、`monitor`、`error`、`startup`、`shutdown`。
 
-事件队列位于 `core/controller.py:push_event` / `_collect_events`（252-299 行）。同一个 tick 中收集到的 stackable event，会合并为这一轮中的同一条 user message；非 stackable event 会直接打断当前 batch；超出当前 batch 的事件会先放入 `_pending_events`，下一轮再处理。
+事件队列位于 `core/controller/controller.py:push_event` / `_collect_events`（252-299 行）。同一个 tick 中收集到的 stackable event，会合并为这一轮中的同一条 user message；非 stackable event 会直接打断当前 batch；超出当前 batch 的事件会先放入 `_pending_events`，下一轮再处理。
 
 每一轮的流程位于 `agent_handlers.py:_run_controller_loop`：
 
@@ -57,7 +57,7 @@ CLI 入口位于 `cli/run.py:run_agent_cli()`。它会先检查配置路径，�
 
 stream parser（`parsing/`）在识别到配置好的 `tool_format` 中的 tool block 时，会发出事件。支持 bracket（默认：`[/bash]@@command=ls\n[bash/]`）、XML（`<bash command="ls"></bash>`）和 native（LLM provider 自带的 function-calling 封装）。每个识别出的 tool，都会通过 `executor.submit_from_event()` 转成一个 executor task。
 
-executor（`core/executor.py`）会维护 `{job_id: asyncio.Task}`，每次调用都会创建一个 `ToolContext`。其中包含 `working_dir`、`session`、`environment`、文件保护设置、文件读取状态 map、job store，以及 agent 名称。
+executor（`core/jobs/executor.py`）会维护 `{job_id: asyncio.Task}`，每次调用都会创建一个 `ToolContext`。其中包含 `working_dir`、`session`、`environment`、文件保护设置、文件读取状态 map、job store，以及 agent 名称。
 
 共有三种模式：
 
@@ -79,7 +79,7 @@ Sub-agent 由 `modules/subagent/manager.py:spawn` 启动。Sub-agent 不能再�
 
 执行完成后，它会将一个 `subagent_output` event 推回父 controller。如果该 sub-agent 配置了 `output_to: external`，输出就会直接流向某个具名 output module，而不再返回父级。
 
-交互式 sub-agent（`modules/subagent/interactive.py` + `interactive_mgr.py`）会跨多轮持续存在，能够接收 `context_update`，也能通过 `_feed_interactive()` 接收新的 prompt。它们和顶层对话一样，也会持久化到 session store。
+交互式 sub-agent（`modules/subagent/interactive/interactive.py` + `interactive/manager.py`）会跨多轮持续存在，能够接收 `context_update`，也能通过 `_feed_interactive()` 接收新的 prompt。它们和顶层对话一样，也会持久化到 session store。
 
 相关文档见 [concepts/modules/sub-agent.md](../concepts/modules/sub-agent.md)。
 
@@ -109,7 +109,7 @@ Sub-agent 由 `modules/subagent/manager.py:spawn` 启动。Sub-agent 不能再�
 
 ### 1.7 Plugin 系统
 
-这里实际上是两套彼此独立的系统。**Prompt plugin**（`prompt/plugins.py`）会在聚合 system prompt 时向其中追加内容，按 priority 排序。内建的有 `ToolList`、`FrameworkHints`、`EnvInfo`、`ProjectInstructions`。**Lifecycle plugin**（`bootstrap/plugins.py`，管理器位于 `modules/plugin/`）会挂到 agent event 上。`PluginManager.notify(hook, **kwargs)` 会等待所有启用 plugin 的匹配方法执行完毕。如果某个 `pre_*` hook 抛出 `PluginBlockError`，当前操作就会被拦截。可用 hook 列表见 builtin inventory。
+这里只有一个 plugin 类 `BasePlugin`（`modules/plugin/base.py`），由 `bootstrap/plugins.py` 加载，管理器位于 `modules/plugin/`。**Prompt 贡献**（`get_prompt_content`、`presentation_contribution`）由管理器按 priority 收集，聚合 system prompt 时由 aggregator 放入；工具清单、工具指引、skills 与 group 区块是框架区段，不是 plugin。**Lifecycle hook** 会挂到 agent event 上。`PluginManager.notify(hook, **kwargs)` 会等待所有启用 plugin 的匹配方法执行完毕。如果某个 `pre_*` hook 抛出 `PluginBlockError`，当前操作就会被拦截。可用 hook 列表见 builtin inventory。
 
 Package 可以在 `kohaku.yaml` 中声明 plugin；`config.plugins[]` 中列出的 plugin 会在 agent 启动时加载。
 
@@ -130,15 +130,15 @@ Session 都保存在单个 `.kohakutr` 文件中，底层是 KohakuVault（SQLit
 - scratchpad 写入时
 - channel 发送时
 
-恢复逻辑位于 `session/resume.py`：先加载 `meta`，再加载每个 agent 的 conversation snapshot，恢复 scratchpad/state，恢复 trigger，将 event 重放给 output module（用于 scrollback），再把 sub-agent 对话挂回去。无法恢复的状态，例如打开的文件、LLM 连接、TUI、asyncio task，都会按配置重新创建。
+恢复逻辑位于 `session/resume/resume.py`：先加载 `meta`，再加载每个 agent 的 conversation snapshot，恢复 scratchpad/state，恢复 trigger，将 event 重放给 output module（用于 scrollback），再把 sub-agent 对话挂回去。无法恢复的状态，例如打开的文件、LLM 连接、TUI、asyncio task，都会按配置重新创建。
 
-`session/memory.py` 和 `session/embedding.py` 提供基于 event log 的 FTS5 和向量搜索。embedding provider 支持 `model2vec`、`sentence-transformer`、`api`。向量会和 event block 一起存储，用于混合搜索。
+`session/memory/index.py` 和 `session/memory/embedding.py` 提供基于 event log 的 FTS5 和向量搜索。embedding provider 支持 `model2vec`、`sentence-transformer`、`api`。向量会和 event block 一起存储，用于混合搜索。
 
 相关文档见 [impl-notes/session-persistence.md](../concepts/impl-notes/session-persistence.md)。
 
 ### 2.2 上下文压缩
 
-`core/compact.py:CompactManager` 每轮结束后都会运行。`should_compact(prompt_tokens)` 会检查 prompt token 是否超过 `max_context` 的 80%（可通过 `compact.threshold` 和 `compact.max_tokens` 调整）。触发后，它会先发出一个 `compact_start` activity event，再启动后台 task 运行 summarizer LLM。默认使用主 LLM，也可以单独配置 `compact_model`。summary 会在 **轮与轮之间** 以原子方式插入对话。live zone，也就是最近 `keep_recent_turns` 轮，永远不会被总结。
+`core/compact/manager.py:CompactManager` 每轮结束后都会运行。`should_compact(prompt_tokens)` 会检查 prompt token 是否超过 `max_context` 的 80%（可通过 `compact.threshold` 和 `compact.max_tokens` 调整）。触发后，它会先发出一个 `compact_start` activity event，再启动后台 task 运行 summarizer LLM。默认使用主 LLM，也可以单独配置 `compact_model`。summary 会在 **轮与轮之间** 以原子方式插入对话。live zone，也就是最近 `keep_recent_turns` 轮，永远不会被总结。
 
 这样可以保证 controller 不会在一轮执行到一半时，突然发现前面的消息消失。完整原因见 [impl-notes/non-blocking-compaction.md](../concepts/impl-notes/non-blocking-compaction.md)。
 
@@ -148,21 +148,21 @@ Session 都保存在单个 `.kohakutr` 文件中，底层是 KohakuVault（SQLit
 
 ### 3.1 Terrarium 引擎
 
-`terrarium/engine.py:Terrarium` 是运行时引擎，每进程一个，托管所有 Creature。引擎拥有：
+`terrarium/engine/engine.py:Terrarium` 是运行时引擎，每进程一个，托管所有 Creature。引擎拥有：
 
-- `_topology: TopologyState`：纯数据 graph 模型 (`terrarium/topology.py`)，记录哪些 Creature 共用哪个 graph、哪些频道存在、谁 listen / send。
-- `_creatures: dict[str, Creature]`：运行中的 wrapper (`terrarium/creature_host.py`)。
+- `_topology: TopologyState`：纯数据 graph 模型 (`terrarium/graph/topology.py`)，记录哪些 Creature 共用哪个 graph、哪些频道存在、谁 listen / send。
+- `_creatures: dict[str, Creature]`：运行中的 wrapper (`terrarium/creature/host.py`)。
 - `_environments: dict[str, Environment]`：每个 graph 一份；持有 `shared_channels`。
 - `_session_stores: dict[str, SessionStore]`：每个挂著 store 的 graph 一份。
 - `_subscribers: list[_Subscriber]`：`EngineEvent` 发布订阅。
 
-独立 Agent 是 1-creature graph；recipe 是用频道连起来的 connected graph。`Terrarium.with_creature(config)` 是独立 Agent 的捷径；`Terrarium.from_recipe(recipe)` 通过 `terrarium/recipe.py:apply_recipe` 走完一份 `TerrariumConfig` (宣告频道、为每只 Creature 加一条 direct channel、若有 root 加 `report_to_root`、接 listen / send 边、启动一切)。Creature 除了通过频道和 (可选的) 嵌进 system prompt 的 topology hint 外，不会知道自己处于 Terrarium 中。
+独立 Agent 是 1-creature graph；recipe 是用频道连起来的 connected graph。`Terrarium.with_creature(config)` 是独立 Agent 的捷径；`Terrarium.from_recipe(recipe)` 通过 `terrarium/recipe/loader.py:apply_recipe` 走完一份 `TerrariumConfig` (宣告频道、为每只 Creature 加一条 direct channel、若有 root 加 `report_to_root`、接 listen / send 边、启动一切)。Creature 除了通过频道和 (可选的) 嵌进 system prompt 的 topology hint 外，不会知道自己处于 Terrarium 中。
 
-**频道注入**。当一只 Creature 加入了一个有它要 listen 的频道的 graph，`terrarium/channels.py:inject_channel_trigger` 会往它的 `trigger_manager` 加一个 `ChannelTrigger`。这是 layer 模型里唯一被允许的向下注入：在 graph 里的 Creature *会* 知道自己有同伴 (它得知道)，但只透过引擎给它的 handle。独立 Creature 不会有任何注入。
+**频道注入**。当一只 Creature 加入了一个有它要 listen 的频道的 graph，`terrarium/channels/channels.py:inject_channel_trigger` 会往它的 `trigger_manager` 加一个 `ChannelTrigger`。这是 layer 模型里唯一被允许的向下注入：在 graph 里的 Creature *会* 知道自己有同伴 (它得知道)，但只透过引擎给它的 handle。独立 Creature 不会有任何注入。
 
-**热插拔**。拓扑可以在运行时变更。`Terrarium.connect(a, b, channel=...)` 可能合并两个 graph (environment 取联集，频道汇集，挂著的 session store 透过 `terrarium/session_coord.py:apply_merge` 合成一份)。`Terrarium.disconnect` 可能拆 graph (parent session 透过 `apply_split` 复制到两边)。`terrarium/topology.py` 里的纯数据拓扑 mutator 返回 `TopologyDelta`，其 `kind in {"nothing", "merge", "split"}` 驱动这些 live 更新。
+**热插拔**。拓扑可以在运行时变更。`Terrarium.connect(a, b, channel=...)` 可能合并两个 graph (environment 取联集，频道汇集，挂著的 session store 透过 `terrarium/session/coord.py:apply_merge` 合成一份)。`Terrarium.disconnect` 可能拆 graph (parent session 透过 `apply_split` 复制到两边)。`terrarium/graph/topology.py` 里的纯数据拓扑 mutator 返回 `TopologyDelta`，其 `kind in {"nothing", "merge", "split"}` 驱动这些 live 更新。
 
-**Session 合并 / 分裂**。Session 的单位是 graph 的连通分量。不影响 graph 成员的拓扑变更会沿用既有的 store。`terrarium/session_coord.py` 实作两条分支并发出 `SESSION_FORKED` / `TOPOLOGY_CHANGED` 事件。
+**Session 合并 / 分裂**。Session 的单位是 graph 的连通分量。不影响 graph 成员的拓扑变更会沿用既有的 store。`terrarium/session/coord.py` 实作两条分支并发出 `SESSION_FORKED` / `TOPOLOGY_CHANGED` 事件。
 
 **事件 bus**。`terrarium/events.py:EngineEvent` 是统一的可观测面。kind 涵盖 text chunk、频道消息、拓扑变更、session fork、creature 生命周期、processing start / end、error。`Terrarium.subscribe(filter)` 返回与 `EventFilter` 匹配的事件 async iterator。每个订阅者各有一个 queue；取消 iterator 会自动撤销订阅。
 

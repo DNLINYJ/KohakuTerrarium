@@ -1,0 +1,460 @@
+"""Read text, images, and PDFs into tool-result content."""
+
+import base64
+import io
+import os
+import time
+from pathlib import Path
+from typing import Any
+
+import aiofiles
+from PIL import Image, ImageChops, UnidentifiedImageError
+
+from kohakuterrarium.builtins.tools.registry import register_builtin
+from kohakuterrarium.llm.message import ImagePart, TextPart
+from kohakuterrarium.modules.tool.base import (
+    BaseTool,
+    ExecutionMode,
+    ToolResult,
+    resolve_tool_path,
+)
+from kohakuterrarium.modules.tool.media_policy import MediaPolicy
+from kohakuterrarium.utils.file.guard import is_binary_file
+from kohakuterrarium.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+MAX_DEFAULT_LINES = 2000
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+
+
+@register_builtin("read")
+class ReadTool(BaseTool):
+    """Read files with line ranges and multimodal handling where supported."""
+
+    needs_context = True
+    path_arguments = {"path": "read"}
+    media_policy = MediaPolicy(persist=True, pinned=False, inline_fallback=True)
+
+    @property
+    def tool_name(self) -> str:
+        return "read"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Read a file: text with line numbers, images or PDF pages. Use it to "
+            "inspect any file, and before write or multi_edit. Not for notebooks - use "
+            "notebook_read."
+        )
+
+    @property
+    def execution_mode(self) -> ExecutionMode:
+        return ExecutionMode.DIRECT
+
+    async def _execute(self, args: dict[str, Any], **kwargs: Any) -> ToolResult:
+        """Read file contents."""
+        context = kwargs.get("context")
+
+        path = args.get("path", "")
+        if not path:
+            return ToolResult(error="No path provided")
+
+        file_path = resolve_tool_path(path, context)
+
+        if context and context.path_guard:
+            msg = context.path_guard.check(str(file_path))
+            if msg:
+                return ToolResult(error=msg)
+
+        if _is_image_file(file_path):
+            return await self._read_image(file_path, path)
+
+        # PDFs interpret the text-range arguments as page offset and page count.
+        if file_path.suffix.lower() == ".pdf":
+            page_offset = int(args.get("offset", 0))
+            page_limit = int(args.get("limit", 0))
+            return await self._read_pdf(file_path, path, page_offset, page_limit)
+
+        if is_binary_file(file_path):
+            return ToolResult(
+                error=f"Binary file detected ({file_path.suffix}). "
+                "Use bash with xxd, file, or other tools to inspect binary files."
+            )
+
+        if not file_path.exists():
+            return ToolResult(error=f"File not found: {path}")
+
+        if not file_path.is_file():
+            return ToolResult(error=f"Not a file: {path}")
+
+        offset = int(args.get("offset", 0))
+        limit = int(args.get("limit", 0))
+
+        max_output_bytes = int(self.config.extra.get("max_output_bytes", 256 * 1024))
+        try:
+            async with aiofiles.open(
+                file_path, encoding="utf-8", errors="replace"
+            ) as f:
+                content = await f.read()
+            lines = content.splitlines(keepends=True)
+
+            total_lines = len(lines)
+
+            # Apply offset and limit
+            if offset > 0:
+                lines = lines[offset:]
+            if limit > 0:
+                lines = lines[:limit]
+            elif total_lines > MAX_DEFAULT_LINES:
+                # guard against unbounded full reads: cap the default read
+                # so huge files don't flood the context; the notice below
+                # tells the model how to navigate with offset/limit
+                lines = lines[:MAX_DEFAULT_LINES]
+
+            # Format with line numbers
+            output_lines = []
+            start_line = offset + 1
+            for i, line in enumerate(lines):
+                line_num = start_line + i
+                # Remove trailing newline for cleaner output
+                line_content = line.rstrip("\n\r")
+                # Truncate individual long lines
+                if len(line_content) > 2000:
+                    total_chars = len(line_content)
+                    line_content = (
+                        line_content[:2000]
+                        + f" ... (line truncated, {total_chars} chars)"
+                    )
+                output_lines.append(f"{line_num:6}→{line_content}")
+
+            output = "\n".join(output_lines)
+
+            # Add truncation notice if applicable
+            if limit > 0 and offset + limit < total_lines:
+                output += f"\n\n... (showing lines {offset + 1}-{offset + len(lines)} of {total_lines})"
+            elif limit == 0 and offset + len(lines) < total_lines:
+                output += (
+                    f"\n\n... (showing lines {offset + 1}-{offset + len(lines)} "
+                    f"of {total_lines}. Use offset/limit to read more.)"
+                )
+
+            # Truncate total output if it exceeds max bytes
+            if max_output_bytes > 0 and len(output.encode("utf-8")) > max_output_bytes:
+                output = output.encode("utf-8")[:max_output_bytes].decode(
+                    "utf-8", errors="ignore"
+                )
+                output += f"\n\n[Output truncated at {max_output_bytes} bytes. Use offset/limit to read specific sections.]"
+
+            logger.debug(
+                "File read",
+                file_path=str(file_path),
+                lines_read=len(lines),
+            )
+
+            # Write/edit guards require the timestamp and whether the read was partial.
+            if context and context.file_read_state:
+                mtime_ns = os.stat(file_path).st_mtime_ns
+                partial = bool(args.get("offset") or args.get("limit"))
+                context.file_read_state.record_read(
+                    str(file_path), mtime_ns, partial, time.time()
+                )
+
+            return ToolResult(output=output, exit_code=0)
+
+        except PermissionError:
+            return ToolResult(error=f"Permission denied: {path}")
+        except Exception as e:
+            logger.error("Read failed", error=str(e))
+            return ToolResult(error=str(e))
+
+    async def _read_pdf(
+        self,
+        file_path: Path,
+        original_path: str,
+        page_offset: int,
+        page_limit: int,
+    ) -> ToolResult:
+        """Extract PDF text and render the selected pages as images."""
+        try:
+            import fitz  # pymupdf
+        except ImportError:
+            return ToolResult(
+                error="PDF reading requires pymupdf. Install with: pip install pymupdf"
+            )
+
+        if not file_path.exists():
+            return ToolResult(error=f"File not found: {original_path}")
+
+        try:
+            doc = fitz.open(file_path)
+        except Exception as e:
+            return ToolResult(error=f"Failed to open PDF: {e}")
+
+        total_pages = len(doc)
+        if total_pages == 0:
+            doc.close()
+            return ToolResult(output="Empty PDF (0 pages).", exit_code=0)
+
+        # Apply offset/limit as page range
+        start = min(page_offset, total_pages)
+        end = total_pages
+        if page_limit > 0:
+            end = min(start + page_limit, total_pages)
+
+        # Refuse unbounded large PDFs before they inflate multimodal context.
+        warn_threshold = int(self.config.extra.get("pdf_page_warn", 20))
+        if page_offset == 0 and page_limit == 0 and total_pages > warn_threshold:
+            doc.close()
+            return ToolResult(
+                error=f"This PDF has {total_pages} pages. Reading all at once "
+                f"will be very large. Please use offset and limit to read a "
+                f"range of pages. For PDFs, offset is the starting page (0-based) "
+                f"and limit is the number of pages to read. "
+                f"Example: offset=0, limit={warn_threshold} for the first "
+                f"{warn_threshold} pages. Or offset=0, limit={total_pages} "
+                f"if you really want all pages."
+            )
+
+        parts: list[TextPart | ImagePart] = []
+        text_sections: list[str] = []
+
+        dpi = int(self.config.extra.get("pdf_dpi", 100))
+        image_format = str(self.config.extra.get("pdf_image_format", "auto")).lower()
+        if image_format not in _PAGE_FORMATS:
+            doc.close()
+            return ToolResult(
+                error=f"pdf_image_format must be one of {sorted(_PAGE_FORMATS)}"
+            )
+        jpeg_quality = int(self.config.extra.get("pdf_jpeg_quality", 75))
+        zoom = dpi / 72
+        mat = fitz.Matrix(zoom, zoom)
+
+        for page_num in range(start, end):
+            page = doc[page_num]
+
+            # Geometric sorting approximates natural reading order across blocks.
+            blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)[
+                "blocks"
+            ]
+            blocks.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))
+
+            page_lines = [f"\n--- Page {page_num + 1}/{total_pages} ---\n"]
+            for block in blocks:
+                if block["type"] == 0:  # Text block
+                    for line in block.get("lines", []):
+                        text_parts = []
+                        for span in line.get("spans", []):
+                            text = span.get("text", "")
+                            if text.strip():
+                                text_parts.append(text)
+                        if text_parts:
+                            page_lines.append("".join(text_parts))
+            text_sections.extend(page_lines)
+
+            try:
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                img_data, mime = encode_page(
+                    pix.width, pix.height, pix.samples, image_format, jpeg_quality
+                )
+                b64 = base64.b64encode(img_data).decode("ascii")
+                parts.append(
+                    ImagePart(
+                        url=f"data:{mime};base64,{b64}",
+                        detail="auto",
+                        source_type="pdf_page",
+                        source_name=f"{file_path.name} p{page_num + 1}",
+                    )
+                )
+            except Exception as e:
+                logger.warning(
+                    "PDF page render failed, text still available",
+                    error=str(e),
+                    exc_info=True,
+                )
+
+        doc.close()
+
+        text_content = "\n".join(text_sections)
+        if not text_content.strip():
+            text_content = "(No extractable text — check the page images below.)"
+
+        header = f"PDF: {original_path} ({total_pages} pages"
+        if page_offset > 0 or page_limit > 0:
+            header += f", showing pages {start + 1}-{end}"
+        header += ")\n"
+
+        parts.insert(0, TextPart(text=header + text_content))
+
+        logger.info(
+            "PDF read",
+            file_path=str(file_path),
+            pages=f"{start + 1}-{end}",
+            total=total_pages,
+            rendered=len(parts) - 1,
+        )
+
+        # Rendered pages exist nowhere else, so they are persisted like any
+        # generated image; they still fold away with the tool block.
+        return ToolResult(
+            output=parts,
+            exit_code=0,
+            metadata={
+                "media_policy": MediaPolicy(persist=True, pinned=False).to_dict()
+            },
+        )
+
+    async def _read_image(self, file_path: Path, original_path: str) -> ToolResult:
+        """Validate an image and return provider-compatible multimodal content."""
+        if not file_path.exists():
+            return ToolResult(error=f"File not found: {original_path}")
+
+        file_size = file_path.stat().st_size
+
+        if file_size > MAX_IMAGE_BYTES:
+            return ToolResult(
+                error=f"Image too large ({file_size // 1024}KB). "
+                f"Max: {MAX_IMAGE_BYTES // (1024 * 1024)}MB."
+            )
+
+        suffix = file_path.suffix.lower()
+        if suffix not in _IMAGE_MIME:
+            return ToolResult(
+                error=(
+                    f"Unsupported image format {suffix!r}. "
+                    f"Supported: {', '.join(sorted(_IMAGE_MIME))}."
+                )
+            )
+
+        try:
+            async with aiofiles.open(file_path, "rb") as f:
+                data = await f.read()
+        except Exception as e:
+            return ToolResult(error=f"Failed to read image: {e}")
+
+        # Header verification alone misses damaged pixel data; a fresh handle is
+        # required because Pillow invalidates the image after ``verify()``.
+        verified_format = _verify_image(data)
+        if verified_format is None:
+            return ToolResult(
+                error=(
+                    f"File {original_path} is not a valid image, or its format "
+                    f"is unsupported (need PNG / JPEG / WEBP / GIF)."
+                )
+            )
+        mime = _PIL_FORMAT_TO_MIME.get(verified_format)
+        if mime is None:
+            return ToolResult(
+                error=(
+                    f"Image decoded as {verified_format!r}, which is not in the "
+                    f"supported set (PNG / JPEG / WEBP / GIF)."
+                )
+            )
+
+        logger.info(
+            "Image read",
+            file_path=str(file_path),
+            size_kb=len(data) // 1024,
+            mime=mime,
+        )
+
+        return ToolResult(
+            output=[
+                TextPart(
+                    text=f"Image: {original_path} ({len(data) // 1024}KB, {mime})"
+                ),
+                ImagePart(
+                    url=f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}",
+                    detail="auto",
+                    source_type="file",
+                    source_name=file_path.name,
+                ),
+            ],
+            exit_code=0,
+        )
+
+
+# The only image formats the supported LLM providers (OpenAI Responses,
+# Codex, Anthropic, Gemini) reliably accept. Anything else either gets
+# rejected at the provider boundary or silently degraded — restricting
+# here keeps the failure mode local and actionable.
+_IMAGE_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+# Image extensions that are still recognized as images by the dispatcher
+# (so they don't fall through to the binary-file guard) but rejected
+# with a clear "unsupported" message in ``_read_image``.
+_UNSUPPORTED_IMAGE_EXTENSIONS = frozenset(
+    {
+        ".bmp",
+        ".tiff",
+        ".tif",
+        ".ico",
+        ".svg",
+        ".heif",
+        ".heic",
+        ".avif",
+    }
+)
+
+_PIL_FORMAT_TO_MIME = {
+    "PNG": "image/png",
+    "JPEG": "image/jpeg",
+    "GIF": "image/gif",
+    "WEBP": "image/webp",
+}
+
+
+_PAGE_FORMATS = frozenset({"auto", "png", "jpeg"})
+
+
+def encode_page(
+    width: int, height: int, samples: bytes, image_format: str, jpeg_quality: int
+) -> tuple[bytes, str]:
+    """Encode an RGB page render; ``auto`` keeps the smaller of PNG and JPEG.
+
+    A page whose pixels are all neutral gray is encoded as one channel.
+    """
+    image = Image.frombytes("RGB", (width, height), samples)
+    red, green, blue = image.split()
+    if (
+        ImageChops.difference(red, green).getbbox() is None
+        and ImageChops.difference(green, blue).getbbox() is None
+    ):
+        image = red
+    candidates: list[tuple[bytes, str]] = []
+    if image_format in ("auto", "png"):
+        stream = io.BytesIO()
+        image.save(stream, "PNG", optimize=True)
+        candidates.append((stream.getvalue(), "image/png"))
+    if image_format in ("auto", "jpeg"):
+        stream = io.BytesIO()
+        image.save(stream, "JPEG", quality=jpeg_quality, optimize=True)
+        candidates.append((stream.getvalue(), "image/jpeg"))
+    return min(candidates, key=lambda candidate: len(candidate[0]))
+
+
+def _verify_image(data: bytes) -> str | None:
+    """Return Pillow's format name when the complete image decodes cleanly."""
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            img.verify()
+        # ``verify()`` leaves the image unusable; reopen for load().
+        with Image.open(io.BytesIO(data)) as img:
+            fmt = img.format
+            img.load()
+        return fmt
+    except (UnidentifiedImageError, OSError, ValueError, SyntaxError) as e:
+        logger.debug("Image verification failed", error=str(e))
+        return None
+
+
+def _is_image_file(path: Path) -> bool:
+    """Route recognized image extensions through image-specific diagnostics."""
+    suffix = path.suffix.lower()
+    return suffix in _IMAGE_MIME or suffix in _UNSUPPORTED_IMAGE_EXTENSIONS

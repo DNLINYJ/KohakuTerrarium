@@ -101,31 +101,41 @@ as needed. Direct.
 
 ### Web
 
-**`web_fetch`**: Fetch a URL as markdown. Tries `crawl4ai` →
-`trafilatura` → Jina proxy → `httpx + html2text`. 100k-char cap, 30s
-timeout. Direct.
+**`web_fetch`**: Fetch a URL as Markdown. Default `backend: auto` tries
+`crawl4ai` → `trafilatura` → Jina → `httpx + html2text`. Select `backend: deepseek`
+for the direct DeepSeek Fetch API. `fallback: auto` opts into the extractor chain
+only after transient failures. Content is capped at 100000 characters.
 
-- Args: `url`.
+- Args: `url`, `max_length` (1–100000).
 
-**`web_search`**: Web search with a DuckDuckGo default plus optional Codex
-subscription and DeepSeek Responses backends. After `kt login codex`, select
-`backend: codex`; this works independently of the creature's active LLM.
-DeepSeek requires `kt config key set deepseek` and `backend: deepseek`. Either
-explicit provider backend can use `fallback: duckduckgo` for transient
-failures. Direct.
+**`web_search`**: DuckDuckGo by default; optional `codex`, `deepseek_api` (direct
+Search), and `deepseek` (legacy Responses, Pro only). Configure a DeepSeek key
+with `kt config key set deepseek`. `fallback: duckduckgo` permits fallback only
+after transient failures. Search results retain their source URLs; they are not
+model-verified citations. Search is independent of the creature's active model.
 
-- Args: `query`, `max_results` (int), `region` (str).
+- Args: `query`, `max_results` (legacy alias `limit`); `need_content` and
+  `ori_question` for `deepseek_api`. Direct Search accepts 1–128 query characters
+  and 1–50 results. The optional `localization` runtime setting is an IP address.
+
 
 ### Provider-native media
 
-**`image_gen`**: Generate or edit an image through the provider's own
-native image backend. Currently auto-injected for Codex-backed creatures
-unless opted out with `disable_provider_tools: [image_gen]`. The executor
-never runs it; the provider returns structured image content and the
-session store persists the generated file into the session artifacts dir.
+**`image_gen`**: Generate or edit an image with the Codex subscription's
+Images endpoints (`gpt-image-2`; needs `kt login codex`). Auto-injected for
+Codex-backed creatures unless opted out with `disable_provider_tools:
+[image_gen]`, and usable on any model when listed under `tools:`. It is an
+ordinary tool: the result carries the image and the session store persists
+the generated file into the session artifacts dir.
 
-- Args: `prompt` plus provider-specific knobs when explicitly wired:
-  `output_format`, `size`, `quality`, `action`, `background`.
+- Args: `prompt`; `transparent_background`; for edits either
+  `referenced_image_paths` (up to 5 local files) or
+  `num_last_images_to_include` (1-5 recent conversation images); `gif`
+  (`frame_count`, `frame_duration_ms`) when the tool option `gif: true` is set.
+- Size, quality and the still-image format are chosen by the backend.
+- A Codex backend with its own `base_url` / `api_key` (a private or enterprise
+  deployment) receives the requests at `{base_url}/images/generations` and
+  `/images/edits` with that key; it must serve those Codex Images endpoints.
 
 ### Interactive and memory
 
@@ -239,18 +249,28 @@ Shipped sub-agent configs under
 `src/kohakuterrarium/builtins/subagents/`. Reference them in a creature
 config under `subagents:` by name.
 
-All builtin sub-agents load `default_plugins: ["auto-compact"]` and the unified
-`budget` plugin with minimal runtime options: turn soft/hard `40/60`, tool-call
-soft/hard `75/100`, and no walltime budget.
+The task helpers `explore` and `critic` use inspection-only tools and the `budget`
+plugin: soft/hard model calls `8/12`, tool calls `24/40`, absolute `max_turns: 14`,
+and whole-run `timeout: 600` seconds. Neither opts into automatic compaction.
+The default-on `fork` uses the same limits and tools but starts from a detached
+parent context snapshot and inherits the model through an isolated provider.
+Providers unable to return a distinct instance from `fork()` are rejected, not
+shared. `fork_enabled: false` disables context forks and `/btw`; an explicit
+`subagents:` entry named `fork` overrides the default when enabled.
+For `explore` and `critic`, the parent still supplies context and diffs; graph
+creatures own substantial work.
+Service presets retain their existing `auto-compact` opt-in and `40/60` turn,
+`75/100` tool-call budgets.
+
+Removed builtins `worker`, `plan`, `research`, and `coordinator` are warned about
+and skipped in older configs, even under strict startup. Update kt-biome or the
+config; custom sub-agents remain supported.
 
 | Name | Tools | Purpose |
 |---|---|---|
-| `worker` | `read`, `write`, `bash`, `glob`, `grep`, `edit`, `multi_edit` | Fix bugs, refactor, run validations. |
-| `coordinator` | `send_message`, `scratchpad` | Decompose → dispatch → aggregate. |
-| `explore` | `glob`, `grep`, `read`, `tree`, `bash` | Read-only exploration. |
-| `plan` | `explore` tools + `think` | Read-only planning. |
-| `research` | `web_search`, `web_fetch`, `read`, `write`, `think`, `scratchpad` | External research. |
-| `critic` | `read`, `glob`, `grep`, `tree`, `bash` | Code review. |
+| `explore` | `glob`, `grep`, `read`, `tree` | Bounded workspace questions with evidence. |
+| `critic` | `read`, `glob`, `grep`, `tree` | Bounded independent review, no fixes or test suites. |
+| `fork` | `read`, `glob`, `grep`, `tree` | Bounded side task with a snapshot of parent context; default-on. No writes, shell, graph coordination, or recursive delegation. |
 | `response` | `read` | User-facing copy generator. Typically `output_to: external`. |
 | `memory_read` | `tree`, `read`, `grep` over the memory folder | Recall from agent memory. |
 | `memory_write` | `tree`, `read`, `write` | Persist findings into memory. |
@@ -324,7 +344,11 @@ Slash commands available inside input modules. Under
 | `/regen` | `/regenerate`, `/retry` | Re-run the last assistant turn as a sibling branch. |
 | `/edit <message_index> <new content>` | (none) | Edit a past user message and re-run from that point as a new branch. |
 | `/branch [<turn> <branch_id>\|latest]` | `/br` | List or switch the live branch for regen/edit alternatives. |
-| `/fork [event_id] [--name name]` | (none) | Copy the current session into a new `.kohakutr` file for alternate exploration. |
+| `/fork [event_id] [--name name]` | (none) | Copy the current session into a new `.kohakutr` file for alternate exploration (unchanged). |
+| `/btw QUESTION` | (none) | Start a private user-facing context fork; neither question nor answer enters the parent LLM input. |
+| `/btw --continue JOB_ID QUESTION` | (none) | Continue the retained side transcript in the same run after completion or stopping. |
+| `/btw --open JOB_ID` | (none) | Reopen a side transcript, hiding the inherited parent prefix. |
+| `/btw --stop JOB_ID` | (none) | Stop only that side job. |
 | `/plugin [list\|enable\|disable\|toggle] [name]` | `/plugins` | Inspect or toggle plugins. |
 | `/skill [list\|enable\|disable\|toggle\|show] [name]` | `/skills` | Inspect or toggle procedural skills. |
 | `/<skill-name> [args]` | (none) | User-invoke path for an enabled procedural skill when no built-in slash command shadows that name. |
@@ -371,7 +395,7 @@ Canonical backend types are `openai`, `anthropic`, and `codex`. Legacy
 
 ## LLM presets
 
-Shipped in `src/kohakuterrarium/llm/presets.py`. Use them as `llm:` or
+Shipped in `src/kohakuterrarium/llm/presets/catalog.py`. Use them as `llm:` or
 `--llm` values.
 
 Naming convention (post-2026-04 refactor):
@@ -553,7 +577,7 @@ provider. Adding these presets does not change an existing default model.
 - `ministral-3-8b`
 
 Preset token windows (`max_context` / `max_output`) are set per preset;
-see `src/kohakuterrarium/llm/presets.py` for the exact values, or
+see `src/kohakuterrarium/llm/presets/catalog.py` for the exact values, or
 `kt config llm show <name>`. `controller.max_tokens` overrides
 `max_output`; to adjust the compaction window, set `compact.max_tokens`.
 
@@ -675,24 +699,20 @@ a variation group.
 
 ---
 
-## Prompt plugins
+## Prompt sections
 
-Shipped prompt plugins (loaded by `prompt/aggregator.py`). Ordered by
-priority (lower = earlier).
+`prompt/aggregator.py` composes the system prompt from gated framework
+sections: the creature's base prompt, `## Available Functions` and
+`## Function Documentation` (text tool formats or `full` doc mode),
+`## Tool guidance`, plugin contributions, `## Skills`, the group blocks
+(only for creatures in a graph), and the execution model. A section whose
+subject does not exist is not emitted.
 
-| Priority | Name | Emits |
-|---|---|---|
-| 50 | `ToolListPlugin` | Tool name + one-line description. |
-| 45 | `FrameworkHintsPlugin` | Framework command examples (`info`, `read_job`, `jobs`, `wait`, native tool usage) and tool-call format examples. |
-| 40 | `EnvInfoPlugin` | `cwd`, platform, date/time. |
-| 30 | `ProjectInstructionsPlugin` | Loads `CLAUDE.md` and `.claude/rules.md`. |
-
-Custom prompt plugins subclass `BasePlugin` and register via the
-`plugins` field in a creature config. See
-[plugin-hooks.md](plugin-hooks.md) for lifecycle and callback hooks.
-
-Separate from prompt plugins, tools may also contribute one-line or short
-paragraph guidance into the aggregated `## Tool guidance` section.
+Plugins add prose by overriding `get_prompt_content(context)` on a
+`BasePlugin` subclass registered through the `plugins` field of a creature
+config. See [plugin-hooks.md](plugin-hooks.md) for the hooks. Tools
+contribute one-line or short paragraph guidance into the aggregated
+`## Tool guidance` section through `prompt_contribution()`.
 
 ---
 

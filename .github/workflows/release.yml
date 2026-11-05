@@ -19,11 +19,17 @@ on:
         default: "stable"
         type: choice
         options: [stable, beta, nightly]
+      dry_run:
+        description: "Build and self-check everything, publish nothing"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
   id-token: write
   packages: write
+  attestations: write
 
 jobs:
   # ── One resolution of version / channel / tag, consumed by every job ──
@@ -204,10 +210,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             py: "3.13"
             abi: cp313
             plat: linux-x64
+          - os: ubuntu-22.04-arm
+            py: "3.13"
+            abi: cp313
+            plat: linux-arm64
           - os: macos-latest
             py: "3.13"
             abi: cp313
@@ -257,6 +267,7 @@ jobs:
             --platform "${{ matrix.plat }}" \
             --py-abi "${{ matrix.abi }}" \
             --channel "${{ needs.meta.outputs.channel }}" \
+            --extras keychain \
             --out dist/release-trees/
 
       - uses: actions/upload-artifact@v4
@@ -266,6 +277,7 @@ jobs:
 
   # ── Aggregate sidecars into channel manifests ─────────────────────
   publish-channel-manifests:
+    if: ${{ !inputs.dry_run }}
     needs: [meta, build-release-tree]
     runs-on: ubuntu-latest
     steps:
@@ -348,9 +360,11 @@ jobs:
             --clobber \
             -R "${GITHUB_REPOSITORY}"
 
-  # ── Briefcase desktop shell (slim — bundles ONE release-tree as fallback) ─
-  build-desktop:
-    needs: [meta, build-wheel, build-release-tree]
+  # ── Tauri desktop shell: bundled interpreter + launcher + one release tree ─
+  # Builds the installer, installs it on the runner and runs the headless
+  # self-check (app serves behind its launch token, kt runs, python tool runs).
+  build-desktop-tauri:
+    needs: [meta, build-release-tree]
     strategy:
       fail-fast: false
       matrix:
@@ -359,12 +373,18 @@ jobs:
             platform: windows
             plat_tag: win-x64
             abi: cp313
-            py: "3.13"
           - os: macos-latest
-            platform: macOS
+            platform: macos
             plat_tag: macos-arm64
             abi: cp313
-            py: "3.13"
+          - os: ubuntu-22.04
+            platform: linux
+            plat_tag: linux-x64
+            abi: cp313
+          - os: ubuntu-22.04-arm
+            platform: linux
+            plat_tag: linux-arm64
+            abi: cp313
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -374,90 +394,174 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.py }}
+          python-version: "3.13"
 
       - name: Stamp the dispatched version
         if: needs.meta.outputs.stamp == 'true'
         run: python scripts/set_pyproject_version.py write "${{ needs.meta.outputs.version }}"
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-tree-${{ matrix.plat_tag }}-${{ matrix.abi }}
+          path: release-tree/
+
+      - name: Stage interpreter, launcher and release tree
+        run: >
+          python packaging/desktop/stage_runtime.py
+          --platform ${{ matrix.plat_tag }}
+          --release-dir release-tree
+          --stamp-version
+
+      - name: Install the Tauri system libraries (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev libdbus-1-dev pkg-config patchelf xvfb \
+            file rpm desktop-file-utils
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packaging/desktop/src-tauri
+
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
 
-      - name: Build frontend
-        working-directory: src/kohakuterrarium-frontend
-        run: |
-          npm ci
-          npm run build
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: release-tree-${{ matrix.plat_tag }}-${{ matrix.abi }}
-          path: bundled-release/
-
-      - name: Verify bundled-release has the right tarball
+      - name: Install the Tauri CLI
         shell: bash
         run: |
-          ls -la bundled-release/
-          test -n "$(find bundled-release -maxdepth 1 -name 'kohakuterrarium-*.tar.*' | head -n 1)"
+          version=$(node -p "require('./src/kohakuterrarium-frontend/package.json').devDependencies['@tauri-apps/cli']")
+          npm install --global "@tauri-apps/cli@$version"
 
-      - name: Install briefcase
-        run: pip install briefcase
-
-      - name: Pre-build wheels for sdist-only deps
+      # Installers carry only the numeric X.Y.Z; the shell records the full
+      # version so a nightly can tell whether a newer nightly exists.
+      - name: Record the shell build identity
         shell: bash
+        run: echo "KT_SHELL_BUILD=$(python packaging/desktop/updater_manifest.py --semver '${{ needs.meta.outputs.version }}')" >> "$GITHUB_ENV"
+
+      # With the signing key present the build also writes signed updater
+      # artifacts; without it (forks) the installers are still built.
+      - name: Build installers (Windows)
+        if: matrix.platform == 'windows'
+        working-directory: packaging/desktop/src-tauri
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
-          mkdir -p wheels
-          pip wheel proxy_tools -w wheels --no-deps
+          $extra = @()
+          if ($env:TAURI_SIGNING_PRIVATE_KEY) { $extra = @('--config', 'tauri.updater.conf.json') }
+          tauri build --bundles "msi,nsis" @extra
 
-      # ``KohakuTerrarium[desktop]`` would otherwise resolve from PyPI — which
-      # at this point still serves the PREVIOUS release, since publish-pypi
-      # runs in parallel with this job.
-      - uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: wheel-dist/
-
-      - name: Stage the release wheel for briefcase
+      - name: Build and ad-hoc sign the app bundle (macOS)
+        if: matrix.platform == 'macos'
+        working-directory: packaging/desktop/src-tauri
         shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
-          find wheel-dist -maxdepth 1 -name "*.whl" -exec cp {} wheels/ \;
-          python scripts/pin_briefcase_local_wheel.py --wheel-dir wheels
-          ls -la wheels/
-
-      - name: Create briefcase project
-        run: briefcase create
-
-      - name: Build briefcase app
-        run: briefcase build
-
-      - name: Package briefcase app
-        shell: bash
-        run: |
-          if [ "${{ matrix.platform }}" = "macOS" ]; then
-            briefcase package --adhoc-sign
-          else
-            briefcase package
+          tauri build --bundles app
+          app=$(find target/release/bundle/macos -maxdepth 1 -name '*.app' | head -n 1)
+          # Every Mach-O in the bundle needs a signature on Apple silicon.
+          find "${app}" -type f \( -name '*.so' -o -name '*.dylib' -o -perm -u+x \) \
+            -exec sh -c 'file -b "$1" | grep -q Mach-O && codesign --force --sign - --timestamp=none "$1"' _ {} \;
+          codesign --force --deep --sign - --timestamp=none "${app}"
+          codesign --verify --deep --strict "${app}"
+          version=$(python -c "import json;print(json.load(open('tauri.conf.json'))['version'])")
+          mkdir -p target/release/bundle/dmg
+          hdiutil create -volname KohakuTerrarium -srcfolder "${app}" -ov -format UDZO \
+            "target/release/bundle/dmg/KohakuTerrarium_${version}_aarch64.dmg"
+          # The updater installs from an archive of the signed app.
+          if [ -n "${TAURI_SIGNING_PRIVATE_KEY}" ]; then
+            archive="target/release/bundle/macos/KohakuTerrarium_${version}_aarch64.app.tar.gz"
+            tar -czf "${archive}" -C "$(dirname "${app}")" "$(basename "${app}")"
+            tauri signer sign -k "${TAURI_SIGNING_PRIVATE_KEY}" "${archive}"
           fi
 
-      - name: Collect artifacts
+      - name: Install and self-check (Windows MSI)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem packaging/desktop/src-tauri/target/release/bundle/msi/*.msi | Select-Object -First 1
+          $process = Start-Process msiexec -ArgumentList "/i", "`"$($msi.FullName)`"", "/qn", "/norestart" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "msiexec exited $($process.ExitCode)" }
+          $dir = "$env:ProgramFiles\KohakuTerrarium"
+          $exe = Get-ChildItem $dir -Filter *.exe | Where-Object { $_.Name -notmatch 'uninstall|unins' } | Select-Object -First 1
+          python packaging/desktop/installed_smoke.py --exe $exe.FullName --resources $dir
+          if ($LASTEXITCODE -ne 0) { throw "installed self-check failed" }
+          Start-Process msiexec -ArgumentList "/x", "`"$($msi.FullName)`"", "/qn", "/norestart" -Wait
+
+      - name: Install and self-check (Windows per-user installer)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem packaging/desktop/src-tauri/target/release/bundle/nsis/*.exe | Select-Object -First 1
+          Start-Process $setup.FullName -ArgumentList "/S" -Wait
+          $dir = "$env:LOCALAPPDATA\KohakuTerrarium"
+          $exe = Get-ChildItem $dir -Filter *.exe | Where-Object { $_.Name -notmatch 'uninstall|unins' } | Select-Object -First 1
+          python packaging/desktop/installed_smoke.py --exe $exe.FullName --resources $dir
+          if ($LASTEXITCODE -ne 0) { throw "installed self-check failed" }
+
+      - name: Install and self-check (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          dmg=$(find packaging/desktop/src-tauri/target/release/bundle/dmg -name '*.dmg' | head -n 1)
+          hdiutil attach "${dmg}" -mountpoint /Volumes/KohakuTerrarium -nobrowse
+          cp -R /Volumes/KohakuTerrarium/KohakuTerrarium.app /Applications/
+          hdiutil detach /Volumes/KohakuTerrarium
+          app=/Applications/KohakuTerrarium.app
+          exe=$(find "${app}/Contents/MacOS" -type f | head -n 1)
+          python packaging/desktop/installed_smoke.py --exe "${exe}" --resources "${app}/Contents/Resources"
+
+      # The AppImage is the self-updating Linux package; deb and rpm are
+      # updated by downloading a newer one.
+      - name: Build packages (Linux)
+        if: matrix.platform == 'linux'
+        working-directory: packaging/desktop/src-tauri
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          NO_STRIP: "true"
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          extra=()
+          if [ -n "${TAURI_SIGNING_PRIVATE_KEY}" ]; then extra=(--config tauri.updater.conf.json); fi
+          tauri build --bundles deb,rpm,appimage "${extra[@]}"
+
+      - name: Install and self-check (Linux deb)
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          deb=$(find packaging/desktop/src-tauri/target/release/bundle/deb -name '*.deb' | head -n 1)
+          sudo apt-get install -y "./${deb}"
+          exe=$(command -v kohakuterrarium)
+          resources=$(dirname "$(dpkg -L "$(dpkg-deb -f "${deb}" Package)" | grep -m1 '/python$')")
+          xvfb-run -a python packaging/desktop/installed_smoke.py --exe "${exe}" --resources "${resources}"
+
+      - name: Collect installers
         shell: bash
         run: |
           mkdir -p artifacts
-          cp dist/*.msi artifacts/ 2>/dev/null || true
-          cp dist/*.dmg artifacts/ 2>/dev/null || true
-          cp dist/*.zip artifacts/ 2>/dev/null || true
-          find dist/ -maxdepth 1 -type f \( -name "*.msi" -o -name "*.dmg" -o -name "*.zip" -o -name "*.exe" -o -name "*.app" \) -exec cp {} artifacts/ \; 2>/dev/null || true
+          find packaging/desktop/src-tauri/target/release/bundle -type f \
+            \( -name '*.msi' -o -name '*-setup.exe' -o -name '*.dmg' \
+               -o -name '*.msi.sig' -o -name '*-setup.exe.sig' \
+               -o -name '*_aarch64.app.tar.gz' -o -name '*_aarch64.app.tar.gz.sig' \
+               -o -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.AppImage.sig' \) \
+            -exec cp {} artifacts/ \;
           ls -la artifacts/
           test -n "$(find artifacts -maxdepth 1 -type f | head -n 1)"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: desktop-${{ matrix.platform }}
+          name: desktop-tauri-${{ matrix.plat_tag }}
           path: artifacts/
 
   # ── Docker images (unchanged) ──────────────────────────────────────
   build-docker:
+    if: ${{ !inputs.dry_run }}
     needs: [meta, build-wheel]
     runs-on: ubuntu-latest
     strategy:
@@ -540,6 +644,7 @@ jobs:
 
   # ── PyPI publish (unchanged) ───────────────────────────────────────
   publish-pypi:
+    if: ${{ !inputs.dry_run }}
     needs: [meta, build-wheel]
     runs-on: ubuntu-latest
     environment: release
@@ -548,11 +653,16 @@ jobs:
         with:
           name: dist
           path: dist/
+      # A nightly re-dispatched on the same day rebuilds the same dated version;
+      # PyPI already has those files and that is not a failure.
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: ${{ needs.meta.outputs.channel == 'nightly' }}
 
-  # ── GitHub Release (release-tree tarballs + briefcase artifacts) ──
+  # ── GitHub Release (release-tree tarballs + desktop installers) ──
   github-release:
-    needs: [meta, build-wheel, build-release-tree, build-desktop, publish-channel-manifests]
+    if: ${{ !inputs.dry_run }}
+    needs: [meta, build-wheel, build-release-tree, build-desktop-tauri, publish-channel-manifests]
     runs-on: ubuntu-latest
     steps:
       # Checkout first: the action cleans its destination directory, which
@@ -590,9 +700,26 @@ jobs:
           find all-artifacts/dist -type f -exec cp {} release/ \;
           # Release-tree tarballs + sidecars
           find all-artifacts/release-tree-* -type f -exec cp {} release/ \;
-          # Briefcase desktop bundles
+          # Desktop installers
           find all-artifacts/desktop-* -type f -exec cp {} release/ \;
+          # The shell's updater reads this from the latest stable release; a
+          # nightly carries one too so the signed path can be tried against it.
+          if compgen -G "release/*.sig" > /dev/null; then
+            python packaging/desktop/updater_manifest.py \
+              --version "${{ needs.meta.outputs.version }}" \
+              --assets release \
+              --base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${{ needs.meta.outputs.tag }}" \
+              --notes-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${{ needs.meta.outputs.tag }}" \
+              --out release/latest.json
+          fi
+          (cd release && sha256sum * > SHA256SUMS)
           ls -la release/
+          cat release/SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "release/*"
 
       # A plain commit list beats ``generate_release_notes``: that groups by
       # pull request, so direct pushes vanish and a branch collapses to one
@@ -629,6 +756,25 @@ jobs:
           # publish as prereleases, so a v2.0.0.dev6 never shows up as
           # "Latest" on the release page. Resolved once, in ``meta``.
           prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
+
+      # Nightly shells read the newest nightly's updater manifest from this
+      # fixed address.
+      - name: Publish the nightly shell manifest
+        if: needs.meta.outputs.channel == 'nightly' && hashFiles('release/latest.json') != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          tag="manifests-nightly"
+          if ! gh release view "${tag}" -R "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${tag}" \
+              --title "Channel manifest: nightly" \
+              --notes "Auto-updated channel manifest for nightly. Do not delete." \
+              --prerelease \
+              -R "${GITHUB_REPOSITORY}"
+          fi
+          cp release/latest.json shell.json
+          gh release upload "${tag}" shell.json --clobber -R "${GITHUB_REPOSITORY}"
 
       - name: Prune old nightly releases
         if: needs.meta.outputs.keep_nightlies != ''

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from kohakuterrarium.studio import nodes as nodes_mod
-from kohakuterrarium.terrarium.service import LocalTerrariumService
+from kohakuterrarium.terrarium.service.service import LocalTerrariumService
 
 # ── _Pending ────────────────────────────────────────────────
 
@@ -45,7 +45,7 @@ class TestDeploy:
 
 class TestNodeHandle:
     def test_local_runtime_no_remote_handles(self):
-        from kohakuterrarium.terrarium.engine import Terrarium
+        from kohakuterrarium.terrarium.engine.engine import Terrarium
 
         engine = Terrarium()
         try:
@@ -76,7 +76,7 @@ class TestNodeHandle:
 
 class TestNodeMap:
     def test_local_returns_handle(self):
-        from kohakuterrarium.terrarium.engine import Terrarium
+        from kohakuterrarium.terrarium.engine.engine import Terrarium
 
         engine = Terrarium()
         try:

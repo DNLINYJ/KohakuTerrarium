@@ -187,7 +187,7 @@ to receive the active service:
 from fastapi import Depends, APIRouter
 
 from kohakuterrarium.api.deps import get_service
-from kohakuterrarium.terrarium.service import TerrariumService
+from kohakuterrarium.terrarium.service.service import TerrariumService
 
 router = APIRouter()
 
@@ -217,7 +217,7 @@ yourself, the same way `api/app.py` does at boot:
 import asyncio
 
 from kohakuterrarium.laboratory._internal.host import HostEngine
-from kohakuterrarium.laboratory._internal.transport_ws import WebSocketTransport
+from kohakuterrarium.laboratory._internal.transport.ws import WebSocketTransport
 from kohakuterrarium.laboratory.config import HostConfig
 from kohakuterrarium.laboratory.adapters import (
     StudioCatalogAdapter,
@@ -315,7 +315,7 @@ For inline `AgentConfig` (no folder on disk anywhere), pass the
 config object directly; it crosses the wire as a packed dict:
 
 ```python
-from kohakuterrarium.core.config_types import AgentConfig, InputConfig, OutputConfig
+from kohakuterrarium.core.config.types import AgentConfig, InputConfig, OutputConfig
 
 cfg = AgentConfig(
     name="ephemeral",
@@ -481,7 +481,7 @@ won't appear in the host's logs.
   identity routes). See [HTTP API reference](../reference/http.md).
 - Python: `kohakuterrarium.terrarium.MultiNodeTerrariumService`
   (lab-host mode), `RemoteTerrariumService` (per-worker handle),
-  `kohakuterrarium.laboratory.ClientConnector` (the worker's
+  `kohakuterrarium.laboratory._internal.client.ClientConnector` (the worker's
   client object; drive your own embedded worker).
 - Concepts: [Laboratory](../concepts/laboratory.md): wire format,
   session sync, resume semantics, identity model.

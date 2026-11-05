@@ -13,6 +13,7 @@ vi.mock("@/components/session-v2/model/status/useUsage", async () => {
 
 import Dock from "./Dock.vue"
 import { createSessionV2, provideSessionV2 } from "@/components/session-v2/model/sessionContext"
+import { clearDockPanels, registerDockPanel } from "@/ext/dockPanels"
 
 function mountDock() {
   let ctx
@@ -36,6 +37,29 @@ beforeEach(() => {
   localStorage.clear()
 })
 
+describe("Dock extension panels", () => {
+  it("lists a docked panel, opens it as the widget and clears it with the extensions", async () => {
+    registerDockPanel({
+      key: "ext:alpha/board",
+      label: "Board",
+      icon: "i-x",
+      order: 1,
+      component: { template: "<div />" },
+    })
+    const { wrapper, ctx } = mountDock()
+    const button = wrapper.find("[data-test='v2-dock-ext:alpha/board']")
+    expect(button.exists()).toBe(true)
+    expect(button.attributes("title")).toBe("Board")
+
+    await button.trigger("click")
+    expect(ctx().widget.value).toBe("ext:alpha/board")
+
+    clearDockPanels()
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find("[data-test='v2-dock-ext:alpha/board']").exists()).toBe(false)
+  })
+})
+
 describe("Dock pill", () => {
   it("closes a widget opened while the dock is collapsed, and expands otherwise", async () => {
     localStorage.setItem("kt.v2.dock.expanded", "0")
@@ -47,5 +71,17 @@ describe("Dock pill", () => {
     await wrapper.find("[data-test='v2-dock-pill']").trigger("click")
     expect(wrapper.find("[data-test='v2-dock-pill']").exists()).toBe(false)
     expect(wrapper.find("[data-test='v2-dock-more']").exists()).toBe(true)
+  })
+})
+
+describe("Dock more menu", () => {
+  it("floats over the widget above it instead of taking layout space", async () => {
+    const { wrapper, ctx } = mountDock()
+    ctx().openWidget("usage")
+    await wrapper.find("[data-test='v2-dock-more']").trigger("click")
+    const menu = wrapper.find("[data-test='v2-dock-more-menu']")
+    expect(menu.classes()).toEqual(expect.arrayContaining(["absolute", "bottom-full"]))
+    expect(wrapper.find("[data-test='v2-dock']").classes()).toContain("relative")
+    expect(ctx().widget.value).toBe("usage")
   })
 })

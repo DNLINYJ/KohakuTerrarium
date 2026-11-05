@@ -45,7 +45,7 @@
 import { defineStore } from "pinia"
 import { computed, getCurrentInstance, markRaw, ref } from "vue"
 
-import { injectScope, registerScopeDisposer } from "@/composables/useScope"
+import { injectScope, disposeScopeStore, registerScopeDisposer } from "@/composables/useScope"
 import { getHybridPrefSync, removeHybridPref, setHybridPref } from "@/utils/uiPrefs"
 
 const USER_PRESETS_KEY = "kt.presets.user"
@@ -703,9 +703,9 @@ function _factoryFor(scope) {
     if (scope) {
       // When the macro shell tabs store closes the last tab carrying
       // this scope, free the per-attach layout store.
-      registerScopeDisposer(scope, () => {
+      registerScopeDisposer(scope, (pinia) => {
         try {
-          useFn().$dispose?.()
+          disposeScopeStore(useFn(pinia), pinia)
         } catch {
           /* swallow — disposer must not throw */
         }

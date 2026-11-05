@@ -1,0 +1,30 @@
+"""A plugin that owns {{name}}'s chat side panel."""
+
+from typing import Any
+
+from kohakuterrarium.modules.plugin.base import BasePlugin
+from kohakuterrarium.modules.ui_owner import OwnerArgumentError
+
+
+class PanelPlugin(BasePlugin):
+    """Counts LLM turns of its creature and pushes the count to the panel."""
+
+    name = "{{module}}_panel"
+
+    def __init__(self, options: dict[str, Any] | None = None) -> None:
+        super().__init__()
+        self.turns = 0
+
+    def ui_state(self) -> dict:
+        return {"turns": self.turns}
+
+    def ui_call(self, action: str, args: dict):
+        if action == "reset":
+            self.turns = 0
+            self.ui_emit("state", self.ui_state())
+            return self.ui_state()
+        raise OwnerArgumentError(f"unknown action {action!r}")
+
+    async def post_llm_call(self, messages, response, usage, **kwargs) -> None:
+        self.turns += 1
+        self.ui_emit("state", self.ui_state())

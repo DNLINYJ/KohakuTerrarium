@@ -6,10 +6,17 @@ from dataclasses import MISSING, fields
 from typing import Any
 
 from kohakuterrarium.errors import LLMNotConfiguredError
-from kohakuterrarium.core.config import AgentConfig
+from kohakuterrarium.core.config.load import AgentConfig
 from kohakuterrarium.llm.base import LLMConfig, LLMProvider
-from kohakuterrarium.llm import api_keys as _api_keys
-from kohakuterrarium.llm.profiles import (
+from kohakuterrarium.llm.profiles import api_keys as _api_keys
+from kohakuterrarium.llm.profiles.backend_registry import (
+    BUILTIN_BACKEND_TYPES,
+    INTERNAL_BACKEND_TYPES,
+    PackageBackendError,
+    load_backend_class,
+    package_backend,
+)
+from kohakuterrarium.llm.profiles.resolve import (
     LLMProfile,
     get_api_key,
     profile_to_identifier,
@@ -151,6 +158,19 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
         backend_type=profile.backend_type,
     )
 
+    if package_backend(profile.backend_type) is not None:
+        provider = load_backend_class(profile.backend_type).from_profile(profile)
+        provider._profile_max_context = profile.max_context
+        _apply_backend_native_identity(provider, profile)
+        return provider
+    if profile.backend_type and profile.backend_type not in (
+        BUILTIN_BACKEND_TYPES | INTERNAL_BACKEND_TYPES
+    ):
+        raise PackageBackendError(
+            f"Backend type {profile.backend_type!r} of profile {profile.name!r} "
+            "is not built in and no installed package provides it"
+        )
+
     if profile.backend_type == "fake_test":
         # This backend validates the full credential path without network access.
         api_key = get_api_key(profile.provider) if profile.provider else ""
@@ -175,7 +195,7 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
         return provider
 
     if profile.backend_type == "codex":
-        from kohakuterrarium.llm.codex_provider import CodexOAuthProvider
+        from kohakuterrarium.llm.codex.provider import CodexOAuthProvider
 
         # A custom base URL requires API-key auth; the default endpoint uses OAuth.
         codex_base_url = _resolved_base_url(profile)
@@ -206,7 +226,7 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
         return provider
 
     if profile.backend_type == "google-antigravity":
-        from kohakuterrarium.llm.antigravity_provider import AntigravityProvider
+        from kohakuterrarium.llm.antigravity.provider import AntigravityProvider
 
         if _api_keys._resolver is not None:
             raise ValueError("Antigravity: local_host_only")
@@ -227,7 +247,7 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
         return provider
 
     if profile.backend_type == "grok-subscription":
-        from kohakuterrarium.llm.grok_provider import GrokSubscriptionProvider
+        from kohakuterrarium.llm.grok.provider import GrokSubscriptionProvider
 
         provider = GrokSubscriptionProvider(
             model=profile.model,
@@ -282,7 +302,7 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
 
     base_url = _resolved_base_url(profile)
     if profile.backend_type == "anthropic":
-        from kohakuterrarium.llm.anthropic_provider import AnthropicProvider
+        from kohakuterrarium.llm.anthropic.provider import AnthropicProvider
 
         provider = AnthropicProvider(
             api_key=api_key,
@@ -295,7 +315,7 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
             retry_policy=retry_policy,
         )
     else:
-        from kohakuterrarium.llm.openai import OpenAIProvider
+        from kohakuterrarium.llm.openai.provider import OpenAIProvider
 
         provider = OpenAIProvider(
             api_key=api_key,
@@ -374,7 +394,7 @@ def _create_from_inline(config: AgentConfig) -> LLMProvider:
         )
 
     if config.auth_mode == "codex-oauth":
-        from kohakuterrarium.llm.codex_provider import CodexOAuthProvider
+        from kohakuterrarium.llm.codex.provider import CodexOAuthProvider
 
         provider = CodexOAuthProvider(
             model=config.model,
@@ -403,7 +423,7 @@ def _create_from_inline(config: AgentConfig) -> LLMProvider:
         )
 
     if config.auth_mode == "anthropic":
-        from kohakuterrarium.llm.anthropic_provider import AnthropicProvider
+        from kohakuterrarium.llm.anthropic.provider import AnthropicProvider
 
         return AnthropicProvider(
             api_key=api_key,
@@ -416,7 +436,7 @@ def _create_from_inline(config: AgentConfig) -> LLMProvider:
             retry_policy=config.retry_policy,
         )
 
-    from kohakuterrarium.llm.openai import OpenAIProvider
+    from kohakuterrarium.llm.openai.provider import OpenAIProvider
 
     return OpenAIProvider(
         api_key=api_key,

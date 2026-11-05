@@ -1,14 +1,16 @@
+import { snapshotContent } from "./contentSnapshot.js"
+
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
 function clonePart(part) {
-  return JSON.parse(JSON.stringify(part || {}))
+  return snapshotContent(part || {})
 }
 
 function cloneContent(content) {
   if (typeof content === "string") return content
   if (!Array.isArray(content)) return content
-  return JSON.parse(JSON.stringify(content))
+  return snapshotContent(content)
 }
 
 function partName(part) {

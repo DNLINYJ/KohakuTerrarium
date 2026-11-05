@@ -47,17 +47,33 @@ from kohakuterrarium.commands.base import (
     parse_command_args,
 )
 from kohakuterrarium.core.agent import Agent
-from kohakuterrarium.core.config_types import (
+from kohakuterrarium.core.config.types import (
     AgentConfig,
     InputConfig,
     OutputConfig,
 )
 from kohakuterrarium.core.events import create_user_input_event
-from kohakuterrarium.core.job import JobResult, JobState, JobStatus, JobType
-from kohakuterrarium.modules.tool.base import BaseTool, ExecutionMode, ToolResult
+from kohakuterrarium.core.jobs.job import JobResult, JobState, JobStatus, JobType
+from kohakuterrarium.llm.message import content_display_text
+from kohakuterrarium.skills.discovery import load_skill_from_path
 from kohakuterrarium.skills.registry import Skill
 from kohakuterrarium.testing.llm import ScriptedLLM
 from kohakuterrarium.testing.output import OutputRecorder
+from kohakuterrarium.builtins.plugins.ui_declarative.plugin import (
+    UiDeclarativePlugin,
+)
+from kohakuterrarium.builtins.tools.info import InfoTool
+from kohakuterrarium.builtins.tools.files.read import ReadTool
+from kohakuterrarium.builtins.tools.skill import SkillTool
+from kohakuterrarium.builtins.user_commands.skill import SkillUserCommand
+from kohakuterrarium.modules.plugin.base import BasePlugin
+from kohakuterrarium.modules.tool.base import (
+    BaseTool,
+    ExecutionMode,
+    ToolContext,
+    ToolResult,
+)
+from kohakuterrarium.modules.user_command.base import UserCommandContext
 
 pytestmark = pytest.mark.timeout(60)
 
@@ -90,9 +106,23 @@ class _MyEchoTool(BaseTool):
 
 # --------------------------------------------------------------------------
 # Fixtures — build a real, fully-wired Agent with ScriptedLLM as the only
-# seam. Mirrors how tests/unit/core/test_agent_real.py constructs an agent,
+# seam. Mirrors how tests/unit/core/agent/test_real.py constructs an agent,
 # patching BOTH bootstrap LLM-factory import sites.
 # --------------------------------------------------------------------------
+
+
+class _GlossaryPlugin(BasePlugin):
+    """A third-party plugin that serves its own ``gloss:<term>`` topics."""
+
+    name = "glossary"
+    doc_prefix = "gloss"
+    TERMS = {"creature": "A configured agent.", "terrarium": "The runtime engine."}
+
+    def doc_topics(self, context):
+        return list(self.TERMS)
+
+    def doc_topic(self, topic, context):
+        return self.TERMS.get(topic)
 
 
 class _ScriptHandle:
@@ -240,7 +270,9 @@ class TestCommandsIntegration:
         )
         assert "## Behavior" in joined
 
-    async def test_info_resolves_subagent_and_unknown(self, make_agent) -> None:
+    async def test_info_resolves_subagent_and_unknown(
+        self, make_agent, tmp_path
+    ) -> None:
         """One turn: a builtin *subagent* skill resolves, a runtime
         *procedural skill* resolves through the SkillRegistry fallback,
         and an unknown name produces a clean ``Not found`` command error
@@ -262,9 +294,17 @@ class TestCommandsIntegration:
                 "[/info]explore[info/]\n"
                 "[/info]deploy_routine[info/]\n"
                 "[/info]definitely_not_a_real_thing[info/]\n"
+                "[/info]ui:quiz[info/]\n"
+                "[/info]gloss:[info/]\n"
+                "[/info]gloss:ghost[info/]\n"
+                "[/info]nobody:thing[info/]\n"
                 "Done.",
             ]
         )
+        # Plugins that own a doc prefix: the built-in inline UI and a
+        # third-party glossary.
+        await agent.add_plugin(UiDeclarativePlugin())
+        await agent.add_plugin(_GlossaryPlugin())
         # Register a real procedural skill on the agent's SkillRegistry —
         # the controller wired ``skills_registry`` into the command context
         # at construction, so ``InfoCommand`` step #5 (_render_skill_info)
@@ -284,7 +324,7 @@ class TestCommandsIntegration:
         asst = _assistant_text(agent)
         # Builtin subagent skill fully resolved into the conversation.
         assert expected_explore in asst
-        assert "Investigates a codebase across many files" in asst
+        assert "A lightweight, read-only investigation in a fresh context" in asst
         # The procedural skill resolved via the SkillRegistry fallback —
         # rendered with the ``--- Skill: ---`` preamble + origin + body.
         assert "--- Skill: deploy_routine ---" in asst
@@ -296,12 +336,110 @@ class TestCommandsIntegration:
         # which the controller splices in as a bracketed command-error note.
         # No exception, no crash, the turn still completed.
         assert "[Command Error: Not found: definitely_not_a_real_thing]" in asst
+        # A plugin topic resolves through its doc prefix: props and an example.
+        assert "# ui:quiz" in asst and "- `quiz`: question*: text" in asst
+        assert '<quiz options={["O(n)", "O(log n)", "O(1)"]}' in asst
+        # An empty topic lists the topics; an unknown one errors with them.
+        assert "# gloss: topics\n\n`gloss:creature`, `gloss:terrarium`" in asst
+        assert (
+            "[Command Error: No documentation for 'gloss:ghost'. Topics: "
+            "`gloss:creature`, `gloss:terrarium`]" in asst
+        )
+        # A prefix no plugin owns falls through to the usual sources.
+        assert "[Command Error: Not found: nobody:thing]" in asst
 
         recorder: OutputRecorder = agent._recorder
         activity_kinds = recorder.activity_types()
-        # Two successes (subagent skill + procedural skill) and one error.
-        assert activity_kinds.count("command_done") == 2
-        assert activity_kinds.count("command_error") == 1
+        # Successes: subagent skill, procedural skill, ui:quiz, gloss:.
+        assert activity_kinds.count("command_done") == 4
+        assert activity_kinds.count("command_error") == 3
+
+        # The native ``info`` tool resolves the same names.
+        context = ToolContext(
+            agent_name=agent.config.name,
+            session=None,
+            working_dir=tmp_path,
+            agent=agent,
+        )
+        tool = InfoTool()
+        found = await tool.execute({"name": "gloss:terrarium"}, context)
+        assert found.output == "The runtime engine." and not found.error
+        missing = await tool.execute({"name": "gloss:ghost"}, context)
+        assert missing.error.startswith("No documentation for 'gloss:ghost'")
+        # A disabled plugin no longer owns its prefix.
+        agent.plugins.disable("glossary")
+        gone = await tool.execute({"name": "gloss:terrarium"}, context)
+        assert gone.error.startswith("No documentation found for 'gloss:terrarium'")
+
+        skill_dir = tmp_path / "global skills" / "resource-probe"
+        skill_dir.mkdir(parents=True)
+        source = skill_dir / "SKILL.md"
+        source.write_text(
+            "---\nname: resource-probe\ndescription: Read bundled references\n---\n"
+            "Read YYY.md from this skill. Read project.txt from the project.\n",
+            encoding="utf-8",
+        )
+        (skill_dir / "YYY.md").write_text("bundled reference", encoding="utf-8")
+        (tmp_path / "YYY.md").write_text("project decoy", encoding="utf-8")
+        (tmp_path / "project.txt").write_text("project input", encoding="utf-8")
+        skill = load_skill_from_path(source, origin="user")
+        agent.skills.add(skill)
+        context = ToolContext(
+            agent_name=agent.config.name,
+            agent=agent,
+            session=agent.session,
+            working_dir=tmp_path,
+        )
+        outputs = []
+        for tool in (SkillTool(), InfoTool()):
+            response = await tool.execute({"name": skill.name}, context)
+            assert not response.error
+            outputs.append(response.output)
+        shown = await SkillUserCommand().execute(
+            "show resource-probe", UserCommandContext(agent=agent)
+        )
+        assert not shown.error
+        outputs.append(shown.output)
+        slash = await agent._try_slash_command_text("/resource-probe user arguments")
+        assert not slash.error and not slash.consumed
+        outputs.append(slash.output)
+
+        for output in outputs:
+            directory_lines = [
+                line
+                for line in output.splitlines()
+                if line.startswith("Skill directory: ")
+            ]
+            assert directory_lines == [f"Skill directory: {skill_dir.resolve()}"]
+            resource = (
+                Path(directory_lines[0].removeprefix("Skill directory: ")) / "YYY.md"
+            )
+            read = await ReadTool().execute({"path": str(resource)}, context)
+            assert not read.error
+            assert "bundled reference" in read.output
+            assert "project decoy" not in read.output
+            assert "explicit project-relative paths" in output
+        project = await ReadTool().execute({"path": "project.txt"}, context)
+        assert "project input" in project.output
+        assert context.working_dir == tmp_path
+
+        agent.controller.llm = ScriptedLLM(
+            [
+                "[/skill]resource-probe[skill/]\n[/info]resource-probe[info/]\nDone.",
+                "Reference acknowledged.",
+            ]
+        )
+        await _run_turn(agent, slash.output)
+        assert (
+            _assistant_text(agent).count(f"Skill directory: {skill_dir.resolve()}") == 1
+        )
+        await _run_turn(agent, "Keep using the reference")
+        history = "\n".join(
+            content_display_text(message.get("content"))
+            for message in agent.controller.llm.last_messages
+        )
+        assert history.count(f"Skill directory: {skill_dir.resolve()}") == 3
+        assert "user arguments" in history
 
     async def test_info_resolution_order(self, make_agent) -> None:
         """Resolution order: packaged builtin skill beats the tool class;

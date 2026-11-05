@@ -77,6 +77,8 @@ same failure historically raised (`FileNotFoundError` / `ValueError` /
 - Request-shaped (used by the studio tier; the HTTP adapter maps them
   to status codes): `NotFoundError(KTError, KeyError)`,
   `InvalidRequestError(KTError, ValueError)`, `ConflictError(KTError)`.
+- Plugins: `PluginToolConflictError(ConflictError, ValueError)`: a plugin
+  contributed a tool whose name is already registered.
 
 **Strict by default.** Programmatic constructors (`Agent.build`,
 `Agent.from_path`, `Terrarium.add_creature`, `Terrarium.apply_recipe`)
@@ -166,6 +168,40 @@ finally:
     await agent.stop()
 ```
 
+### Context snapshots
+
+- `agent.capture_context() -> ContextSnapshot` is **synchronous**: do not await it.
+  It captures a detached, immutable snapshot of the effective conversation branch
+  without changing the parent. Unfinished native-tool groups are excluded so the
+  captured prefix is provider-valid.
+- `creature.capture_context() -> ContextSnapshot` and
+  `engine.capture_context(creature) -> ContextSnapshot` synchronously forward to
+  that creature's agent.
+- `ContextSnapshot` is exported from `kohakuterrarium`. `messages` and
+  `provenance` return fresh decoded containers; mutating them cannot mutate the
+  snapshot or parent. `to_dict()` / `ContextSnapshot.from_dict(data)` provide a
+  serializable round trip. `conversation()` creates a separate `Conversation`.
+- Provenance records the source agent, branch path/view, turn and branch IDs,
+  event watermark, session path, and model where available. It describes where
+  the context came from; it is not a live reference to the source branch.
+
+```python
+from kohakuterrarium import ContextSnapshot
+
+snapshot = agent.capture_context()
+serialized = snapshot.to_dict()
+restored = ContextSnapshot.from_dict(serialized)
+side_context = restored.conversation()
+```
+
+Snapshot capture itself makes no LLM call. The default-on `fork` sub-agent uses
+one when dispatched, then requires an isolated provider (a distinct instance
+returned by `fork()` for the inherited model). Providers without that isolation
+are rejected rather than reused. `/btw` exposes a retained user-audience side
+conversation; neither its question nor answer enters the parent's LLM input.
+See the [sub-agent guide](../guides/sub-agents.md#context-forks-and-btw) for
+limits, continuation, persistence, and `fork_enabled: false`.
+
 ### `@kt.tool` / `FunctionTool`
 
 Module: `kohakuterrarium.modules.tool.function` (re-exported as
@@ -246,7 +282,7 @@ async for ev in agent.run_stream("Refactor utils.py"):
 
 ## Terrarium engine
 
-Module: `kohakuterrarium.terrarium.engine` (re-exported as
+Module: `kohakuterrarium.terrarium.engine.engine` (re-exported as
 `kohakuterrarium.Terrarium`). The multi-agent runtime engine. It hosts
 every running creature in the process; a solo agent is a 1-creature
 graph.
@@ -379,7 +415,7 @@ async with kt.Terrarium(session_dir="runs/") as engine:
 
 ## Creature
 
-Module: `kohakuterrarium.terrarium.creature_host` (re-exported as
+Module: `kohakuterrarium.terrarium.creature.host` (re-exported as
 `kohakuterrarium.Creature`). The engine's handle for one running agent.
 Returned by `add_creature` / `with_creature`; not constructed directly.
 
@@ -421,7 +457,7 @@ Lifecycle / introspection:
 
 ### `SessionReader`: read-only inspection
 
-Module: `kohakuterrarium.session.reader` (re-exported as
+Module: `kohakuterrarium.session.readonly.reader` (re-exported as
 `kohakuterrarium.SessionReader`). The one-stop read-only surface over a
 `.kohakutr` file. Opens via `SessionStore.open_readonly`, so reading never
 bumps `last_active` or flips `status`. Context-manager friendly.

@@ -18,8 +18,8 @@ from kohakuterrarium.studio.persistence.session_index import (
     reconcile as reconcile_mod,
 )
 from kohakuterrarium.studio.sessions import lifecycle
-from kohakuterrarium.terrarium.engine import Terrarium
-from kohakuterrarium.terrarium.service import LocalTerrariumService
+from kohakuterrarium.terrarium.engine.engine import Terrarium
+from kohakuterrarium.terrarium.service.service import LocalTerrariumService
 from kohakuterrarium.testing.terrarium import TestTerrariumBuilder
 
 

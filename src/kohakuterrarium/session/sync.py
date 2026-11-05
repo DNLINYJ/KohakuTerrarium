@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from kohakuterrarium.laboratory._internal.app import AppMessage
+from kohakuterrarium.laboratory._internal.app.app import AppMessage
 from kohakuterrarium.laboratory.protocols import LabNotifier, LabRegistrar
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.utils.logging import get_logger
@@ -274,11 +274,10 @@ class SessionMirrorWriter:
             # SessionStore re-stamps the event type; preserve all other payload data.
             payload = {k: v for k, v in data.items() if k not in ("type",)}
             await store.run(store.append_event, agent, event_type, payload)
-            # Stamp origin only after persistence. Plain assignment avoids the
-            # metadata proxy's byte-coercing ``setdefault`` implementation.
+            # Stamp origin only after persistence; the first stamp wins.
             source_node = getattr(msg, "sender_node", "") or body.get("node_id", "")
-            if source_node and "on_node" not in store.meta:
-                store.meta["on_node"] = source_node
+            if source_node:
+                store.meta.setdefault("on_node", source_node)
         except Exception:  # pragma: no cover - mirroring must not affect the source
             logger.exception(
                 "session-sync mirror: append failed for %s/%s", session_id, key

@@ -23,6 +23,7 @@ class TUIInput(BaseInputModule):
 
     # Textual exclusively owns terminal input/output while this module is active.
     _supports_raw_io = False
+    supports_busy_commands = True
 
     def __init__(
         self,
@@ -36,6 +37,7 @@ class TUIInput(BaseInputModule):
         self._tui: TUISession | None = None
         self._app_task: asyncio.Task | None = None
         self._exit_requested = False
+        self._input_closed = False
 
     def set_user_commands(self, commands: dict, context: Any) -> None:
         """Register commands and refresh live completion hints."""
@@ -67,6 +69,7 @@ class TUIInput(BaseInputModule):
     async def try_user_command(self, text: str) -> UserCommandResult | None:
         """Route terminal-conflicting or picker-oriented commands to TUI modals."""
         if text.startswith("/") and self._user_commands:
+            await self.wait_for_command_slot(text)
             name, args = parse_slash_command(text)
             canonical = self._command_alias_map.get(name, name)
             if canonical == "module":
@@ -151,10 +154,17 @@ class TUIInput(BaseInputModule):
 
         return None
 
+    async def present_command_result(
+        self, result: UserCommandResult, name: str
+    ) -> None:
+        text = result.error or result.output
+        if self._tui and text:
+            self._tui.add_system_notice(text, command=name, error=bool(result.error))
+
     @property
     def exit_requested(self) -> bool:
         """Return whether the user requested exit."""
-        return self._exit_requested
+        return self._exit_requested or self._input_closed
 
     async def _on_start(self) -> None:
         """Initialize the session and launch its Textual application."""
@@ -204,7 +214,7 @@ class TUIInput(BaseInputModule):
 
             # Empty input is the app/session shutdown sentinel.
             if not text:
-                self._exit_requested = True
+                self._input_closed = True
                 return None
 
             # Plain exit commands remain available when user commands are absent.
@@ -218,6 +228,10 @@ class TUIInput(BaseInputModule):
                 return None
 
             if text.startswith("/"):
+                if self.defer_command(text):
+                    event = create_user_input_event(text, source="tui")
+                    event.context["deferred_input_command"] = True
+                    return event
                 cmd_name = (
                     text.lstrip("/").split()[0].lower() if text.strip("/") else ""
                 )
@@ -239,7 +253,7 @@ class TUIInput(BaseInputModule):
             return create_user_input_event(text, source="tui")
 
         except (EOFError, asyncio.CancelledError):
-            self._exit_requested = True
+            self._input_closed = True
             return None
         except Exception as e:
             logger.error("Error reading TUI input", error=str(e))

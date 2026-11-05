@@ -1,7 +1,5 @@
 """Cancellation edges for mutation workers, bundle publish, and source acquire."""
 
-from __future__ import annotations
-
 import asyncio
 import os
 import threading
@@ -9,14 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from kohakuterrarium.laboratory.adapters import terrarium_file_mutations as mut
-from kohakuterrarium.laboratory.adapters import terrarium_files as files_mod
-from kohakuterrarium.laboratory.adapters.terrarium_file_mutations import (
+from kohakuterrarium.laboratory.adapters.terrarium import file_mutations as mut
+from kohakuterrarium.laboratory.adapters.terrarium import files as files_mod
+from kohakuterrarium.laboratory.adapters.terrarium.file_mutations import (
     replace_enrolled,
     run_mutation_worker,
 )
-from kohakuterrarium.session import file_mutation as worker
-from kohakuterrarium.session.resource_gate import (
+from kohakuterrarium.session.occupancy import mutation as worker
+from kohakuterrarium.session.occupancy.gate import (
     GATE,
     ResourceReleaseError,
     try_fast,

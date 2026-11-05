@@ -70,11 +70,19 @@ class TestCatalogBuiltins:
         # description comes from the tool class, not a hardcoded string.
         assert bash["description"]
 
-    def test_list_subagents_contains_coordinator(self):
+    def test_list_subagents_contains_inspection_and_service_presets(self):
         s = Studio()
         subs = s.catalog.builtins.list("subagents")
         names = {x["name"] for x in subs}
-        assert "coordinator" in names
+        assert names == {
+            "fork",
+            "explore",
+            "critic",
+            "response",
+            "summarize",
+            "memory_read",
+            "memory_write",
+        }
         assert all(x["source"] == "builtin" for x in subs)
 
     def test_list_none_unions_all_kinds(self):

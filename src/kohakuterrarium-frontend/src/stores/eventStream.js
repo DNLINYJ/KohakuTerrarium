@@ -13,10 +13,10 @@
  * each other's loaded events / cursor.
  */
 
-import { defineStore } from "pinia"
+import { defineStore, getActivePinia } from "pinia"
 import { getCurrentInstance } from "vue"
 
-import { injectScope, registerScopeDisposer } from "@/composables/useScope"
+import { injectScope, disposeScopeStore, registerScopeDisposer } from "@/composables/useScope"
 import { sessionAPI } from "@/utils/api"
 
 const _eventStreamOptions = {
@@ -111,6 +111,7 @@ const _eventStreamOptions = {
 }
 
 const _eventStreamFactories = new Map()
+const _ephemeralInstances = new Map()
 
 function _factoryFor(scope, registerWithScope = true) {
   const key = scope || "default"
@@ -119,13 +120,15 @@ function _factoryFor(scope, registerWithScope = true) {
     useFn = defineStore(`eventStream:${key}`, _eventStreamOptions)
     _eventStreamFactories.set(key, useFn)
     if (scope && registerWithScope) {
-      registerScopeDisposer(scope, () => {
+      registerScopeDisposer(scope, (pinia) => {
         try {
-          useFn().$dispose?.()
+          useFn(pinia).clear()
+          disposeScopeStore(useFn(pinia), pinia)
         } catch {
           /* swallow */
         }
         _eventStreamFactories.delete(key)
+        _ephemeralInstances.delete(key)
       })
     }
   }
@@ -139,7 +142,10 @@ export function useEventStreamStore(scope) {
 }
 
 export function useEphemeralEventStreamStore(scope) {
-  return _factoryFor(scope, false)()
+  const pinia = getActivePinia()
+  const store = _factoryFor(scope, false)(pinia)
+  _ephemeralInstances.set(scope || "default", { store, pinia })
+  return store
 }
 
 export function disposeEventStreamStore(scope) {
@@ -147,9 +153,14 @@ export function disposeEventStreamStore(scope) {
   const useFn = _eventStreamFactories.get(key)
   if (!useFn) return
   try {
-    useFn().$dispose?.()
+    const instance = _ephemeralInstances.get(key)
+    const pinia = instance?.pinia || getActivePinia()
+    const store = instance?.store || useFn(pinia)
+    store.clear()
+    disposeScopeStore(store, pinia)
   } catch {
     /* swallow */
   }
   _eventStreamFactories.delete(key)
+  _ephemeralInstances.delete(key)
 }

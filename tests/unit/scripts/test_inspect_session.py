@@ -9,8 +9,9 @@ from contextlib import closing
 from pathlib import Path
 
 import pytest
+from kohakuvault import KVault
 
-from kohakuterrarium.session.resource_gate import GATE, ResourceReleaseError, try_fast
+from kohakuterrarium.session.occupancy.gate import GATE, ResourceReleaseError, try_fast
 from kohakuterrarium.session.store import SessionStore
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -154,14 +155,22 @@ def forbid_history_values(monkeypatch, store):
 @pytest.fixture
 def closed_inspection_source(tmp_path):
     path = tmp_path / "inspect.kohakutr"
-    with closing(SessionStore.open_readonly(path)) as store:
+    store = SessionStore(path)
+    try:
         store.init_meta("inspect", "agent", "config", "", ["a"])
         store.append_event("a", "text", {"content": "inspectionneedle"})
         store.save_channel_message("tasks", {"sender": "a", "content": "task detail"})
         store.save_conversation("a", [{"role": "assistant", "content": "answer"}])
-        store.meta["status"] = "completed"
-        store.meta["last_active"] = "original-recency"
-        assert store.state.get("counters:max_event_id") is None
+    finally:
+        store.close(update_status=False)
+    # Legacy files carry no event counters.
+    with closing(KVault(str(path), table="state")) as state:
+        state.delete("counters:max_event_id")
+        state.delete("counters:exact_event_id")
+    with closing(KVault(str(path), table="meta")) as meta:
+        meta.enable_auto_pack()
+        meta["status"] = "completed"
+        meta["last_active"] = "original-recency"
     return path
 
 
@@ -409,8 +418,8 @@ class TestStoredSummaryCounts:
         before = _business_rows(path)
 
         class ObservedStore(SessionStore):
-            def __init__(self, path):
-                super().__init__(path)
+            def __init__(self, path, **kwargs):
+                super().__init__(path, **kwargs)
                 opened.append(self)
                 forbid_history_values(monkeypatch, self)
 

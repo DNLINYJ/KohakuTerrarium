@@ -17,7 +17,7 @@ class TestListBuiltinToolEntries:
         bash = by_name["bash"]
         assert bash["source"] == "builtin"
         assert bash["type"] == "builtin"
-        assert bash["execution_mode"] in ("direct", "background", "stateful")
+        assert bash["execution_mode"] == "direct"
         assert isinstance(bash["needs_context"], bool)
         assert isinstance(bash["has_doc"], bool)
         # Every entry has a non-empty name + a description string.
@@ -133,7 +133,7 @@ class TestListBuiltinDriveRegistrationEntries:
         # The hardcoded builtin catalog entries (kept terrarium-free for the CLI)
         # must not drift from the authoritative ``*.descriptor()``.
         from kohakuterrarium.terrarium.drive.goal import GoalDriveRegistration
-        from kohakuterrarium.terrarium.drive.registration import (
+        from kohakuterrarium.terrarium.drive.registration.registration import (
             GenericDriveRegistration,
         )
 

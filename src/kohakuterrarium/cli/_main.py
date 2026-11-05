@@ -17,16 +17,20 @@ from kohakuterrarium.cli._aliases import (
     dispatch_client_alias,
     dispatch_host_alias,
 )
-from kohakuterrarium.cli.admin import add_admin_subparser, admin_cli
+from kohakuterrarium.cli.admin.admin import add_admin_subparser, admin_cli
 from kohakuterrarium.cli.auth import login_cli
-from kohakuterrarium.cli.config import add_config_subparser, config_cli
+from kohakuterrarium.cli.config.config import add_config_subparser, config_cli
 from kohakuterrarium.cli.doctor import add_doctor_subparser, dispatch_doctor
 from kohakuterrarium.cli.drive import add_drive_subparser, drive_cli
-from kohakuterrarium.cli.extension import extension_info_cli, extension_list_cli
-from kohakuterrarium.cli.identity_mcp import list_for_agent_cli as mcp_list_cli
+from kohakuterrarium.cli.extension.extension import (
+    extension_info_cli,
+    extension_list_cli,
+    extension_new_cli,
+)
+from kohakuterrarium.cli.identity.mcp import list_for_agent_cli as mcp_list_cli
 from kohakuterrarium.cli.lab_client import add_lab_client_subparser, lab_client_cli
 from kohakuterrarium.cli.marketplace import marketplace_cli
-from kohakuterrarium.cli.mcp_serve import add_mcp_serve_subparser, mcp_serve_cli
+from kohakuterrarium.cli.mcp.serve import add_mcp_serve_subparser, mcp_serve_cli
 from kohakuterrarium.cli.memory import embedding_cli, search_cli
 from kohakuterrarium.cli.model import model_cli
 from kohakuterrarium.cli.packages import (
@@ -39,13 +43,14 @@ from kohakuterrarium.cli.packages import (
 )
 from kohakuterrarium.cli.resume import resume_cli
 from kohakuterrarium.cli.run import resolve_then_run, run_agent_cli
-from kohakuterrarium.cli.select_args import add_run_like_args
+from kohakuterrarium.cli.select.args import add_run_like_args
 from kohakuterrarium.cli.self_update import add_self_update_subparser, self_update_cli
+from kohakuterrarium.cli.open_in_app import add_open_subparser, open_dispatch
 from kohakuterrarium.cli.shims import add_shims_subparser, shims_cli
 from kohakuterrarium.cli.serve import add_serve_subparser, serve_cli
 from kohakuterrarium.cli.service import add_service_subparser, service_cli
 from kohakuterrarium.cli.version import format_version_report
-from kohakuterrarium.serving.desktop import launch_desktop_app
+from kohakuterrarium.serving.desktop.desktop import launch_desktop_app
 from kohakuterrarium.serving.web import run_web_server
 from kohakuterrarium.utils.fd_limit import raise_fd_limit
 from kohakuterrarium.utils.logging import configure_utf8_stdio
@@ -166,6 +171,7 @@ def _build_parser() -> argparse.ArgumentParser:
     add_run_like_args(tui_parser)
 
     add_shims_subparser(subparsers)
+    add_open_subparser(subparsers)
     add_mcp_serve_subparser(subparsers)
 
     list_parser = subparsers.add_parser("list", help="List available agents")
@@ -372,6 +378,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "info", help="Show details of a specific package"
     )
     ext_info_parser.add_argument("name", help="Package name")
+    ext_new_parser = ext_sub.add_parser("new", help="Scaffold a new package")
+    ext_new_parser.add_argument("name", help="Package name")
+    ext_new_parser.add_argument(
+        "--ui", action="store_true", help="Include dashboard UI (settings + panel)"
+    )
+    ext_new_parser.add_argument("--dir", default=".", help="Parent directory")
 
     # Marketplace browsing and installation share the same configured sources.
     mp_parser = subparsers.add_parser(
@@ -558,6 +570,8 @@ def _dispatch_extension(args: argparse.Namespace) -> int:
         return extension_list_cli()
     elif sub == "info":
         return extension_info_cli(args.name)
+    elif sub == "new":
+        return extension_new_cli(args.name, ui=args.ui, directory=args.dir)
     else:
         parser = _build_parser()
         parser.parse_args(["extension", "--help"])
@@ -580,6 +594,7 @@ COMMANDS: dict[str, callable] = {
     "cli": _dispatch_cli_mode,
     "tui": _dispatch_tui_mode,
     "shims": shims_cli,
+    "open": open_dispatch,
     "resume": _dispatch_resume,
     "doctor": dispatch_doctor,
     "list": lambda args: list_cli(args.path),

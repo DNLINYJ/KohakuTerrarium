@@ -4,7 +4,7 @@ from pathlib import Path
 
 from kohakuterrarium.prompt.template import render_template_safe
 
-_TEMPLATE = Path(__file__).with_name("_base_prompt.md")
+_PROMPT_DIR = Path(__file__).parent
 
 
 def render_subagent_prompt(
@@ -14,9 +14,10 @@ def render_subagent_prompt(
     extra_principles: str,
     response_shape: str,
     can_modify: bool,
+    template_name: str = "_base_prompt.md",
 ) -> str:
     """Render the shared built-in sub-agent prompt template."""
-    template = _TEMPLATE.read_text(encoding="utf-8")
+    template = (_PROMPT_DIR / template_name).read_text(encoding="utf-8")
     return render_template_safe(
         template,
         agent_name=agent_name,

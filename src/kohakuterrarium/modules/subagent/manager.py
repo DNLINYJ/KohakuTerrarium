@@ -1,28 +1,33 @@
 """Manage task and interactive sub-agent lifecycle, jobs, and results."""
 
 import asyncio
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
 
 from kohakuterrarium.core.budget import IterationBudget
-from kohakuterrarium.core.job import JobState, JobStatus, JobStore, JobType
-from kohakuterrarium.core.job import generate_job_id
+from kohakuterrarium.core.conversation.context_snapshot import ContextSnapshot
+from kohakuterrarium.modules.subagent.side import SideConversationMixin, side_title
+from kohakuterrarium.core.jobs.job import JobState, JobStatus, JobStore, JobType
+from kohakuterrarium.core.jobs.job import generate_job_id
 from kohakuterrarium.core.loader import ModuleLoader
 from kohakuterrarium.core.registry import Registry
 from kohakuterrarium.llm.base import LLMProvider
 from kohakuterrarium.modules.subagent.base import SubAgent, SubAgentJob, SubAgentResult
 from kohakuterrarium.modules.subagent.config import SubAgentConfig, SubAgentInfo
+from kohakuterrarium.modules.subagent.fork_policy import ForkToolPolicy
 from kohakuterrarium.modules.subagent.runtime_builders import (
     build_compact_manager,
     build_plugin_manager,
+    fork_tool_context,
     load_and_wrap_plugins,
     resolve_llm,
 )
-from kohakuterrarium.modules.subagent.interactive import (
+from kohakuterrarium.modules.subagent.interactive.interactive import (
     InteractiveOutput,
     InteractiveSubAgent,
 )
-from kohakuterrarium.modules.subagent.interactive_mgr import InteractiveManagerMixin
+from kohakuterrarium.modules.subagent.interactive.manager import InteractiveManagerMixin
 from kohakuterrarium.modules.subagent.model_resolve import release_forked_llm
 from kohakuterrarium.parsing.events import SubAgentCallEvent
 from kohakuterrarium.utils.logging import get_logger
@@ -30,7 +35,7 @@ from kohakuterrarium.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-class SubAgentManager(InteractiveManagerMixin):
+class SubAgentManager(SideConversationMixin, InteractiveManagerMixin):
     """Register, spawn, track, and clean up task and interactive sub-agents."""
 
     def __init__(
@@ -58,6 +63,9 @@ class SubAgentManager(InteractiveManagerMixin):
         self._on_complete: Callable[[Any], None] | None = None
         self._on_tool_activity: Callable[[str, str, str, str], None] | None = None
         self._parent_executor: Any = None
+        self._host_agent: Any = None
+        self._capture_context: Any = None
+        self._side_locks: dict[str, asyncio.Lock] = {}
         # Parent post-run hooks execute at result collection without rebinding jobs.
         self._parent_plugins: Any = None
         # The legacy iteration budget is separate from plugin-owned budget state.
@@ -117,13 +125,21 @@ class SubAgentManager(InteractiveManagerMixin):
             return SubAgentInfo.from_config(config)
         return None
 
-    def get_subagents_prompt(self) -> str:
-        """Generate sub-agents section for system prompt."""
-        if not self._configs:
+    def get_subagents_prompt(self, visible: Callable[[str], bool] | None = None) -> str:
+        """Generate sub-agents section for system prompt.
+
+        ``visible`` filters sub-agents by name; the section is empty when none pass.
+        """
+        configs = [
+            (name, config)
+            for name, config in self._configs.items()
+            if visible is None or visible(name)
+        ]
+        if not configs:
             return ""
 
         lines = ["## Available Sub-Agents", ""]
-        for name, config in self._configs.items():
+        for name, config in configs:
             info = SubAgentInfo.from_config(config)
             lines.append(info.to_prompt_line())
 
@@ -141,6 +157,12 @@ class SubAgentManager(InteractiveManagerMixin):
         task: str,
         job_id: str | None = None,
         background: bool = True,
+        *,
+        snapshot: ContextSnapshot | None = None,
+        audience: str = "controller",
+        continuation: bool = False,
+        run_index: int | None = None,
+        inherited_message_count: int | None = None,
     ) -> str:
         """Spawn a registered sub-agent and optionally await its completion."""
         config = self._configs.get(name)
@@ -150,12 +172,26 @@ class SubAgentManager(InteractiveManagerMixin):
         if job_id is None:
             job_id = generate_job_id(f"agent_{name}")
 
+        if audience not in {"controller", "user"}:
+            raise ValueError("Invalid sub-agent audience")
+        if config.fork_context and snapshot is None:
+            if self._capture_context is None:
+                raise ValueError("Parent context capture is unavailable")
+            snapshot = self._capture_context()
+        if audience == "user":
+            config = deepcopy(config)
+            config.budget_inherit = False
+            config.budget_allocation = None
         effective_tool_format = config.tool_format or self._tool_format
 
         plugin_manager = build_plugin_manager(
             config, self._loader, self._default_plugin_specs, strict=self._strict
         )
         llm = resolve_llm(self.llm, config)
+        if snapshot is not None and llm is self.llm:
+            raise ValueError(
+                "This provider cannot create an isolated context fork; implement fork()"
+            )
         compact_manager = build_compact_manager(config, llm)
 
         subagent = SubAgent(
@@ -166,9 +202,16 @@ class SubAgentManager(InteractiveManagerMixin):
             tool_format=effective_tool_format,
             plugin_manager=plugin_manager,
             compact_manager=compact_manager,
+            snapshot=snapshot,
+            audience=audience,
+            continuation=continuation,
         )
+        if inherited_message_count is not None:
+            subagent._inherited_message_count = inherited_message_count
 
         subagent._job_id = job_id
+        if snapshot is not None:
+            subagent._fork_policy = ForkToolPolicy(self._parent_plugins)
 
         # Preserve the legacy shared-budget contract when configured.
         subagent.iteration_budget = self._resolve_child_budget(config)
@@ -188,7 +231,7 @@ class SubAgentManager(InteractiveManagerMixin):
                 await llm.close()
             raise
 
-        if self._on_tool_activity:
+        if self._on_tool_activity and audience == "controller":
             sa_name = name
             sa_job_id = job_id
             parent_cb = self._on_tool_activity
@@ -199,15 +242,25 @@ class SubAgentManager(InteractiveManagerMixin):
             subagent.on_tool_activity = _forward_activity
 
         if self._parent_executor:
-            subagent._build_tool_context = self._parent_executor._build_tool_context
+            builder = self._parent_executor._build_tool_context
+            subagent._build_tool_context = (
+                fork_tool_context(builder, subagent)
+                if snapshot is not None
+                else builder
+            )
 
         if self._session_store:
             subagent._session_store = self._session_store
             subagent._parent_name = self._parent_name
-            subagent._run_index = self._session_store.next_subagent_run(
-                self._parent_name, name
+            subagent._run_index = (
+                run_index
+                if run_index is not None
+                else self._session_store.next_subagent_run(self._parent_name, name)
             )
 
+        if audience == "user":
+            subagent._side_title = side_title(task)
+            subagent.on_checkpoint = lambda: self._persist_side(job_id, subagent)
         job = SubAgentJob(subagent, job_id)
         self._jobs[job_id] = job
 
@@ -296,7 +349,9 @@ class SubAgentManager(InteractiveManagerMixin):
         try:
             result = await job.run(task)
             # Result-site hooks may transform output without mutating shared job methods.
-            pm = self._parent_plugins
+            pm = (
+                self._parent_plugins if job.subagent._audience == "controller" else None
+            )
             if pm is not None:
                 try:
                     rewritten = await pm.run_pre_hooks(
@@ -324,17 +379,20 @@ class SubAgentManager(InteractiveManagerMixin):
                 state = JobState.DONE
             else:
                 state = JobState.ERROR
+            public_output = (
+                result.output if job.subagent._audience == "controller" else ""
+            )
             self.job_store.update_status(
                 job_id,
                 state=state,
-                output_lines=result.output.count("\n") + 1 if result.output else 0,
-                output_bytes=len(result.output),
-                preview=result.output[:200] if result.output else "",
-                error=result.error,
+                output_lines=public_output.count("\n") + 1 if public_output else 0,
+                output_bytes=len(public_output),
+                preview=public_output[:200],
+                error=result.error if job.subagent._audience == "controller" else None,
             )
 
             job_result = job.to_job_result()
-            if job_result:
+            if job_result and job.subagent._audience == "controller":
                 self.job_store.store_result(job_result)
 
             logger.info(
@@ -374,14 +432,30 @@ class SubAgentManager(InteractiveManagerMixin):
             self.job_store.update_status(
                 job_id,
                 state=JobState.ERROR,
-                error=str(e),
+                error=(
+                    str(e)
+                    if job.subagent._audience == "controller"
+                    else "Side conversation failed"
+                ),
             )
             return result
 
         finally:
+            if job.subagent._audience == "user":
+                try:
+                    self._finish_side(job_id, job.subagent, self._results.get(job_id))
+                except Exception as exc:
+                    logger.error(
+                        "Side conversation delivery failed",
+                        job_id=job_id,
+                        error=str(exc),
+                    )
             if hasattr(job.subagent, "plugins") and job.subagent.plugins:
                 await job.subagent.plugins.unload_all()
-            await release_forked_llm(job.subagent.llm)
+            if job.subagent._snapshot is not None:
+                await job.subagent.llm.close()
+            else:
+                await release_forked_llm(job.subagent.llm)
 
     async def wait_for(
         self,

@@ -6,18 +6,25 @@ into the session store, declarative ``applies_to`` gating works, and
 option set/get round-trips through validation.
 """
 
+import types
+from contextlib import closing
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
 
+from kohakuterrarium.core.conversation.pinned import PinnedContext
+from kohakuterrarium.core.conversation.pinned import state_key as pinned_state_key
 from kohakuterrarium.modules.plugin.base import (
     BasePlugin,
     PluginBlockError,
     PluginContext,
     ToolVisibility,
 )
+from kohakuterrarium.modules.output.router.router import OutputRouter
 from kohakuterrarium.modules.plugin.option_validation import PluginOptionError
+from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.testing.output import OutputRecorder
 
 
 class _FakeStore:
@@ -76,6 +83,11 @@ class TestPluginContextNoAgent:
     def test_inject_message_before_llm_noop_without_controller(self):
         ctx = PluginContext(agent_name="a")
         ctx.inject_message_before_llm("user", "hi")  # must not raise
+
+    def test_pin_message_noop_without_agent(self):
+        ctx = PluginContext(agent_name="a")
+        assert ctx.pin_message("persona", "user", "hi") is False
+        assert ctx.unpin_message("persona") is False
 
     def test_get_state_returns_none_without_store(self):
         ctx = PluginContext(agent_name="a", _plugin_name="p")
@@ -147,19 +159,74 @@ class TestPluginContextWithAgent:
             {"role": "system", "content": "second"},
         ]
 
+    def test_pin_message_reaches_the_controller_and_the_store(self):
+        store = _FakeStore()
+        ctrl = types.SimpleNamespace(pinned=PinnedContext())
+        agent = _FakeAgent(
+            controller=ctrl,
+            session_store=store,
+            config=types.SimpleNamespace(name="a"),
+        )
+        ctx = PluginContext(agent_name="a", _host_agent=agent)
+        assert ctx.pin_message("persona", "user", "look") is True
+        assert [k for k, _ in ctrl.pinned.pinned()] == ["persona"]
+        assert store.state[pinned_state_key("a")][0]["key"] == "persona"
+        assert ctx.unpin_message("persona") is True
+        assert len(ctrl.pinned) == 0 and store.state[pinned_state_key("a")] == []
+
     def test_plugin_scoped_state_is_namespaced(self):
-        # Contract: get/set_state writes under plugin:<name>:<key>.
         store = _FakeStore()
         agent = _FakeAgent(session_store=store)
         ctx = PluginContext(agent_name="a", _host_agent=agent, _plugin_name="budget")
         ctx.set_state("turns", 7)
-        assert store.state == {"plugin:budget:turns": 7}
         assert ctx.get_state("turns") == 7
         # A different plugin name does NOT see it.
         other = PluginContext(
             agent_name="a", _host_agent=agent, _plugin_name="permgate"
         )
         assert other.get_state("turns") is None
+
+    def test_creature_state_is_independent_and_survives_reopen(self, tmp_path):
+        path = tmp_path / "plugins.kohakutr"
+        with closing(SessionStore(path)) as store:
+            host = _FakeAgent(session_store=store)
+            a = PluginContext(agent_name="a", _host_agent=host, _plugin_name="budget")
+            b = PluginContext(agent_name="b", _host_agent=host, _plugin_name="budget")
+            a.set_state("turns", 7)
+            b.set_state("turns", 2)
+            assert a.get_state("turns") == 7
+            assert b.get_state("turns") == 2
+            # Separators inside names must not alias another identity.
+            x = PluginContext(agent_name="a:b", _host_agent=host, _plugin_name="c")
+            y = PluginContext(agent_name="a", _host_agent=host, _plugin_name="b:c")
+            x.set_state("key", "x")
+            y.set_state("key", "y")
+            assert x.get_state("key") == "x"
+        with closing(SessionStore(path)) as reopened:
+            host.session_store = reopened
+            assert a.get_state("turns") == 7
+            assert b.get_state("turns") == 2
+            assert x.get_state("key") == "x"
+            assert y.get_state("key") == "y"
+
+    def test_legacy_fallback_does_not_share_new_writes_or_hide_none(self, tmp_path):
+        with closing(SessionStore(tmp_path / "legacy.kohakutr")) as store:
+            store.state["plugin:budget:turns"] = 7
+            host = _FakeAgent(session_store=store)
+            a = PluginContext(agent_name="a", _host_agent=host, _plugin_name="budget")
+            b = PluginContext(agent_name="b", _host_agent=host, _plugin_name="budget")
+            assert a.get_state("turns") == b.get_state("turns") == 7
+            a.set_state("turns", None)
+            assert a.get_state("turns") is None
+            assert b.get_state("turns") == 7
+            b.set_state("turns", 9)
+            assert a.get_state("turns") is None
+            assert store.state["plugin:budget:turns"] == 7
+            unnamed = PluginContext(_host_agent=host, _plugin_name="budget")
+            assert unnamed.get_state("turns") == 7
+            unnamed.set_state("turns", 11)
+            assert store.state["plugin:budget:turns"] == 11
+            assert b.get_state("turns") == 9
 
     def test_spawn_child_agent_delegates_to_helper(self):
         calls = []
@@ -223,6 +290,15 @@ class TestPluginContextEmit:
         ctx = PluginContext(agent_name="a", _host_agent=agent)
         result = await ctx.emit_and_wait(object(), timeout_s=5.0)
         assert result == ("reply", 5.0)
+
+    def test_widgets_is_the_routers_service_or_none(self):
+        router = OutputRouter(OutputRecorder())
+        ctx = PluginContext(
+            agent_name="a", _host_agent=_FakeAgent(output_router=router)
+        )
+        assert ctx.widgets is router.widgets
+        assert PluginContext(agent_name="a").widgets is None
+        assert PluginContext(agent_name="a", _host_agent=_FakeAgent()).widgets is None
 
 
 # ── BasePlugin: gating ─────────────────────────────────────────────

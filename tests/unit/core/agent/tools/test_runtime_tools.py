@@ -1,0 +1,585 @@
+"""Unit tests for :mod:`kohakuterrarium.core.agent.tools.runtime_tools`."""
+
+import asyncio
+import types
+from unittest.mock import AsyncMock
+
+import pytest
+
+from kohakuterrarium.core.agent.turn.event_loop import AgentEventLoopMixin
+from kohakuterrarium.core.agent.tools.runtime_tools import (
+    AgentRuntimeToolsMixin,
+    _make_job_label,
+)
+from kohakuterrarium.core.event_inbox import EventInbox
+from kohakuterrarium.core.events import EventType, TriggerEvent
+from kohakuterrarium.llm.message import FilePart, ImagePart, TextPart
+from kohakuterrarium.session.output.output import SessionOutput
+from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.parsing.events import (
+    CommandResultEvent,
+    SubAgentCallEvent,
+    ToolCallEvent,
+)
+
+# ── stubs ────────────────────────────────────────────────────────
+
+
+class _Router:
+    def __init__(self):
+        self.activity_calls: list[tuple] = []
+        self.flush_calls = 0
+        self.reset_calls = 0
+        self.default_output = types.SimpleNamespace(reset=self._do_reset)
+
+    def _do_reset(self):
+        self.reset_calls += 1
+
+    def notify_activity(self, kind, msg, metadata=None):
+        self.activity_calls.append((kind, msg, metadata))
+
+    def reset(self):
+        self.reset_calls += 1
+
+    async def flush(self):
+        self.flush_calls += 1
+
+
+class _Mgr:
+    def __init__(self):
+        self.spawn = AsyncMock(return_value=("agent_123", True))
+
+    async def spawn_from_event(self, event):
+        return await self.spawn(event)
+
+
+def _make_mixin(*, running=True, notify_meta=None):
+    class _Agent(AgentRuntimeToolsMixin, AgentEventLoopMixin):
+        pass
+
+    a = _Agent()
+    a._direct_job_meta = dict(notify_meta or {})
+    a._bg_controller_notify = {}
+    a.output_router = _Router()
+    a.subagent_manager = _Mgr()
+    a.config = types.SimpleNamespace(name="alice")
+    a._turn_usage_accum = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "cached_tokens": 0,
+        "total_tokens": 0,
+    }
+    a._running = running
+    a._event_inbox = EventInbox()
+    return a
+
+
+# ── _make_job_label ──────────────────────────────────────────────
+
+
+class TestMakeJobLabel:
+    def test_with_id(self):
+        tool, label = _make_job_label("bash_abcdef123456")
+        assert tool == "bash"
+        assert label == "bash[abcdef]"
+
+    def test_no_underscore(self):
+        tool, label = _make_job_label("bashonly")
+        assert tool == "bashonly"
+        assert label == "bashonly"
+
+
+# ── _notify_command_result ───────────────────────────────────────
+
+
+class TestNotifyCommandResult:
+    def test_success(self):
+        a = _make_mixin()
+        evt = CommandResultEvent(command="read", content="OK", error=None)
+        a._notify_command_result(evt)
+        kind, msg, _ = a.output_router.activity_calls[0]
+        assert kind == "command_done"
+        assert "read" in msg
+
+    def test_error(self):
+        a = _make_mixin()
+        evt = CommandResultEvent(command="read", content="", error="bad arg")
+        a._notify_command_result(evt)
+        kind, msg, _ = a.output_router.activity_calls[0]
+        assert kind == "command_error"
+        assert "bad arg" in msg
+
+
+# ── _notify_tool_start ───────────────────────────────────────────
+
+
+class TestNotifyToolStart:
+    def test_direct_label(self):
+        a = _make_mixin()
+        evt = ToolCallEvent(name="bash", args={"command": "ls"}, raw="")
+        a._notify_tool_start(evt, "bash_abc123", is_direct=True)
+        kind, msg, meta = a.output_router.activity_calls[0]
+        assert kind == "tool_start"
+        assert "bash[abc123]" in msg
+        # No "(bg)" tag for direct tools.
+        assert "(bg)" not in msg
+        assert meta["background"] is False
+
+    def test_background_label_and_underscore_filter(self):
+        a = _make_mixin()
+        evt = ToolCallEvent(
+            name="bash",
+            args={"command": "ls", "_hidden": "x"},
+            raw="",
+        )
+        a._notify_tool_start(evt, "bash_xyz", is_direct=False)
+        kind, msg, meta = a.output_router.activity_calls[0]
+        assert "(bg)" in msg
+        assert "_hidden" not in meta["args"]
+
+
+# ── _emit_token_usage ────────────────────────────────────────────
+
+
+class TestEmitTokenUsage:
+    def test_no_usage_no_op(self):
+        a = _make_mixin()
+        ctrl = types.SimpleNamespace()
+        a._emit_token_usage(ctrl)
+        assert a.output_router.activity_calls == []
+
+    def test_accumulates_into_turn_usage(self):
+        a = _make_mixin()
+        ctrl = types.SimpleNamespace(
+            _last_usage={
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+            }
+        )
+        a._emit_token_usage(ctrl)
+        assert a.output_router.activity_calls[0][0] == "token_usage"
+        assert a._turn_usage_accum["prompt_tokens"] == 10
+        assert a._turn_usage_accum["completion_tokens"] == 5
+
+    def test_emits_cache_stats(self):
+        a = _make_mixin()
+        ctrl = types.SimpleNamespace(
+            _last_usage={
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "cached_tokens": 30,
+                "cache_creation_input_tokens": 10,
+            }
+        )
+        a._emit_token_usage(ctrl)
+        kinds = [c[0] for c in a.output_router.activity_calls]
+        assert "cache_stats" in kinds
+        cache_meta = next(
+            c[2] for c in a.output_router.activity_calls if c[0] == "cache_stats"
+        )
+        assert cache_meta["cache_read"] == 30
+        assert cache_meta["cache_write"] == 10
+        assert cache_meta["cache_hit_ratio"] == pytest.approx(0.3)
+
+    def test_cache_stats_skipped_when_no_cache(self):
+        a = _make_mixin()
+        ctrl = types.SimpleNamespace(
+            _last_usage={"prompt_tokens": 1, "completion_tokens": 1}
+        )
+        a._emit_token_usage(ctrl)
+        kinds = [c[0] for c in a.output_router.activity_calls]
+        assert "cache_stats" not in kinds
+
+    def test_no_accumulator_safe(self):
+        a = _make_mixin()
+        a._turn_usage_accum = None  # type: ignore[assignment]
+        ctrl = types.SimpleNamespace(_last_usage={"prompt_tokens": 5})
+        a._emit_token_usage(ctrl)
+        # No crash; activity still emitted.
+        assert a.output_router.activity_calls
+
+    def test_frame_carries_running_totals_and_context(self):
+        a = _make_mixin()
+        first = {"prompt_tokens": 10, "completion_tokens": 5, "cached_tokens": 2}
+        second = {"prompt_tokens": 40, "completion_tokens": 3, "total_tokens": 43}
+        a._emit_token_usage(types.SimpleNamespace(_last_usage=first))
+        a._emit_token_usage(types.SimpleNamespace(_last_usage=second))
+        frames = [c[2] for c in a.output_router.activity_calls if c[0] == "token_usage"]
+        assert frames[1]["prompt_tokens"] == 40
+        assert frames[1]["totals"] == {
+            "prompt": 50,
+            "completion": 8,
+            "cached": 2,
+            "total": 58,
+        }
+        assert frames[1]["context_tokens"] == 40
+        # The controller's usage dict is not mutated by the frame build.
+        assert "totals" not in second
+
+    def test_totals_extend_the_persisted_slot(self):
+        a = _make_mixin()
+        a.session_store = types.SimpleNamespace(
+            state={
+                "alice:token_usage": {
+                    "total_input_tokens": 900,
+                    "total_output_tokens": 100,
+                    "total_cached_tokens": 0,
+                }
+            }
+        )
+        usage = {"prompt_tokens": 10, "completion_tokens": 1}
+        a._emit_token_usage(types.SimpleNamespace(_last_usage=usage))
+        frame = a.output_router.activity_calls[0][2]
+        assert frame["totals"]["prompt"] == 910
+        assert frame["totals"]["total"] == 1011
+
+
+# ── _cancel_handles ──────────────────────────────────────────────
+
+
+class TestCancelHandles:
+    async def test_cancels_undone_unpromoted(self):
+        a = _make_mixin()
+
+        async def forever():
+            await asyncio.Event().wait()
+
+        def handle(promoted, done):
+            return types.SimpleNamespace(
+                promoted=promoted, done=done, task=asyncio.ensure_future(forever())
+            )
+
+        h1, h2, h3 = handle(False, False), handle(True, False), handle(False, True)
+        a._cancel_handles({"a": h1, "b": h2, "c": h3})
+        await asyncio.sleep(0)
+        assert [h.task.cancelled() for h in (h1, h2, h3)] == [True, False, False]
+        for h in (h2, h3):
+            h.task.cancel()
+        await asyncio.gather(h2.task, h3.task, return_exceptions=True)
+
+
+# ── reset / flush ────────────────────────────────────────────────
+
+
+class TestResetFlush:
+    def test_reset_output_state(self):
+        a = _make_mixin()
+        a._reset_output_state()
+        assert a.output_router.reset_calls >= 1
+
+    async def test_flush_output(self):
+        a = _make_mixin()
+        await a._flush_output()
+        assert a.output_router.flush_calls == 1
+
+
+# ── _start_subagent_async ────────────────────────────────────────
+
+
+class TestStartSubagentAsync:
+    async def test_spawn_succeeds(self):
+        a = _make_mixin()
+        evt = SubAgentCallEvent(name="explore", args={"task": "x"}, raw="")
+        job_id, is_bg = await a._start_subagent_async(evt)
+        assert job_id == "agent_123"
+        assert is_bg is True
+
+    async def test_spawn_raises_value_error(self):
+        a = _make_mixin()
+        a.subagent_manager.spawn.side_effect = ValueError("not registered")
+        evt = SubAgentCallEvent(name="ghost", args={"task": "x"}, raw="")
+        job_id, is_bg = await a._start_subagent_async(evt)
+        assert job_id == "error_ghost"
+        assert is_bg is True
+
+
+# ── _should_notify_controller_on_background_complete ─────────────
+
+
+class TestShouldNotify:
+    def test_meta_override_true(self):
+        a = _make_mixin(
+            notify_meta={"j1": {"notify_controller_on_background_complete": True}}
+        )
+        assert a._should_notify_controller_on_background_complete("j1") is True
+
+    def test_meta_override_false(self):
+        a = _make_mixin(
+            notify_meta={"j1": {"notify_controller_on_background_complete": False}}
+        )
+        assert a._should_notify_controller_on_background_complete("j1") is False
+
+    def test_default_true(self):
+        a = _make_mixin()
+        # Unknown job_id → default True.
+        assert a._should_notify_controller_on_background_complete("j2") is True
+
+    def test_bg_notify_override(self):
+        a = _make_mixin()
+        a._bg_controller_notify["j3"] = False
+        assert a._should_notify_controller_on_background_complete("j3") is False
+
+
+# ── _on_bg_complete ──────────────────────────────────────────────
+
+
+class TestOnBgComplete:
+    async def test_not_running_skips(self):
+        a = _make_mixin(running=False)
+        evt = TriggerEvent(
+            type=EventType.TOOL_COMPLETE,
+            job_id="bash_abc",
+            content="ok",
+            context={},
+        )
+        a._on_bg_complete(evt)
+        # Nothing happened.
+        assert a.output_router.activity_calls == []
+
+    async def test_tool_done(self):
+        a = _make_mixin()
+        evt = TriggerEvent(
+            type=EventType.TOOL_COMPLETE,
+            job_id="bash_abc",
+            content="result text",
+            context={},
+        )
+        a._on_bg_complete(evt)
+        kind, _detail, metadata = a.output_router.activity_calls[0]
+        assert kind == "tool_done"
+        assert metadata["result"] == "result text"
+        assert metadata["output_preview"] == "result text"
+        queued = a._event_inbox.drain_all()
+        assert len(queued) == 1
+        assert queued[0].event is evt
+        assert queued[0].future is None
+
+    @pytest.mark.parametrize("error", [None, "diagnostic failure"])
+    async def test_completed_tool_retains_structured_output_and_separate_status(
+        self, tmp_path, error
+    ):
+        a = _make_mixin()
+        artifact_url = "/api/sessions/graph_1/artifacts/generated_images/image.jpeg"
+        event_parts = [
+            TextPart(text="diagnostic caption"),
+            ImagePart(url=artifact_url, source_name="image.jpeg"),
+            FilePart(name="report.txt", content="DIAGNOSTIC_FILE", is_inline=True),
+            TextPart(text="diagnostic tail"),
+        ]
+        canvas_preview = {
+            "kind": "image",
+            "file_path": "/work/image.jpeg",
+            "content": artifact_url,
+            "lang": "jpg",
+            "bytes": 123,
+            "truncated": False,
+        }
+        evt = TriggerEvent(
+            type=EventType.TOOL_COMPLETE,
+            job_id="grok_image_gen_abc",
+            content=event_parts,
+            context={
+                "error": error,
+                "exit_code": 2 if error else 0,
+                "result_metadata": {
+                    "canvas_preview": canvas_preview,
+                    "session_metadata": {
+                        "artifacts": [{"kind": "image", "url": artifact_url}]
+                    },
+                },
+            },
+        )
+
+        a._on_bg_complete(evt)
+
+        kind, _detail, metadata = a.output_router.activity_calls[0]
+        assert kind == ("tool_error" if error else "tool_done")
+        expected = [part.to_dict() for part in event_parts]
+        assert metadata["result"] == expected
+        if error:
+            assert metadata["error"] == error
+            assert metadata["final_state"] == "error"
+            assert "canvas_preview" not in metadata
+        else:
+            assert artifact_url in metadata["output_preview"]
+            assert metadata["output"] == event_parts
+            assert metadata["canvas_preview"] == canvas_preview
+            assert metadata["tool_metadata"] == {
+                "artifacts": [{"kind": "image", "url": artifact_url}]
+            }
+        store = SessionStore(tmp_path / "completed.kohakutr")
+        try:
+            out = SessionOutput("alice", store, a)
+            out.on_activity_with_metadata(kind, _detail, metadata)
+            await out.drain()
+            result = next(
+                event
+                for event in store.get_events("alice")
+                if event["type"] == "tool_result"
+            )
+            assert result["output"] == expected
+            assert result["exit_code"] == (2 if error else 0)
+            if error:
+                assert result["error"] == error
+                assert result["interrupted"] is False
+                assert result["cancelled"] is False
+                assert result["final_state"] == "error"
+            assert evt.content == event_parts
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize("result_metadata", [None, [], "invalid", {}])
+    async def test_tool_done_without_mapping_metadata(self, result_metadata):
+        a = _make_mixin()
+        a._bg_controller_notify["canvas_image_abc"] = False
+        evt = TriggerEvent(
+            type=EventType.TOOL_COMPLETE,
+            job_id="canvas_image_abc",
+            content="result text",
+            context={"result_metadata": result_metadata},
+        )
+
+        a._on_bg_complete(evt)
+
+        kind, _detail, metadata = a.output_router.activity_calls[0]
+        assert kind == "tool_done"
+        assert metadata["result"] == "result text"
+        assert "canvas_preview" not in metadata
+        assert "tool_metadata" not in metadata
+
+    @pytest.mark.parametrize("failure", [{"error": "failed"}, {"exit_code": 2}])
+    async def test_failed_tool_does_not_publish_canvas_preview(self, failure):
+        a = _make_mixin()
+        a._bg_controller_notify["canvas_image_abc"] = False
+        evt = TriggerEvent(
+            type=EventType.TOOL_COMPLETE,
+            job_id="canvas_image_abc",
+            content="partial output",
+            context={
+                "result_metadata": {"canvas_preview": {"kind": "image"}},
+                **failure,
+            },
+        )
+
+        a._on_bg_complete(evt)
+
+        kind, _detail, metadata = a.output_router.activity_calls[0]
+        assert kind == "tool_error"
+        assert "canvas_preview" not in metadata
+
+    async def test_subagent_done(self):
+        a = _make_mixin()
+        evt = TriggerEvent(
+            type=EventType.TOOL_COMPLETE,
+            job_id="agent_x_y",
+            content="result",
+            context={
+                "subagent_metadata": {
+                    "tools_used": ["bash", "read"],
+                    "turns": 3,
+                    "duration": 1.5,
+                    "total_tokens": 100,
+                    "subagent": "explore",
+                    "llm_name": "openai/worker",
+                    "model": "gpt-worker",
+                }
+            },
+        )
+        a._on_bg_complete(evt)
+        kinds = [c[0] for c in a.output_router.activity_calls]
+        assert "subagent_done" in kinds
+        meta = next(
+            c[2] for c in a.output_router.activity_calls if c[0] == "subagent_done"
+        )
+        assert meta["turns"] == 3
+        assert meta["subagent"] == "explore"
+        assert meta["llm_name"] == "openai/worker"
+        assert meta["model"] == "gpt-worker"
+
+    async def test_error_path(self):
+        a = _make_mixin()
+        evt = TriggerEvent(
+            type=EventType.TOOL_COMPLETE,
+            job_id="bash_x",
+            content="",
+            context={"error": "boom"},
+        )
+        a._on_bg_complete(evt)
+        kinds = [c[0] for c in a.output_router.activity_calls]
+        assert "tool_error" in kinds
+
+    async def test_nonzero_exit_code_is_an_error(self):
+        a = _make_mixin()
+        evt = TriggerEvent(
+            type=EventType.TOOL_COMPLETE,
+            job_id="bash_x",
+            content=[
+                TextPart(text="partial failure"),
+                ImagePart(url="https://example.invalid/diagnostic.png"),
+            ],
+            context={"exit_code": 2},
+        )
+
+        a._on_bg_complete(evt)
+
+        kind, _detail, metadata = a.output_router.activity_calls[0]
+        assert kind == "tool_error"
+        assert metadata["exit_code"] == 2
+        assert metadata["result"] == [part.to_dict() for part in evt.content]
+
+    async def test_interrupted_flag(self):
+        a = _make_mixin()
+        evt = TriggerEvent(
+            type=EventType.TOOL_COMPLETE,
+            job_id="bash_x",
+            content=[TextPart(text="partial interrupted output")],
+            context={"error": "x", "interrupted": True},
+        )
+        a._on_bg_complete(evt)
+        meta = next(
+            c[2] for c in a.output_router.activity_calls if c[0] == "tool_error"
+        )
+        assert meta["final_state"] == "interrupted"
+        assert meta["result"] == [part.to_dict() for part in evt.content]
+
+    async def test_cancelled_flag(self):
+        a = _make_mixin()
+        evt = TriggerEvent(
+            type=EventType.TOOL_COMPLETE,
+            job_id="bash_x",
+            content=[TextPart(text="partial cancelled output")],
+            context={"error": "x", "cancelled": True},
+        )
+        a._on_bg_complete(evt)
+        meta = next(
+            c[2] for c in a.output_router.activity_calls if c[0] == "tool_error"
+        )
+        assert meta["final_state"] == "cancelled"
+        assert meta["result"] == [part.to_dict() for part in evt.content]
+
+    async def test_subagent_error(self):
+        a = _make_mixin()
+        evt = TriggerEvent(
+            type=EventType.TOOL_COMPLETE,
+            job_id="agent_x",
+            content="",
+            context={"error": "fail"},
+        )
+        a._on_bg_complete(evt)
+        kinds = [c[0] for c in a.output_router.activity_calls]
+        assert "subagent_error" in kinds
+
+    async def test_notify_off_pops_state(self):
+        a = _make_mixin()
+        a._bg_controller_notify["bash_x"] = False
+        evt = TriggerEvent(
+            type=EventType.TOOL_COMPLETE,
+            job_id="bash_x",
+            content="r",
+            context={},
+        )
+        a._on_bg_complete(evt)
+        # State cleared.
+        assert "bash_x" not in a._bg_controller_notify
+        assert a._event_inbox.drain_all() == []

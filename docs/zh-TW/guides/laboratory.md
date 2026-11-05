@@ -163,7 +163,7 @@ curl -X POST http://localhost:8001/api/sessions/active/creature \
 from fastapi import Depends, APIRouter
 
 from kohakuterrarium.api.deps import get_service
-from kohakuterrarium.terrarium.service import TerrariumService
+from kohakuterrarium.terrarium.service.service import TerrariumService
 
 router = APIRouter()
 
@@ -193,7 +193,7 @@ lab-host` 時才會呼叫 `set_service(...)`）。
 import asyncio
 
 from kohakuterrarium.laboratory._internal.host import HostEngine
-from kohakuterrarium.laboratory._internal.transport_ws import WebSocketTransport
+from kohakuterrarium.laboratory._internal.transport.ws import WebSocketTransport
 from kohakuterrarium.laboratory.config import HostConfig
 from kohakuterrarium.laboratory.adapters import (
     StudioCatalogAdapter,
@@ -288,7 +288,7 @@ info = await service.add_creature(target_path, on_node="worker-gpu-1")
 直接傳 config 物件，它會以打包過的 dict 形式跨越線路：
 
 ```python
-from kohakuterrarium.core.config_types import AgentConfig, InputConfig, OutputConfig
+from kohakuterrarium.core.config.types import AgentConfig, InputConfig, OutputConfig
 
 cfg = AgentConfig(
     name="ephemeral",
@@ -446,7 +446,7 @@ worker 側以 WARNING 等級記錄，不會出現在主機的 log 裡。
   `?node=` query）。見 [HTTP API 參考](../reference/http.md)。
 - Python：`kohakuterrarium.terrarium.MultiNodeTerrariumService`
   （lab-host 模式）、`RemoteTerrariumService`（單 worker handle）、
-  `kohakuterrarium.laboratory.ClientConnector`（worker 的 client
+  `kohakuterrarium.laboratory._internal.client.ClientConnector`（worker 的 client
   物件，驅動你自己嵌入的 worker）。
 - 概念：[Laboratory](../concepts/laboratory.md)，涵蓋線路格式、
   session 同步、resume 語意、identity 模型。

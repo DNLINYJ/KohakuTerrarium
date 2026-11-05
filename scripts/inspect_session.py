@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kohakuterrarium.session.store import SessionStore, iter_kv_keys
+from kohakuterrarium.session.store import SessionStore
 
 
 def print_meta(store: SessionStore) -> None:
@@ -331,14 +331,14 @@ def print_summary(store: SessionStore) -> None:
     print(f"Agents: {meta.get('agents', [])}")
 
     agents = meta.get("agents", [])
-    event_counts = _sequence_counts(iter_kv_keys(store.events), ":e")
+    event_counts = _sequence_counts(store.events.keys(), ":e")
     for agent in agents:
         print(f"  {agent}: {event_counts[str(agent)]} events")
 
-    channel_counts = _sequence_counts(iter_kv_keys(store.channels), ":m")
+    channel_counts = _sequence_counts(store.channels.keys(), ":m")
     print(f"Channels: {len(channel_counts)} ({sum(channel_counts.values())} messages)")
 
-    sa_count = _subagent_run_count(iter_kv_keys(store.subagents))
+    sa_count = _subagent_run_count(store.subagents.keys())
     print(f"Sub-agent runs: {sa_count}")
     print("Counts describe stored records; payloads are not validated.")
     print()

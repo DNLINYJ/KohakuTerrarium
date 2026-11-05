@@ -117,7 +117,7 @@ memory:
 [search_memory/]
 ```
 
-如果你要對 *外部* 資料源做 RAG，請自己做一個 custom tool，或做一個會呼叫向量資料庫的 [prompt plugin](plugins.md)。
+如果你要對 *外部* 資料源做 RAG，請自己做一個 custom tool，或做一個會呼叫向量資料庫的 [plugin](plugins.md)。
 
 ## 在生物裡設定記憶
 
@@ -134,8 +134,8 @@ memory:
 
 ```python
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.session.memory import SessionMemory
-from kohakuterrarium.session.embedding import GeminiEmbedder
+from kohakuterrarium.session.memory.index import SessionMemory
+from kohakuterrarium.session.memory.embedding import GeminiEmbedder
 
 store = SessionStore("~/.kohakuterrarium/sessions/swe.kohakutr")
 embedder = GeminiEmbedder("gemini-embedding-004", api_key="...")

@@ -12,6 +12,7 @@ from kohakuterrarium.llm.deferred_provider import DeferredLLMProvider
 from kohakuterrarium.bootstrap.subagents import init_subagents
 from kohakuterrarium.bootstrap.tools import init_tools
 from kohakuterrarium.bootstrap.triggers import init_triggers
+from kohakuterrarium.builtins.kt_ui.inline_state import InlineUiStates
 from kohakuterrarium.builtins.plugin_catalog import resolve_plugin_specs
 from kohakuterrarium.builtins.tool_catalog import get_builtin_tool
 from kohakuterrarium.builtins.user_commands import (
@@ -19,16 +20,17 @@ from kohakuterrarium.builtins.user_commands import (
     list_builtin_user_commands,
 )
 from kohakuterrarium.core.budget import IterationBudget
-from kohakuterrarium.core.config import AgentConfig
-from kohakuterrarium.core.controller import Controller, ControllerConfig
-from kohakuterrarium.core.executor import Executor
+from kohakuterrarium.core.config.load import AgentConfig
+from kohakuterrarium.core.controller.controller import Controller, ControllerConfig
+from kohakuterrarium.core.jobs.executor import Executor
 from kohakuterrarium.core.loader import ModuleLoader
 from kohakuterrarium.core.registry import Registry
 from kohakuterrarium.core.session import Session, get_session
 from kohakuterrarium.core.termination import TerminationChecker, TerminationConfig
+from kohakuterrarium.core.tools.gate import is_subagent_visible, visible_catalog
 from kohakuterrarium.modules.input.base import InputModule
 from kohakuterrarium.modules.output.base import OutputModule
-from kohakuterrarium.modules.output.router import OutputRouter
+from kohakuterrarium.modules.output.router.router import OutputRouter
 from kohakuterrarium.modules.plugin.base import PluginContext
 from kohakuterrarium.modules.subagent import SubAgentManager
 from kohakuterrarium.modules.user_command.aggregate import (
@@ -44,7 +46,7 @@ from kohakuterrarium.modules.user_command.base import (
 from kohakuterrarium.packages.locations import find_package_root_for_path
 from kohakuterrarium.packages.manifest import get_package_framework_hints
 from kohakuterrarium.packages.resolve import ensure_package_importable
-from kohakuterrarium.packages.slots import iter_package_user_command_entries
+from kohakuterrarium.packages.slots.slots import iter_package_user_command_entries
 from kohakuterrarium.parsing.format import BRACKET_FORMAT, XML_FORMAT, ToolCallFormat
 from kohakuterrarium.prompt.aggregator import aggregate_system_prompt
 from kohakuterrarium.prompt.framework_hints import merge_overrides
@@ -55,7 +57,7 @@ from kohakuterrarium.skills import (
     build_user_skill_turn,
     discover_skills,
 )
-from kohakuterrarium.utils.file_guard import FileReadState, PathBoundaryGuard
+from kohakuterrarium.utils.file.guard import FileReadState, PathBoundaryGuard
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -274,6 +276,9 @@ class AgentInitMixin:
         )
         # Reuse the parent executor's working directory and safety guards.
         self.subagent_manager._parent_executor = self.executor
+        self.subagent_manager._host_agent = self
+        self.subagent_manager._parent_plugins = self.plugins
+        self.subagent_manager._capture_context = self.capture_context
 
         init_subagents(self.config, self.subagent_manager, self.registry, self._loader)
 
@@ -321,6 +326,9 @@ class AgentInitMixin:
 
         # The primary controller also owns framework command dispatch.
         self.controller = self._create_controller()
+        self.controller.before_llm_request = getattr(
+            self, "apply_pending_prompt_refresh", None
+        )
         if getattr(self, "plugins", None):
             self.controller.plugins = self.plugins
             self._apply_plugin_hooks()
@@ -330,10 +338,17 @@ class AgentInitMixin:
         # The aggregator adds tools and framework hints; system.md remains agent-specific.
         base_prompt = self.config.system_prompt
         pending_subagents_prompt = ""
+        visibility = visible_catalog(
+            self.registry,
+            getattr(self, "plugins", None),
+            getattr(self, "output_router", None),
+        )
 
         # Sub-agent inventory follows the same prompt-inclusion switch as tools.
         if self.config.include_tools_in_prompt:
-            subagents_prompt = self.subagent_manager.get_subagents_prompt()
+            subagents_prompt = self.subagent_manager.get_subagents_prompt(
+                lambda name: is_subagent_visible(name, visibility)
+            )
             if subagents_prompt:
                 pending_subagents_prompt = subagents_prompt
 
@@ -400,6 +415,7 @@ class AgentInitMixin:
             ),
             runtime_plugins=getattr(self, "plugins", None),
             plugin_context=plugin_context,
+            visibility=visibility,
         )
 
     def _ensure_skill_tool_registered(self) -> None:
@@ -481,7 +497,11 @@ class AgentInitMixin:
                 self.output_router.notify_activity(
                     "command_result",
                     result.output,
-                    metadata={"source": source, "command": content},
+                    metadata={
+                        "source": source,
+                        "command": content,
+                        "data": result.data,
+                    },
                 )
             return None
         return result.output or content
@@ -565,6 +585,9 @@ class AgentInitMixin:
         logger.info("Named outputs registered", named_outputs=list(self._known_outputs))
 
         self.output_router = OutputRouter(default_output, named_outputs=named_outputs)
+        self.output_router.widgets.bind_agent(self)
+        self.output_router.inline_ui = InlineUiStates(self.output_router)
+        self.output_router.inline_ui.bind_agent(self)
 
     def _init_user_commands(self) -> None:
         """Aggregate every user-command source and bind it to the input module."""

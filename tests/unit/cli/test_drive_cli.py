@@ -12,15 +12,15 @@ from types import SimpleNamespace
 import pytest
 
 from kohakuterrarium.cli import drive as drive_cli_mod
-from kohakuterrarium.studio.sessions import drives as facade
-from kohakuterrarium.terrarium.creature_host import Creature
+from kohakuterrarium.studio.sessions.drives import drives as facade
+from kohakuterrarium.terrarium.creature.host import Creature
 from kohakuterrarium.terrarium.drive.config import (
     DriveRuntimeConfig,
     default_registrations,
 )
 from kohakuterrarium.terrarium.drive.models import ActorRef
-from kohakuterrarium.terrarium.engine import Terrarium
-from kohakuterrarium.terrarium.service import LocalTerrariumService
+from kohakuterrarium.terrarium.engine.engine import Terrarium
+from kohakuterrarium.terrarium.service.service import LocalTerrariumService
 from kohakuterrarium.testing.terrarium import _FakeAgent
 
 pytestmark = pytest.mark.timeout(30)

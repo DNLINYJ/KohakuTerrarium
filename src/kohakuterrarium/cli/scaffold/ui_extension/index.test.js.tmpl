@@ -1,0 +1,24 @@
+// Unit test against the SDK mock (aliased in vitest.config.js).
+import { mount } from "@vue/test-utils"
+import { expect, test } from "vitest"
+import { createMockHost } from "@kohakuterrarium/ui-sdk"
+
+import register, { PluginPanel } from "../index.js"
+
+test("registers both contributions", async () => {
+  const host = createMockHost({ package: "{{name}}" })
+  await host.register(register)
+  expect([...host.registered.settings.keys()]).toEqual(["settings"])
+  expect([...host.registered.panel.keys()]).toEqual(["panel"])
+})
+
+test("panel shows pushed state and calls its owner", async () => {
+  const host = createMockHost({ owner: { state: { turns: 2 }, actions: { reset: () => ({ turns: 0 }) } } })
+  const wrapper = mount(PluginPanel)
+  expect(wrapper.text()).toContain("Turns: 2")
+  host.emit("state", { turns: 5 })
+  await wrapper.vm.$nextTick()
+  expect(wrapper.text()).toContain("Turns: 5")
+  await wrapper.find("button").trigger("click")
+  expect(host.ownerCalls).toEqual([{ action: "reset", args: {} }])
+})

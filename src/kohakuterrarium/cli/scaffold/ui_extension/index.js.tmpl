@@ -1,0 +1,41 @@
+// {{name}} dashboard UI. No build step: the dashboard supplies `vue` and the SDK.
+import { ref } from "vue"
+import { defineExtension, notify, useExtension, useOwner } from "@kohakuterrarium/ui-sdk"
+
+export const SettingsSection = {
+  name: "{{module}}Settings",
+  setup() {
+    const kt = useExtension()
+    const owner = useOwner()
+    const draft = ref("")
+    async function save() {
+      await owner.call("set_greeting", { greeting: draft.value })
+      notify(kt.t("saved"), "success")
+    }
+    return { kt, owner, draft, save }
+  },
+  template: `
+    <div class="{{module}}-card">
+      <p>{{ kt.t("greeting", { greeting: owner.state.value?.greeting || "" }) }}</p>
+      <input v-model="draft" placeholder="New greeting" />
+      <button @click="save">Save</button>
+    </div>`,
+}
+
+export const PluginPanel = {
+  name: "{{module}}Panel",
+  setup() {
+    const owner = useOwner()
+    return { owner, reset: () => owner.call("reset") }
+  },
+  template: `
+    <div class="{{module}}-card">
+      <p>Turns: {{ owner.state.value?.turns ?? 0 }}</p>
+      <button @click="reset">Reset</button>
+    </div>`,
+}
+
+export default defineExtension((kt) => {
+  kt.registerSettingsSection("settings", SettingsSection)
+  kt.registerPanel("panel", PluginPanel)
+})

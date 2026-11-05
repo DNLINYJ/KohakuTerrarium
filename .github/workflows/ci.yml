@@ -119,6 +119,45 @@ jobs:
       - name: Run dep-graph lint guard
         run: pytest tests/unit/test_dep_graph_lint.py -n 0 -v --tb=short
 
+  desktop-shell:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-22.04, ubuntu-22.04-arm]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: packaging/desktop/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the Tauri system libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev libdbus-1-dev pkg-config patchelf xvfb
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packaging/desktop/src-tauri
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test
+        shell: bash
+        run: |
+          run=""
+          if [ "$RUNNER_OS" = "Linux" ]; then run="xvfb-run -a"; fi
+          $run cargo test --locked
+      - run: cargo clippy --all-targets --features source-dev --locked -- -D warnings
+      - name: Test (source development)
+        shell: bash
+        run: |
+          run=""
+          if [ "$RUNNER_OS" = "Linux" ]; then run="xvfb-run -a"; fi
+          $run cargo test --features source-dev --locked
+
   frontend-check:
     runs-on: ubuntu-latest
     defaults:
@@ -131,6 +170,13 @@ jobs:
           node-version: "24"
       - run: npm ci
       - run: npm run format:check
+      - run: npm run test:desktop-dev
+      - name: Run desktop development UI regression tests
+        run: >-
+          npm test -- --maxWorkers=4
+          src/utils/hostBridge.test.js
+          src/components/settings/DesktopAppSettings.test.js
+          src/composables/useBackendStatus.test.js
       - name: Run history and branch regression tests
         run: >-
           npm test -- --maxWorkers=4
@@ -143,6 +189,13 @@ jobs:
           src/stores/chat.editRerunGuards.test.js
           src/components/chat/ChatPanel.history
           src/components/chat/chatHistoryExpand.test.js
+      - name: Run tool and plugin settings regression tests
+        run: >-
+          npm test -- --maxWorkers=4
+          src/components/settings/modules
+          src/components/panels/modules/ModuleEditForm.test.js
+          src/components/settings/SettingsPage.test.js
+          src/components/session-v2/phone/PhoneTabs.test.js
       - run: npm run build
       - name: Verify frontend build output
         working-directory: .

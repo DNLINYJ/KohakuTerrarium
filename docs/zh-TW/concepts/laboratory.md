@@ -169,7 +169,7 @@ msgpack body。兩端各自註冊 namespace 的*擴充 handler*；雙方唯一
 
 Studio 永遠不需要知道一隻生物住在行程內還是遠端機器上。
 `TerrariumService` Protocol
-（`src/kohakuterrarium/terrarium/service.py`）有 `add_creature`、
+（`src/kohakuterrarium/terrarium/service/service.py`）有 `add_creature`、
 `list_creatures`、`chat`、`connect` 之類的方法。三個實作滿足它：
 
 - `LocalTerrariumService`：直接呼叫行程內的 Terrarium。
@@ -191,7 +191,7 @@ Studio 永遠不需要知道一隻生物住在行程內還是遠端機器上。
 包括 worker-2 上的 listener，就好像兩隻生物住在同一個行程裡
 一樣。Lab 用兩個機制達成這點：
 
-- **跨節點 connect**（`terrarium/multi_node_replication.py`）。
+- **跨節點 connect**（`terrarium/multi_node/replication.py`）。
   當使用者呼叫 `service.connect(creatureA, creatureB)` 且兩隻
   生物住在不同 worker 時，主機會：
   1. 在兩個 worker 的圖上各加一個頻道物件。
@@ -315,7 +315,7 @@ Resume 跑的還是同一個 `engine.adopt_session(path)`，只是在
 （[`_worker_session.py`](_worker_session.py-line)）透過
 `pack_agent_config` 擷取完整的 `AgentConfig` 並存在
 `meta["config_snapshot"]` 下。Resume 路徑
-（`session/resume.py::_rebuild_agent`）有 folder 存在時優先用
+（`session/resume/resume.py::_rebuild_agent`）有 folder 存在時優先用
 `config_path`，否則回退到 `unpack_agent_config(snapshot)`。
 
 ### 單生物 resume（CF-6 基準）
@@ -402,7 +402,7 @@ Resume 時，`_resume_terrarium_into_engine` 先重建 recipe 描
 因為快照是*完整*的（不是 delta log），使用者的移除也會被
 反映出來：任何被使用者移除的東西就是不在快照裡。
 
-實作：`src/kohakuterrarium/terrarium/topology_snapshot.py`。
+實作：`src/kohakuterrarium/terrarium/graph/snapshot.py`。
 測試：`tests/integration/test_runtime_topology_resume.py`。
 
 ### 目前的已知限制

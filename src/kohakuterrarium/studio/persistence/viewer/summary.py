@@ -7,9 +7,11 @@ sessions.
 from collections.abc import Iterable
 from typing import Any
 
-from kohakuterrarium.errors import NotFoundError
-from kohakuterrarium.session.history import dedupe_adjacent_duplicate_events
+from kohakuterrarium.session.history.replay import dedupe_adjacent_duplicate_events
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.studio.persistence.viewer.agents import (
+    viewer_agent_names as _agents_for_summary,
+)
 from kohakuterrarium.studio.persistence.viewer.rollups import (
     _add_usage,
     _aggregate_rollup_contributions,
@@ -35,33 +37,6 @@ def _subagent_failed(evt: dict) -> bool:
             or final_state in {"error", "interrupted", "cancelled"}
         )
     )
-
-
-def _agents_for_summary(
-    meta: dict[str, Any], store: SessionStore, requested: str | None
-) -> list[str]:
-    """Select and order agent namespaces for the overview.
-
-    A requested agent must belong to the session. Without one, all main and
-    attached namespaces are included, with ``viewer_default_agent`` first.
-    ``load_meta`` already includes event-discovered creatures in ``agents``.
-    """
-    main_agents = list(meta.get("agents") or [])
-    attached_namespaces = [
-        e["namespace"] for e in store.discover_attached_agents() if e.get("namespace")
-    ]
-    known_agents = main_agents + [
-        n for n in attached_namespaces if n not in main_agents
-    ]
-    if requested is None:
-        default = meta.get("viewer_default_agent")
-        if isinstance(default, str) and default in known_agents:
-            ordered = [default] + [a for a in known_agents if a != default]
-            return ordered
-        return known_agents
-    if requested not in known_agents:
-        raise NotFoundError(f"Agent not found in session: {requested}")
-    return [requested]
 
 
 def _aggregate_rollups(

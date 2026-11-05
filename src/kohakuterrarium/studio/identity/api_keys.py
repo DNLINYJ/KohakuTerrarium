@@ -3,8 +3,9 @@
 import os
 from typing import Any
 
-from kohakuterrarium.llm.api_keys import KEYS_PATH, list_api_keys
-from kohakuterrarium.llm.profiles import (
+from kohakuterrarium.llm.profiles.api_keys import KEYS_PATH, list_api_keys
+from kohakuterrarium.llm.profiles.backend_registry import package_backend
+from kohakuterrarium.llm.profiles.resolve import (
     PROVIDER_KEY_MAP,
     _is_available,
     get_api_key,
@@ -15,6 +16,12 @@ from kohakuterrarium.llm.profiles import (
 KEYS_FILE_PATH = KEYS_PATH
 
 
+def _manages_own_credentials(backend_type: str) -> bool:
+    """True for a package backend that declares ``credentials: external|none``."""
+    descriptor = package_backend(backend_type)
+    return descriptor is not None and descriptor.manages_own_credentials
+
+
 def _provider_credentials(
     backends: dict[str, Any] | None = None,
 ) -> dict[str, tuple[str, str]]:
@@ -23,6 +30,7 @@ def _provider_credentials(
     credentials = {
         name: (backend.backend_type, backend.api_key_env or "")
         for name, backend in resolved_backends.items()
+        if not _manages_own_credentials(backend.backend_type)
     }
     for name, env_var in PROVIDER_KEY_MAP.items():
         credentials.setdefault(name, ("credential", env_var))

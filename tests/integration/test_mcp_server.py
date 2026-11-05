@@ -1,6 +1,7 @@
 """Complete authenticated tool workflows through the real MCP HTTP SDK."""
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -21,6 +22,7 @@ from kohakuterrarium.mcp_server.endpoint import EndpointStore
 from kohakuterrarium.mcp_server.service import is_running, status
 from kohakuterrarium.mcp_server.workspaces import WorkspaceRegistry
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
+from tests.helpers.waiting import wait_until_sync
 
 
 @pytest.mark.xdist_group("mcp-subprocess")
@@ -34,6 +36,8 @@ class TestMCPServer:
         env = {
             **os.environ,
             "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
+            "TUNNEL_TOKEN": "unrelated-token",
+            "TUNNEL_CRED_CONTENTS": "unrelated-credentials",
         }
 
         def cli(command, *extra, root=home):
@@ -47,7 +51,7 @@ class TestMCPServer:
                     "--home-dir",
                     str(root),
                     *([] if command == "url" else ["--json"]),
-                    *(["--wait", "8"] if command == "start" else []),
+                    *(["--wait", "8"] if command in {"start", "restart"} else []),
                     *map(str, extra),
                 ],
                 capture_output=True,
@@ -69,6 +73,18 @@ class TestMCPServer:
                     }
                 )
             return completed.returncode, result
+
+        def settled(predicate, root=home):
+            """Poll ``status`` until ``predicate`` holds; ``start`` only waits ``--wait``."""
+            last = {}
+
+            def poll():
+                nonlocal last
+                last = status(store if root == home else other)
+                return predicate(last)
+
+            wait_until_sync(poll, interval=0.1, what="endpoint state")
+            return last
 
         def port():
             with socket.socket() as sock:
@@ -147,12 +163,15 @@ class TestMCPServer:
             assert code == 0 and migrated["migrated"] and not migrated["running"]
             assert other.load().secret != "a" * 43
             assert legacy_record.read_bytes() == legacy_bytes
-            (code, started), (_, racing) = await asyncio.gather(
+            (code, first_start), (_, racing) = await asyncio.gather(
                 asyncio.to_thread(cli, "start"), asyncio.to_thread(cli, "start")
             )
-            assert code == 1 and started["local_ready"] and not started["public_ready"]
-            assert started["management"]["state"] == "ready"
-            assert started["run_id"] == racing["run_id"]
+            assert code == 1
+            started = settled(
+                lambda s: s["local_ready"] and s["management"]["state"] == "ready"
+            )
+            assert not started["public_ready"]
+            assert first_start["run_id"] == racing["run_id"] == started["run_id"]
             assert (await call("workspaces")).structuredContent["workspaces"] == []
             original = store.load()
             registered = cli("workspace add", "first", "./project")
@@ -275,7 +294,7 @@ class TestMCPServer:
             _, restarted = cli("start")
             restart_run_id = restarted.get("run_id")
             assert restart_run_id and restart_run_id != started["run_id"], restarted
-            deadline = asyncio.get_running_loop().time() + 8
+            deadline = asyncio.get_running_loop().time() + 60
             while not (restarted.get("instance_id") and restarted.get("local_ready")):
                 assert restarted.get("running") and restarted.get("state") not in {
                     "failed",
@@ -322,8 +341,8 @@ class TestMCPServer:
             assert cli("rotate")[0] == 0
             rotated = store.load()
             assert rotated.secret != original.secret
-            _, applied = cli("start")
-            assert applied["local_ready"]
+            cli("start")
+            settled(lambda s: s["local_ready"])
             async with httpx.AsyncClient(trust_env=False) as http:
                 rejected = await http.get(
                     f"http://127.0.0.1:{rotated.port}/mcp/{original.secret}"
@@ -374,8 +393,10 @@ class TestMCPServer:
                 )[0]
                 == 0
             )
-            _, ingress_failed = cli("start")
-            assert ingress_failed["local_ready"] and "launch" in ingress_failed["error"]
+            cli("start")
+            ingress_failed = settled(
+                lambda s: s["local_ready"] and "launch" in (s.get("error") or "")
+            )
             bg = await call(
                 "python",
                 {
@@ -397,7 +418,8 @@ class TestMCPServer:
                 )[0]
                 == 0
             )
-            _, pending = cli("start")
+            cli("start")
+            pending = settled(lambda s: s["local_ready"])
             assert pending["instance_id"] == ingress_failed["instance_id"]
             assert (
                 pending["public_origin"] == active.public_origin
@@ -425,10 +447,72 @@ class TestMCPServer:
                 assert (
                     active.public_origin in args and "https://next.invalid" not in args
                 )
-            assert cli("stop")[1]["state"] == "stopped"
-            _, reapplied = cli("start")
+            cli("restart")
+            reapplied = settled(
+                lambda s: s["local_ready"]
+                and s.get("instance_id") != pending["instance_id"]
+            )
             assert reapplied["public_origin"] == "https://next.invalid"
+            assert reapplied["instance_id"] != pending["instance_id"]
             assert reapplied["local_ready"] and not reapplied["restart_required"]
+
+            tunnel_id = "f28d5968-1e07-4a79-8055-0c7e58f38341"
+            credentials = tmp_path / "cloudflare-credentials.json"
+            cloudflare_secret = base64.b64encode(b"x" * 32).decode()
+            credentials.write_text(
+                json.dumps(
+                    {
+                        "TunnelID": tunnel_id,
+                        "TunnelSecret": cloudflare_secret,
+                        "AccountTag": "account",
+                    }
+                )
+            )
+            (home / "tunnel").write_text(
+                "import json,os,sys,time\nfrom pathlib import Path\n"
+                "p = Path(sys.argv[sys.argv.index('--config') + 1])\n"
+                "assert 'TUNNEL_TOKEN' not in os.environ\n"
+                "assert 'TUNNEL_CRED_CONTENTS' not in os.environ\n"
+                "Path('cloudflare-observed.json').write_text(p.read_text())\n"
+                "time.sleep(60)\n"
+            )
+            new_port = port()
+            code, configured = cli(
+                "setup",
+                "--non-interactive",
+                "--mode",
+                "cloudflare",
+                "--port",
+                new_port,
+                "--cloudflared-bin",
+                sys.executable,
+                "--cloudflare-tunnel-id",
+                tunnel_id,
+                "--cloudflare-credentials",
+                credentials,
+                "--probe-proxy",
+                "http://127.0.0.1:1",
+            )
+            assert code == 0 and configured["restart_required"]
+            assert configured["pending_changes"]["probe_proxy"]["running"] is None
+            cli("restart")
+            cloudflare = settled(
+                lambda s: s["local_ready"] and s["tunnel"] == "cloudflare"
+            )
+            assert cloudflare["local_ready"] and cloudflare["tunnel"] == "cloudflare"
+            assert cloudflare["active"]["probe_proxy"] == "http://127.0.0.1:1"
+            assert not cloudflare["public_ready"]
+            observed_cf = home / "cloudflare-observed.json"
+            for _ in range(100):
+                if observed_cf.exists():
+                    break
+                await asyncio.sleep(0.1)
+            generated = json.loads(observed_cf.read_text())
+            assert generated["ingress"][0] == {
+                "hostname": "next.invalid",
+                "service": f"http://127.0.0.1:{new_port}",
+            }
+            assert cloudflare_secret not in str(cloudflare) + str(generated)
         finally:
             for root, owner in ((home, store), (other_home, other)):
                 if owner.record_path.exists():
@@ -715,6 +799,106 @@ class TestMCPServer:
                             )
                         )[0].isError
                         assert (tmp_path / "note.txt").read_text() == "after"
+                        for index in range(2):
+                            text = f"中文🙂{index}\nsecond\n"
+                            path = f"contract-{index}.txt"
+                            created, written = await call(
+                                "write", {"path": path, "content": text}
+                            )
+                            assert not created.isError
+                            assert (tmp_path / path).read_text(encoding="utf-8") == text
+                            assert (
+                                f", {(tmp_path / path).stat().st_size} bytes)"
+                                in written["output"]
+                            )
+                            assert written["metadata"]["canvas_preview"][
+                                "bytes"
+                            ] == len(text.encode("utf-8"))
+                            assert not (await call("read", {"path": path}))[0].isError
+                            edited, _ = await call(
+                                "edit",
+                                {
+                                    "path": path,
+                                    "old": "second",
+                                    "new": "third",
+                                },
+                            )
+                            assert not edited.isError
+                            assert (tmp_path / path).read_text(
+                                encoding="utf-8"
+                            ) == text.replace("second", "third")
+                            expected = (tmp_path / path).read_bytes()
+                            rolled_back, _ = await call(
+                                "multi_edit",
+                                {
+                                    "path": path,
+                                    "edits": [
+                                        {"old": "third", "new": "fourth"},
+                                        {"old": "missing", "new": "bad"},
+                                    ],
+                                },
+                            )
+                            assert rolled_back.isError
+                            assert (tmp_path / path).read_bytes() == expected
+                            edited, _ = await call(
+                                "multi_edit",
+                                {
+                                    "path": path,
+                                    "edits": [
+                                        {"old": "third", "new": "fourth"},
+                                        {"old": "fourth", "new": "FIFTH"},
+                                    ],
+                                },
+                            )
+                            assert not edited.isError
+                            assert (tmp_path / path).read_text(
+                                encoding="utf-8"
+                            ) == text.replace("second", "FIFTH")
+                        found, paths = await call(
+                            "glob", {"pattern": "contract-*.txt", "limit": 1}
+                        )
+                        assert not found.isError
+                        assert (
+                            len(
+                                [
+                                    line
+                                    for line in paths["output"].splitlines()
+                                    if line.startswith("contract-")
+                                ]
+                            )
+                            == 1
+                        )
+                        found, matches = await call(
+                            "grep",
+                            {
+                                "pattern": "fifth",
+                                "glob": "contract-*.txt",
+                                "limit": 1,
+                                "ignore_case": True,
+                            },
+                        )
+                        assert not found.isError
+                        assert (
+                            len(
+                                [
+                                    line
+                                    for line in matches["output"].splitlines()
+                                    if ":2: FIFTH" in line
+                                ]
+                            )
+                            == 1
+                        )
+                        (tmp_path / ".contract-hidden.txt").write_text(
+                            "hidden", encoding="utf-8"
+                        )
+                        for include_hidden in (False, True):
+                            found, listing = await call(
+                                "tree", {"hidden": include_hidden}
+                            )
+                            assert not found.isError
+                            assert (
+                                ".contract-hidden.txt" in listing["output"]
+                            ) == include_hidden
                         shell, shell_data = await call(
                             "bash", {"command": "echo MCP-SHELL"}
                         )

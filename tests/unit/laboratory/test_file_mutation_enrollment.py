@@ -1,21 +1,19 @@
 """Laboratory exact-path mutation occupancy around file publication."""
 
-from __future__ import annotations
-
 import os
 import threading
 from pathlib import Path
 
 import pytest
 
-from kohakuterrarium.laboratory.adapters import terrarium_file_mutations as mut
-from kohakuterrarium.laboratory.adapters.terrarium_file_mutations import (
+from kohakuterrarium.laboratory.adapters.terrarium import file_mutations as mut
+from kohakuterrarium.laboratory.adapters.terrarium.file_mutations import (
     replace_enrolled,
     unlink_enrolled,
     write_bytes_enrolled,
 )
-from kohakuterrarium.session import file_family as family
-from kohakuterrarium.session.resource_gate import (
+from kohakuterrarium.session.occupancy import family
+from kohakuterrarium.session.occupancy.gate import (
     GATE,
     REASON_LEGACY_ENROLLED,
     REASON_LEGACY_PENDING,

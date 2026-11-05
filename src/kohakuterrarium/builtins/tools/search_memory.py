@@ -13,8 +13,8 @@ from kohakuterrarium.modules.tool.base import (
     ToolContext,
     ToolResult,
 )
-from kohakuterrarium.session.embedding import create_embedder
-from kohakuterrarium.session.memory_async import (
+from kohakuterrarium.session.memory.embedding import create_embedder
+from kohakuterrarium.session.memory.async_search import (
     LiveSessionMemory,
     live_memory_for_store,
 )
@@ -36,7 +36,10 @@ class SearchMemoryTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "Search this session's earlier events by keyword or meaning. Use to recall details already dropped from context. Not for searching files - use grep."
+        return (
+            "Search this session's earlier events by keyword or meaning. Use it to "
+            "recall details dropped from context. Not for searching files - use grep."
+        )
 
     @property
     def execution_mode(self) -> ExecutionMode:

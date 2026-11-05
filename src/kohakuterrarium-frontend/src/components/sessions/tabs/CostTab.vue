@@ -184,11 +184,11 @@ function openTurn(turnIndex) {
 watch(
   // ``detail.reloadKey`` re-runs this with the CURRENT agent/aggregate so
   // a live session's new rounds refetch without a manual refresh (UXI-01).
-  () => [detail.name, agent.value, agents.value, aggregateMode.value, detail.reloadKey],
-  async ([name, a, list, agg]) => {
+  () => JSON.stringify([detail.name, aggregateMode.value ? null : agent.value || agents.value[0] || null, aggregateMode.value, detail.reloadKey]),
+  async (key) => {
+    const [name, target, agg] = JSON.parse(key)
     if (!name) return
-    const target = agg ? null : a || list[0] || null
-    if (!agg && !a && list.length) agent.value = list[0]
+    if (!agg && !agent.value && target) agent.value = target
     await rollup.load(name, target, { aggregate: agg })
     expandedTurns.value = new Set()
   },

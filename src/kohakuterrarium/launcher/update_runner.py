@@ -39,6 +39,7 @@ from kohakuterrarium.launcher.tree_ops import (
     sweep_stale_partials,
     write_active_pointer,
 )
+from kohakuterrarium.launcher.versions import is_newer
 
 
 @dataclass
@@ -79,6 +80,12 @@ def _pick_bundled_tarball() -> Path | None:
         return None
     candidates = sorted(root.glob("kohakuterrarium-*.tar.*"))
     return candidates[0] if candidates else None
+
+
+def bundled_version() -> str | None:
+    """Return the version of the release archive shipped with the shell, if any."""
+    tarball = _pick_bundled_tarball()
+    return _bundled_version_from_filename(tarball) if tarball is not None else None
 
 
 def _bundled_version_from_filename(tarball: Path) -> str:
@@ -139,7 +146,8 @@ def _install_from_feed(
     """Resolve and install a feed release unless an update is current.
 
     First installation always proceeds. Update mode returns a successful
-    ``up-to-date`` result when the resolved version is already active.
+    ``up-to-date`` result when the resolved version is already active, or is not
+    newer than it unless the user pinned a version.
     """
     _safe_progress(progress, "resolve", 5.0, "Checking for updates")
     try:
@@ -149,7 +157,13 @@ def _install_from_feed(
 
     if is_update:
         current = read_active_pointer()
-        if current is not None and current.version == target.version:
+        stale = current is not None and (
+            current.version == target.version
+            or (
+                not cfg.pinned_version and not is_newer(target.version, current.version)
+            )
+        )
+        if stale:
             _safe_progress(progress, "done", 100.0, f"Already on {target.version}")
             return UpdateResult(
                 ok=True,
@@ -243,6 +257,33 @@ def _first_install_locked(progress: ProgressCallback) -> UpdateResult:
         cfg.runtime.last_check_error = result.error
     _settings.save(cfg)
     return result
+
+
+def adopt_newer_bundle(progress: ProgressCallback | None = None) -> UpdateResult:
+    """Activate the bundled release when it is newer than the active one.
+
+    An installed shell carries a release; a runtime left by an earlier install
+    must not hold the app on an older one.
+    """
+    progress = progress or _noop_progress
+    tarball = _pick_bundled_tarball()
+    active = read_active_pointer()
+    if tarball is None or active is None:
+        return UpdateResult(ok=True, skipped_reason="nothing-to-adopt")
+    version = _bundled_version_from_filename(tarball)
+    if not is_newer(version, active.version):
+        return UpdateResult(ok=True, skipped_reason="active-is-current")
+    try:
+        with UpdateLock(lock_path()):
+            result = _install_from_bundled(progress)
+            if result.ok:
+                cfg = _settings.load()
+                cfg.runtime.active_version = result.version
+                cfg.runtime.active_build_id = result.build_id
+                _settings.save(cfg)
+            return result
+    except LockBusy as e:
+        return UpdateResult(ok=False, error=f"another update is in progress: {e}")
 
 
 def first_install(progress: ProgressCallback | None = None) -> UpdateResult:

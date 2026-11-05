@@ -33,6 +33,7 @@ from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
 from kohakuterrarium.bootstrap.io import create_input, create_output
 from kohakuterrarium.builtins.outputs import StdoutOutput
+from kohakuterrarium.builtins.tool_catalog import list_builtin_tools
 from kohakuterrarium.bootstrap.llm import (
     _create_from_inline,
     _extract_controller_data,
@@ -44,8 +45,8 @@ from kohakuterrarium.bootstrap.subagents import create_subagent_config
 from kohakuterrarium.bootstrap.tools import create_tool
 from kohakuterrarium.bootstrap.triggers import create_trigger
 from kohakuterrarium.core.agent import Agent
-from kohakuterrarium.core.config import build_agent_config
-from kohakuterrarium.core.config_types import (
+from kohakuterrarium.core.config.load import build_agent_config
+from kohakuterrarium.core.config.types import (
     SubAgentConfigItem,
     ToolConfigItem,
     TriggerConfig,
@@ -57,6 +58,7 @@ from kohakuterrarium.modules.trigger.callable import CallableTriggerTool
 from kohakuterrarium.modules.trigger.channel import ChannelTrigger
 from kohakuterrarium.modules.trigger.context import ContextUpdateTrigger
 from kohakuterrarium.modules.trigger.timer import TimerTrigger
+from kohakuterrarium.modules.user_command.base import UserCommandContext
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
 
 # ── the only seam: the LLM provider factory ──────────────────────
@@ -97,7 +99,7 @@ def scripted_llm(monkeypatch):
 
 
 def _write_minimal_creature(root: Path) -> Path:
-    """A bare creature: no tools, no plugins, no sub-agents, no triggers.
+    """A bare creature with no explicitly configured modules.
 
     Exercises the happy path where each factory still has to produce a
     *real* component even when the config declares nothing for it.
@@ -269,7 +271,11 @@ def _write_rich_creature(root: Path) -> Path:
                 module: ./custom/ext.py
                 class: StampTool
             subagents:
-              - name: research
+              - {name: worker, type: builtin}
+              - {name: plan, type: builtin}
+              - {name: research, type: builtin}
+              - {name: coordinator, type: builtin}
+              - name: explore
                 type: builtin
               - name: critic
                 type: builtin
@@ -333,9 +339,12 @@ class TestBootstrapIntegration:
         assert agent.llm is scripted_llm.built[-1]
 
         # bootstrap.tools -> registry built. Config declared no tools, so
-        # the only entry is ``skill``, auto-registered by _init_controller
-        # because skill discovery always produces a registry.
-        assert agent.registry.list_tools() == ["skill"]
+        # the entries are ``skill`` (auto-registered by _init_controller
+        # because skill discovery always produces a registry) and the
+        # default-on ``ui.apps`` plugin's ``show_app``, which the model does
+        # not see while no client draws ``kt.app``.
+        assert sorted(agent.registry.list_tools()) == ["show_app", "skill"]
+        assert "show_app" not in agent.get_system_prompt()
 
         # _init_executor -> executor + session wired off the registry.
         assert agent.executor is not None
@@ -349,8 +358,8 @@ class TestBootstrapIntegration:
         plugin_names = {p["name"] for p in agent.plugins.list_plugins()}
         assert "tagplugin" not in plugin_names
 
-        # bootstrap.subagents -> manager built, no sub-agents registered.
-        assert agent.subagent_manager.list_subagents() == []
+        assert agent.subagent_manager.list_subagents() == ["fork"]
+        assert agent.registry.list_subagents() == ["fork"]
 
         # _init_output -> router with a real default output module.
         assert agent.output_router is not None
@@ -385,6 +394,44 @@ class TestBootstrapIntegration:
             and "minimal creature" in str(m.get("content", ""))
             for m in history
         )
+
+        for enabled in (False, True):
+            (config_dir / "config.yaml").write_text(
+                f"name: minimal\nfork_enabled: {str(enabled).lower()}\n"
+                'controller: {model: gpt-4-test, api_key_env: ""}\n'
+                "input: {type: none}\n"
+                "subagents:\n"
+                "  - name: fork\n"
+                "    type: builtin\n"
+                "    timeout: 300\n",
+                encoding="utf-8",
+            )
+            configured = Agent.from_path(str(config_dir))
+            try:
+                assert configured.subagents == (["fork"] if enabled else [])
+                if enabled:
+                    assert configured.subagent_manager.get_config("fork").timeout == 300
+                else:
+                    with pytest.raises(ValueError, match="disabled"):
+                        await configured.subagent_manager.start_side("side question")
+                    rejected = await configured.list_user_commands()["btw"].execute(
+                        "side question", UserCommandContext(agent=configured)
+                    )
+                    assert not rejected.success
+                    assert "disabled" in rejected.error
+                    assert "fork" not in {
+                        schema.name
+                        for schema in configured.controller._get_native_tool_schemas()
+                    }
+                    with pytest.raises(ValueError, match="not registered"):
+                        await configured.subagent_manager.spawn("fork", "side question")
+                    assert configured.llm.call_count == 0
+                await configured.start()
+                result = await configured.run("Still runnable after fork configuration")
+                assert result.text == "Hello from the minimal creature."
+                assert configured.llm.call_count == 1
+            finally:
+                await configured.stop()
 
         # ── bootstrap.llm pure-logic + error paths. The provider
         #    constructors need a live backend, but the config-extraction
@@ -463,7 +510,7 @@ class TestBootstrapIntegration:
     #    trigger + llm_profile, all wired and exercised live ─────────
 
     async def test_rich_creature_wires_every_factory_and_runs(
-        self, scripted_llm, tmp_path
+        self, scripted_llm, tmp_path, caplog
     ):
         """A fully-loaded creature built via ``Agent.from_path``.
 
@@ -506,14 +553,20 @@ class TestBootstrapIntegration:
         timer_tool = agent.registry.get_tool("add_timer")
         assert isinstance(timer_tool, CallableTriggerTool)
 
-        # bootstrap.subagents -> the builtin ``research`` sub-agent plus a
-        # ``critic`` whose inline ``extra_prompt`` option was overlaid
-        # onto the builtin config, plus a ``scout`` loaded as a
-        # ``SubAgentConfig`` object from a custom module.
-        assert "research" in agent.subagent_manager.list_subagents()
-        assert "critic" in agent.subagent_manager.list_subagents()
-        assert "scout" in agent.subagent_manager.list_subagents()
-        assert agent.registry.get_subagent("research") is not None
+        assert set(agent.subagent_manager.list_subagents()) == {
+            "explore",
+            "critic",
+            "scout",
+            "fork",
+        }
+        assert set(agent.registry.list_subagents()) == {
+            "explore",
+            "critic",
+            "scout",
+            "fork",
+        }
+        for removed in ("worker", "plan", "research", "coordinator"):
+            assert f"Skipping unavailable builtin sub-agent {removed!r}" in caplog.text
         critic_cfg = agent.registry.get_subagent("critic")
         assert critic_cfg.extra_prompt == "Be extra harsh."
         scout_cfg = agent.registry.get_subagent("scout")
@@ -593,6 +646,27 @@ class TestBootstrapIntegration:
         # stop() tears the trigger back down.
         assert heartbeat.is_running is False
         assert agent.llm.call_count == 2
+
+        configured_tools = set(agent.registry.list_tools())
+        discovered = list_builtin_tools()
+        assert {"read", "python", "web_search", "mcp_list"} <= set(discovered)
+        assert set(agent.registry.list_tools()) == configured_tools
+
+        for name in ("explore", "critic"):
+            agent.subagent_manager.llm = ScriptedLLM(
+                [
+                    f"[/read]\n@@path={config_dir / 'system.md'}\n[read/]",
+                    "Inspected system.md; no broader coverage claimed.",
+                ]
+            )
+            job_id = await agent.subagent_manager.spawn(
+                name, "Inspect system.md only.", background=False
+            )
+            result = agent.subagent_manager.get_result(job_id)
+            assert result.success
+            assert result.metadata["tools_used"] == ["read"]
+            assert "Inspected system.md" in result.output
+            assert agent.subagent_manager.get_status(job_id).state.value == "done"
 
         # ── direct factory-driver coverage for the bootstrap sub-agent /
         #    trigger / tool factories: the override-overlay branches and
@@ -807,7 +881,7 @@ class TestBootstrapIntegration:
         # Same wiring guarantees as the from_path path. The config
         # declared ``read``; ``skill`` is the auto-registered extra.
         assert isinstance(agent.llm, ScriptedLLM)
-        assert set(agent.registry.list_tools()) == {"read", "skill"}
+        assert set(agent.registry.list_tools()) == {"read", "skill", "show_app"}
         assert "read" in agent.executor._tools
         # Both sub-agents wired: a builtin and an inline custom one.
         assert "critic" in agent.subagent_manager.list_subagents()
@@ -1063,7 +1137,7 @@ class TestBootstrapIntegration:
                   - name: bad-trigger
                     type: not_a_real_trigger
                 subagents:
-                  - name: research
+                  - name: explore
                     type: builtin
                   - name: phantom
                     type: not_a_real_subagent_type
@@ -1093,7 +1167,7 @@ class TestBootstrapIntegration:
         assert "bad-trigger" not in trigger_ids
 
         # The bad sub-agent entry was dropped; the valid builtin survived.
-        assert "research" in agent.subagent_manager.list_subagents()
+        assert "explore" in agent.subagent_manager.list_subagents()
         assert "phantom" not in agent.subagent_manager.list_subagents()
 
         # The unresolvable plugin name did not land in the manager, but

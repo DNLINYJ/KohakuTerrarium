@@ -4,18 +4,16 @@ Offline SQLite fixtures only: these tests never open SessionStore / KohakuVault
 on the same file as CPython sqlite3.
 """
 
-from __future__ import annotations
-
 import sqlite3
 import time
 
-from kohakuterrarium.session.resource_gate import (
+from kohakuterrarium.session.occupancy.gate import (
     GATE,
     REASON_OK,
     REASON_LEGACY_ENROLLED,
     try_fast,
 )
-from kohakuterrarium.terrarium.drive.store_migration import (
+from kohakuterrarium.terrarium.drive.store.migration import (
     DRIVE_SCHEMA_VERSION,
     _SCHEMA,
 )

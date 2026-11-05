@@ -162,6 +162,13 @@ Procedural skills are separate from tool docs. Discovered package skills default
 disabled until the creature opts them in with `skills:`; the prompt only gets a
 byte-budgeted skill index, not every full `SKILL.md` body.
 
+Loading a procedural skill with `skill`, `info`, or `/<skill-name>` includes
+its absolute directory when it was loaded from a file. Resolve bundled
+references, scripts, and assets against that directory and use absolute paths
+in tool calls. Explicit project-relative paths still refer to the project;
+loading a skill does not change the working directory. `/skill show <name>`
+displays the same guidance. Supporting files are read only when needed.
+
 Skills with matching `paths` filters also add a short working-directory hint.
 That hint stays identical through the user's tool calls and background
 completions, preserving the history prefix for incremental Responses requests.
@@ -381,7 +388,7 @@ Compaction runs in the background and does not block the controller. See [Sessio
 
 ## Plugins
 
-Attach lifecycle/prompt plugins to this creature only:
+Attach plugins to this creature only:
 
 ```yaml
 plugins:

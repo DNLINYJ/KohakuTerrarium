@@ -1,14 +1,19 @@
 """Unit tests for :mod:`kohakuterrarium.api.routes.persistence.viewer`."""
 
 import asyncio
+import json
+import threading
 import types
 from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
+from kohakuvault import KVault
+from fastapi.testclient import TestClient
 
+import kohakuterrarium.session.vault.io as vault_io
+from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.api.routes.persistence import subagents as subagents_mod
 from kohakuterrarium.api.routes.persistence import viewer as viewer_mod
 from tests.helpers.loop_witness import LoopWitness
@@ -406,6 +411,114 @@ class TestLiveSessionResolution:
             assert witness.never_blocked, "live viewer builder blocked the loop"
         finally:
             store.close()
+
+
+@pytest.mark.parametrize("live", [False, True])
+async def test_cancelled_event_page_retains_worker_store(tmp_path, monkeypatch, live):
+    path = tmp_path / "cancel-page.kohakutr"
+    store = SessionStore(path)
+    store.init_meta("alice", "agent", "/p", "/w", ["alice"])
+    for _ in range(5):
+        store.append_event("alice", "x", {})
+    store.flush()
+    if not live:
+        store.close(update_status=False)
+    engine = types.SimpleNamespace(_session_stores={"graph": store} if live else {})
+    loop = asyncio.get_running_loop()
+    entered, closing, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    release = threading.Event()
+    owner, payloads, reads, order = [], [], [], []
+    original_read, original_close = KVault.get_many, SessionStore.close
+
+    def read(table, keys, *args, **kwargs):
+        if owner and table is owner[0].events and not payloads:
+            reads.append(threading.get_ident())
+            assert not closed.is_set()
+            if len(reads) == 1:
+                loop.call_soon_threadsafe(entered.set)
+                assert release.wait(5), "event read was not released"
+        return original_read(table, keys, *args, **kwargs)
+
+    def close(target, *args, **kwargs):
+        if owner and target is owner[0]:
+            loop.call_soon_threadsafe(closing.set)
+            try:
+                return original_close(target, *args, **kwargs)
+            finally:
+                order.append("closed")
+                loop.call_soon_threadsafe(closed.set)
+        return original_close(target, *args, **kwargs)
+
+    def build(target, canonical):
+        owner.append(target)
+        if live:
+            assert target is store
+        payload = viewer_mod.build_events_payload(
+            target,
+            canonical,
+            agent="alice",
+            turn_index=None,
+            types=None,
+            from_ts=None,
+            to_ts=None,
+            limit=2,
+            cursor=None,
+        )
+        payloads.append(payload)
+        order.append("built")
+        return payload
+
+    def append():
+        order.append("append")
+        store.append_event("alice", "x", {"content": "after page"})
+
+    monkeypatch.setattr(vault_io, "READ_CHUNK", 1)
+    monkeypatch.setattr(KVault, "get_many", read)
+    monkeypatch.setattr(SessionStore, "close", close)
+    task = asyncio.create_task(viewer_mod._build_single(engine, "graph", path, build))
+    close_task = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        later = store.submit(append) if live else None
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not release.is_set()
+        assert not closed.is_set()
+        assert payloads == []
+        if live:
+            assert not later.done()
+            close_task = asyncio.create_task(
+                asyncio.to_thread(store.close, update_status=False)
+            )
+            await asyncio.wait_for(closing.wait(), timeout=5)
+            assert not closed.is_set()
+        release.set()
+        await asyncio.wait_for(closed.wait(), timeout=5)
+        if close_task:
+            await close_task
+        assert order == (["built", "append", "closed"] if live else ["built", "closed"])
+        assert len(reads) == 2
+        assert len(set(reads)) == 1
+        assert reads[0] != threading.get_ident()
+        assert [row["event_id"] for row in payloads[0]["events"]] == [1, 2]
+        assert payloads[0]["next_cursor"] == 2
+        assert json.loads(json.dumps(payloads[0])) == payloads[0]
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        if close_task:
+            await close_task
+        elif live:
+            await asyncio.to_thread(store.close, update_status=False)
+        else:
+            await asyncio.wait_for(closed.wait(), timeout=5)
+    if live:
+        reopened = SessionStore(path)
+        try:
+            assert reopened.get_events("alice")[-1]["content"] == "after page"
+        finally:
+            reopened.close(update_status=False)
 
 
 # ── turns ──────────────────────────────────────────────────────

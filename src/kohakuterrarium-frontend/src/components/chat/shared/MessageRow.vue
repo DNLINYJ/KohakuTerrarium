@@ -71,6 +71,7 @@
 
   <!-- User message -->
   <div v-else-if="message.role === 'user'" class="ml-auto group relative" :class="editing ? 'w-[min(760px,92%)] max-w-[92%]' : 'max-w-[80%]'">
+    <MessageDecorators position="header" :message="messageInfo" />
     <div class="kt-conversation-user-bubble chat-cv" :class="{ 'opacity-70': message.queued, 'user-message-editing': editing }">
       <div class="text-xs text-warm-400 mb-1 flex items-center gap-1.5">
         <span>You</span>
@@ -116,6 +117,7 @@
       <ConversationMessage v-else :message="message" :render-text="renderSharedText" :render-content-part="renderSharedContentPart" bare />
       <p v-if="editError || branchOperationError" class="mt-1 text-sm text-coral-shadow dark:text-coral-light" role="alert">{{ editError || branchOperationError }}</p>
     </div>
+    <MessageDecorators position="footer" :message="messageInfo" />
     <!-- Hover actions for user messages -->
     <div v-if="!editing && !message.queued && !message.injectedMidTurn && messageIdx != null" class="absolute -bottom-5 right-2 flex gap-1 items-center hover-only-action chat-msg-actions chat-msg-actions--right">
       <!-- Branch navigator on user message: shown only when this turn
@@ -136,6 +138,7 @@
       <button class="msg-action-btn" title="Edit & rerun" aria-label="Edit and rerun message" :disabled="branchOperationBusy" :aria-busy="branchOperationBusy" @click="startEdit">
         <span class="i-carbon-edit text-xs" />
       </button>
+      <ActionButtons target="message" role="user" :context="actionContext" button-class="msg-action-btn" />
     </div>
   </div>
 
@@ -146,9 +149,11 @@
        keyed on the first tool's id so streaming new tools into an
        in-progress batch doesn't reshuffle ``expandedTools`` state. -->
   <div v-else-if="message.role === 'assistant' && message.parts" class="max-w-[90%] group relative">
+    <MessageDecorators position="header" :message="messageInfo" />
     <div class="chat-cv">
       <ConversationMessage :message="message" :render-text="renderSharedText" :render-content-part="renderSharedAssistantPart" bare />
     </div>
+    <MessageDecorators position="footer" :message="messageInfo" />
     <!-- Hover actions -->
     <div class="absolute -bottom-5 left-2 flex gap-1 items-center hover-only-action chat-msg-actions chat-msg-actions--left">
       <!-- Branch navigator on the assistant bubble: shown only when
@@ -174,6 +179,7 @@
       <button class="msg-action-btn" title="Regenerate" aria-label="Regenerate response" :disabled="branchOperationBusy" :aria-busy="branchOperationBusy" @click="regenerate">
         <span class="i-carbon-renew text-xs" />
       </button>
+      <ActionButtons target="message" role="assistant" :context="actionContext" button-class="msg-action-btn" />
     </div>
   </div>
 
@@ -210,21 +216,32 @@
 
   <!-- Phase B output-event kinds (ask_text, confirm, selection, progress, notification, card) -->
   <ConversationMessage v-else-if="message.role === 'ui_event'" :message="message" :render-ui-event="renderSharedUIEvent" @reply="onUIEventReply" />
+
+  <!-- Widgets (renderer looked up in the widget registry) -->
+  <WidgetBlock v-else-if="message.role === 'widget'" :widget="widgetView" :host="widgetHost" />
 </template>
 
 <script setup>
 import { computed, h, inject, reactive, ref } from "vue"
 
+import AssistantText from "./AssistantText.vue"
 import CommandResultMessage from "../CommandResultMessage.vue"
 import ConversationMessage from "./ConversationMessage.js"
 import ToolCallBatch from "../ToolCallBatch.vue"
 import ToolCallBlock from "../ToolCallBlock.vue"
 import VideoFilePreview from "../VideoFilePreview.vue"
 import UIEventBlock from "../UIEventBlock.vue"
+import WidgetBlock from "../widgets/WidgetBlock.vue"
+import { sayToChat } from "../widgets/ktui/sayMessage.js"
+import { makeWidgetHost } from "../widgets/widgetHost.js"
+import { widgetFromMessage } from "../widgets/widgetModel.js"
 import MarkdownRenderer from "../../../public/chat/MarkdownRenderer.vue"
 import { MediaImage } from "../../../public/chat/MediaPreview.js"
 import { useMessageActions } from "../../../public/chat/messageActions.js"
 import { contentToText, useMessageRowActions } from "../../../public/chat/useMessageRowActions.js"
+import ActionButtons from "@/ext/ActionButtons.vue"
+import MessageDecorators from "@/ext/MessageDecorators.vue"
+import { useCanvasStore } from "@/stores/canvas"
 import { useChatStore } from "@/stores/chat"
 import { GEM } from "@/utils/colors"
 import { useI18n } from "@/utils/i18n"
@@ -280,7 +297,10 @@ function toggleTool(id) {
   expandedTools[id] = !expandedTools[id]
 }
 
-function renderSharedText(content, breaks = false) {
+function renderSharedText(content, breaks = false, options = null) {
+  if (options?.assistant) {
+    return h(AssistantText, { content, breaks, origin: markdownOrigin, streaming: options.streaming === true, canOpenCanvas: hostActions?.canvas !== false, uiStore: chat, uiAddress: uiAddress.value, onSay: sendUiMessage, onOpenCanvas: openUiInCanvas })
+  }
   return h(MarkdownRenderer, { content, breaks, origin: markdownOrigin })
 }
 
@@ -332,7 +352,9 @@ function renderSharedContentPart(part) {
 }
 
 const chat = inject("chatStore", null) || useChatStore()
+const canvasStore = inject("canvasStore", null) || useCanvasStore()
 const messageTab = computed(() => props.tabId || chat.activeTab)
+const uiAddress = computed(() => ({ tab: messageTab.value, turn: props.message.turnIndex, branch: props.message.branchId }))
 
 // Phase B UI event reply: route through the host seam so the VS Code webview
 // keeps its accepted-reply transport (never a raw store bypass) while the
@@ -346,11 +368,44 @@ function onUIEventReply({ actionId, values }) {
   chat.submitUIReply(messageTab.value, props.message.eventId, actionId, values || {})
 }
 
+// Widget transport: a renderer's messages and state go to the creature that
+// opened the widget, through the chat store.
+const widgetView = computed(() => (props.message.role === "widget" ? widgetFromMessage(props.message) : null))
+const widgetHost = makeWidgetHost({
+  store: chat,
+  tab: () => messageTab.value,
+  eventId: props.message.eventId,
+  canvas: canvasStore,
+  extra: { origin: markdownOrigin },
+})
+
+// Inline UI sends use the host's user-message transport when it has one.
+function sendUiMessage(text) {
+  return sayToChat(chat, text, t, hostActions?.sendText || null)
+}
+
+function openUiInCanvas({ source, title }) {
+  canvasStore.pinUi?.({ source, title })
+}
+
 const showSenderHeader = computed(() => {
   if (props.message.role !== "channel") return false
   if (!props.prevMessage || props.prevMessage.role !== "channel") return true
   return props.prevMessage.sender !== props.message.sender
 })
+
+// Read-only description of this message handed to extension actions and decorators.
+const messageInfo = computed(() => {
+  const message = props.message
+  const text = message.parts
+    ? message.parts
+        .filter((part) => part.type === "text" && part.content)
+        .map((part) => part.content)
+        .join("")
+    : contentToText(message.contentParts || message.content)
+  return { id: message.id ?? null, role: message.role, text, turn: message.turnIndex ?? null, tab: messageTab.value }
+})
+const actionContext = () => messageInfo.value
 
 const senderGemColor = computed(() => _gemForSender(props.message.sender))
 
@@ -423,7 +478,8 @@ const { editing, editText, editAttachments, editTextRestricted, editTextareaEl, 
   }
 }
 
-.msg-action-btn {
+.msg-action-btn,
+:deep(.msg-action-btn) {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -439,7 +495,8 @@ const { editing, editText, editAttachments, editTextRestricted, editTextareaEl, 
     color 0.15s,
     border-color 0.15s;
 }
-.msg-action-btn:hover {
+.msg-action-btn:hover,
+:deep(.msg-action-btn:hover) {
   background: var(--color-card-hover);
   color: var(--color-text);
   border-color: var(--color-border-hover);

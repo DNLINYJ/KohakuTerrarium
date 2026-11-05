@@ -30,7 +30,7 @@ from pathlib import Path
 
 import pytest
 
-from kohakuterrarium.llm.api_keys import PROVIDER_KEY_MAP, get_api_key
+from kohakuterrarium.llm.profiles.api_keys import PROVIDER_KEY_MAP, get_api_key
 
 _REAL_CONFIG_DIR = Path.home() / ".kohakuterrarium"
 
@@ -213,7 +213,8 @@ def test_daemon_probe_ignores_a_missing_or_dead_pid(tmp_path):
 
 
 async def test_a_test_cannot_start_a_real_provider_login():
-    from kohakuterrarium.llm import codex_auth, codex_provider
+    from kohakuterrarium.llm.codex import auth as codex_auth
+    from kohakuterrarium.llm.codex import provider as codex_provider
 
     for module in (codex_auth, codex_provider):
         with pytest.raises(AssertionError, match="real provider login"):

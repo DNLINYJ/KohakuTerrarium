@@ -16,6 +16,10 @@ class SessionNotReadyError(RuntimeError):
     """
 
 
+class SessionViewClosedError(RuntimeError):
+    """Raised when a closed read-only session view is queried."""
+
+
 class AlreadyAttachedError(Exception):
     """Raised when an agent is attached to a different session.
 

@@ -24,7 +24,7 @@ Config 裡指到其他檔案或套件的欄位，解析順序：
 
 ## 生物設定 (`config.yaml`)
 
-由 `kohakuterrarium.core.config.load_agent_config` 載入。檔案查找順序：`config.yaml` → `config.yml` → `config.json` → `config.toml`。
+由 `kohakuterrarium.core.config.load.load_agent_config` 載入。檔案查找順序：`config.yaml` → `config.yml` → `config.json` → `config.toml`。
 
 ### 頂層欄位
 
@@ -55,7 +55,7 @@ Config 裡指到其他檔案或套件的欄位，解析順序：
 | `pwd_guard` | str | `"warn"` | 否 | 工作目錄之外的檔案存取：`warn` (對某路徑的第一次嘗試會被拒絕並給出警告，重試則放行)、`block` (一律拒絕) 或 `off` (不檢查)。工作目錄只是預設位置，不是沙箱；需要真正的能力限制請用 `sandbox` 外掛。 |
 | `tool_format` | str \| dict | `"bracket"` | 否 | `bracket`、`xml`、`native`，或自訂 dict 格式。`native` 需要設定的 LLM provider 支援結構化的 tool calling。 |
 | `mcp_servers` | list | `[]` | 否 | 每隻代理的 MCP server。見 [MCP server](#生物-config-裡的-mcp-server)。 |
-| `plugins` | list | `[]` | 否 | Lifecycle 外掛。見 [外掛](#外掛)。 |
+| `plugins` | list | `[]` | 否 | 外掛。見 [外掛](#外掛)。 |
 | `no_inherit` | list[str] | `[]` | 否 | 改成**取代**而非合併的 key。例如 `[tools, subagents]`。 |
 | `memory` | dict | `{}` | 否 | `memory.embedding.{provider,model}`。見 [記憶](#記憶)。 |
 | `output_wiring` | list | `[]` | 否 | 每隻生物的回合輸出自動路由。見 [輸出接線](#輸出接線)。 |
@@ -81,7 +81,7 @@ Config 裡指到其他檔案或套件的欄位，解析順序：
 | `extra_body` | dict | `{}` | 深層合併到解析後 preset 的 `extra_body` 上 (後者可能已經帶有 variation patch)。 |
 | `tool_doc_mode`、`include_tools_in_prompt`、`include_hints_in_prompt`、`max_messages`、`ephemeral`、`tool_format` | | | 對映頂層同名欄位。 |
 
-每回合解析順序 (見 `llm/profiles.py:resolve_controller_llm`)：
+每回合解析順序 (見 `llm/profiles/resolve.py:resolve_controller_llm`)：
 
 1. CLI 旗標 `--llm` 勝過 YAML 裡的 `controller.llm`。
 2. 否則用 `controller.llm` (preset 名稱 + 可選的 `@group=option` selector)。
@@ -508,7 +508,7 @@ Root（面向使用者的特權節點）：
 - 規範路徑：`config_dir() / "drive-settings.yaml"`，通常是
   `~/.kohakuterrarium/drive-settings.yaml`（尊重 `KT_CONFIG_DIR`）。它
   **不是** launcher 的 `app-settings.json`。
-- 由 `kohakuterrarium.studio.identity.drive_settings` 載入 / 校驗。
+- 由 `kohakuterrarium.studio.identity.drive_settings.settings` 載入 / 校驗。
 - 只存可序列化的選擇和選項——絕不存活的 Python 物件，也絕不存 Drive
   記錄（那些活在 Drive 倉庫 / session sidecar 裡）。
 - **缺失** 的檔案解析為執行期 **停用** 的預設。**格式錯誤** 的檔案丟一個
@@ -626,6 +626,12 @@ subagent_models:
   explore: openrouter/mimo-v2.5-pro
   worker: codex/gpt-5.5
 
+# 選用：group_add_node 與 group_spawn_child 的子 creature 預設模型。
+# 鍵是正規化後的 @pkg/...；default 是全域 child 預設。
+child_models:
+  default: openrouter/mimo-v2.5-pro
+  "@kt-biome/creatures/swe": codex/gpt-5.5
+
 backends:
   <provider-name>:
     backend_type: openai | anthropic | codex  # transport 實作
@@ -658,7 +664,9 @@ presets:
 
 內建 provider 名稱 (`codex`、`openai`、`openrouter`、`anthropic`、`gemini`、`mimo`、`kimi-code`、`glm-coding`) 不能刪除；它們的 base URL 與 `api_key_env` 由內建預設值寫死。每隻代理仍然可以用 `controller.base_url` / `controller.api_key_env` 覆寫。
 
-`subagent_models` 讓使用者不用修改上游 creature 套件，就能設定各 subagent 的預設模型。鍵會與最終的 `SubAgentConfig.name` 精確匹配。creature 或 subagent 模組中的具體 `model` 仍然優先；`parent`、`inherit`、`default` 明確表示繼承父 LLM。未設定模型、使用 `subagent-default` 或 `subagent_default` 時會優先採用同名設定，未命中則繼承父模型。此映射在建立 subagent 時讀取，因此修改只影響之後建立的 job。Conversation 與 Inspector Trace 會記錄每個新 job 實際綁定的模型，優先顯示正規化 profile selector，缺少時 fallback 到 raw model id。
+`subagent_models` 讓使用者不用修改上游 creature 套件，就能設定各 subagent 的預設模型。鍵會與最終的 `SubAgentConfig.name` 精確匹配。命中的使用者設定會覆蓋未設定的模型，以及 `parent`、`inherit`、`default`、`subagent-default`、`subagent_default`。直接寫在該 subagent 設定上的具體 selector 仍然優先；沒有命中時繼承父 LLM。此映射在建立 subagent 時讀取，因此修改只影響之後建立的 job。Conversation 與 Inspector Trace 會記錄每個新 job 實際綁定的模型，優先顯示正規化 profile selector，缺少時 fallback 到 raw model id。
+
+`child_models` 為 `group_add_node` 與 `group_spawn_child` 提供同類的使用者預設模型。它不影響 `kt run`、Studio、recipe 與直接 Python API。本次呼叫的 `llm` 參數優先。具名 `@pkg/...` 設定會覆蓋具體模型，但表內 `default` 不會；它只用於未寫模型或 `parent`、`inherit`、`default`。結果回傳 `requested_llm`、`llm`、`llm_source`、`matched_key`、`llm_fallback_from` 與 `fallback_reason`。查表時按正規化的 `@pkg/...`，從目前 creature 到 `base_config` 祖先，由近到遠使用第一個命中的鍵。鍵不匹配 `config.name`、spawn 的 `name` 或本機路徑。表內 `default` 是全域 child 預設，與設定哨兵 `default` 不是同一個意思。表中的 selector 不可用時，回退到呼叫者模型，再回退到 `default_model`。工具回傳 `llm`、`llm_source` 與 `llm_fallback_from`。檔案在 spawn 時讀取，修改只影響之後的 spawn。
 
 ### 新增自訂 LLM backend provider
 

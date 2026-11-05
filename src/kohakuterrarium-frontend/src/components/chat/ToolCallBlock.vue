@@ -75,6 +75,8 @@
           <SubagentConversationPanel v-if="convOpen" class="m-2" :session-id="conversationSessionId" :parent="chat.activeTab || ''" :job-id="tc.jobId || ''" :name="tc.name" :run="tc.run" :status="tc.status" :depth="depth" :live="conversationLive" />
         </div>
       </template>
+      <!-- A UI extension owning this tool renders its body. -->
+      <component :is="toolRenderer.component" v-else-if="toolRenderer" :call="tc" />
       <template v-else>
         <!-- Collapsible media: shown only while the block is expanded. -->
         <div v-if="collapsibleMediaParts.length" class="flex flex-col gap-2 p-2 border-b border-sapphire/15 dark:border-sapphire/20 bg-sapphire/4 dark:bg-sapphire/6" data-testid="tool-media-collapsible">
@@ -113,6 +115,7 @@
 <script setup>
 import { computed, inject } from "vue"
 
+import { toolRenderers } from "@/ext/renderers"
 import { useChatStore } from "@/stores/chat"
 
 import MarkdownRenderer from "../../public/chat/MarkdownRenderer.vue"
@@ -120,6 +123,7 @@ import { safeArtifactUrl, safeMediaParts } from "../../public/chat/mediaRefs.js"
 import { usePlatformOrigin } from "../../public/chat/platformOrigin.js"
 import { useI18n } from "../../utils/i18n"
 import SubagentConversationPanel from "../subagents/SubagentConversationPanel.vue"
+import { builtinToolBody } from "./toolBodies/builtinToolBodies.js"
 import VideoFilePreview from "./VideoFilePreview.vue"
 
 const props = defineProps({
@@ -130,6 +134,7 @@ const props = defineProps({
 
 const emit = defineEmits(["toggle"])
 const chat = inject("chatStore", null) || useChatStore()
+const toolRenderer = computed(() => toolRenderers.get(props.tc.name) || builtinToolBody(props.tc))
 const { t } = useI18n()
 // The shared platform-origin seam (installed by the host) owns the origin
 // tool-result Markdown links resolve against. It is left uninstalled by the

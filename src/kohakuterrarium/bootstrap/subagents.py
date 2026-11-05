@@ -5,7 +5,7 @@ Resolve and register configured sub-agents.
 from typing import Any
 
 from kohakuterrarium.builtins.subagent_catalog import get_builtin_subagent_config
-from kohakuterrarium.core.config import AgentConfig
+from kohakuterrarium.core.config.load import AgentConfig
 from kohakuterrarium.core.loader import ModuleLoader, ModuleLoadError
 from kohakuterrarium.core.registry import Registry
 from kohakuterrarium.modules.subagent import SubAgentManager
@@ -21,7 +21,14 @@ def _apply_option_overrides(config: SubAgentConfig, options: dict[str, Any]) -> 
         config.extra_prompt = options["extra_prompt"]
     if options.get("extra_prompt_file"):
         config.extra_prompt_file = options["extra_prompt_file"]
-    for field_name in ("default_plugins", "plugins", "compact", "model"):
+    for field_name in (
+        "default_plugins",
+        "plugins",
+        "compact",
+        "model",
+        "max_turns",
+        "timeout",
+    ):
         if field_name in options:
             setattr(config, field_name, options[field_name])
     if "notify_controller_on_background_complete" in options:
@@ -39,7 +46,13 @@ def create_subagent_config(
         case "builtin":
             config = get_builtin_subagent_config(item.name)
             if config is None:
-                logger.warning("Unknown builtin sub-agent", subagent_name=item.name)
+                logger.warning(
+                    f"Skipping unavailable builtin sub-agent {item.name!r}. "
+                    "The remaining configuration will still load. Update kt-biome "
+                    "or remove this entry; use explore/critic for bounded inspection "
+                    "and graph creatures for substantial delegated work.",
+                    subagent_name=item.name,
+                )
                 return None
 
             _apply_option_overrides(config, item.options)
@@ -91,7 +104,15 @@ def init_subagents(
     loader: ModuleLoader | None,
 ) -> None:
     """Register sub-agents with both execution and parsing registries."""
+    if config.fork_enabled and not any(
+        item.name == "fork" for item in config.subagents
+    ):
+        fork = get_builtin_subagent_config("fork")
+        subagent_manager.register(fork)
+        registry.register_subagent(fork.name, fork)
     for subagent_item in config.subagents:
+        if subagent_item.name == "fork" and not config.fork_enabled:
+            continue
         sa_config = create_subagent_config(subagent_item, loader)
         if sa_config:
             subagent_manager.register(sa_config)

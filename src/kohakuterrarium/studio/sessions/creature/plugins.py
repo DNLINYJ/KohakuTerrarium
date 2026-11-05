@@ -1,0 +1,105 @@
+"""Inspect, configure, and toggle plugins on live creatures.
+
+The option surface mirrors provider-native tool configuration by exposing each
+plugin's schema, current values, and mutation path.
+"""
+
+from typing import Any
+
+from kohakuterrarium.studio.sessions.lifecycle import find_creature
+from kohakuterrarium.terrarium import TerrariumService
+from kohakuterrarium.terrarium.creature.ops import agent_toggle_plugin
+from kohakuterrarium.studio._runtime import as_engine
+
+
+def list_plugins(
+    service: "TerrariumService", session_id: str, creature_id: str
+) -> list[dict]:
+    """Return plugins with enabled / disabled status.  Empty list when
+    the creature has no plugin manager."""
+    engine = as_engine(service)
+    agent = find_creature(engine, session_id, creature_id).agent
+    if not agent.plugins:
+        return []
+    return agent.plugins.list_plugins()
+
+
+def plugin_inventory(
+    service: "TerrariumService", session_id: str, creature_id: str
+) -> list[dict]:
+    """Return plugins enriched with option schema + current values.
+
+    This is the runtime equivalent of ``native_tool_inventory`` — drives
+    the schema-aware options editor in the frontend Plugins tab.
+    """
+    engine = as_engine(service)
+    agent = find_creature(engine, session_id, creature_id).agent
+    if not agent.plugins:
+        return []
+    return agent.plugins.list_plugins_with_options()
+
+
+def get_plugin_options(
+    service: "TerrariumService", session_id: str, creature_id: str, plugin_name: str
+) -> dict[str, Any]:
+    """Return the current options dict of a single plugin.
+
+    Raises ``KeyError`` if the plugin isn't registered.
+    """
+    engine = as_engine(service)
+    agent = find_creature(engine, session_id, creature_id).agent
+    if not agent.plugins:
+        raise KeyError(plugin_name)
+    plugin = agent.plugins.get_plugin(plugin_name)
+    if plugin is None:
+        raise KeyError(plugin_name)
+    schema_fn = getattr(type(plugin), "option_schema", None)
+    schema: dict[str, dict[str, Any]] = {}
+    if callable(schema_fn):
+        try:
+            schema = schema_fn() or {}
+        except Exception:
+            schema = {}
+    values = plugin.get_options() if hasattr(plugin, "get_options") else {}
+    return {
+        "name": plugin_name,
+        "schema": schema,
+        "options": values,
+    }
+
+
+def set_plugin_options(
+    service: "TerrariumService",
+    session_id: str,
+    creature_id: str,
+    plugin_name: str,
+    values: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate + apply runtime option overrides on a plugin.
+
+    Persists to the agent's session store via
+    :class:`PluginOptions`. Returns the post-merge options dict.
+    Raises ``KeyError`` if no such plugin, ``ValueError`` (which is
+    a ``PluginOptionError``) on validation failure.
+    """
+    engine = as_engine(service)
+    agent = find_creature(engine, session_id, creature_id).agent
+    helper = getattr(agent, "plugin_options", None)
+    if helper is None:
+        raise ValueError(f"Creature {creature_id!r} has no plugin_options helper")
+    return helper.set(plugin_name, values or {})
+
+
+async def toggle_plugin(
+    service: "TerrariumService", session_id: str, creature_id: str, plugin_name: str
+) -> dict:
+    """Flip a plugin's enabled state.  Returns ``{name, enabled}``.
+
+    Delegates to :func:`agent_toggle_plugin` so the studio path shares
+    the terrarium path's contract: ``ValueError`` when the creature has
+    no plugin manager, ``KeyError`` for a plugin name the creature does
+    not have — never a fabricated success.
+    """
+    engine = as_engine(service)
+    agent = find_creature(engine, session_id, creature_id).agent
+    return await agent_toggle_plugin(agent, plugin_name)

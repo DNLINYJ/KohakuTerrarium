@@ -67,7 +67,7 @@ terrarium, studio}` plus multi-node. e2e answers one question:
 ### Carve-outs
 
 Some files are intentionally excluded from the 95% per-file
-coverage target: third-party providers (`llm/codex_provider.py`),
+coverage target: third-party providers (`llm/codex/provider.py`),
 platform PTY (`api/ws/pty.py`), the end-user CLI/UI
 (`builtins/cli_rich/*`, `builtins/tui/*`), the pywebview boot path.
 The full list is in `tests/README.md`.
@@ -286,14 +286,14 @@ Mirror `src/` layout under `tests/unit/`:
 | You changed             | Add tests under                    |
 |-------------------------|------------------------------------|
 | `core/agent.py`         | `tests/unit/test_phase5.py` or a new file |
-| `core/controller.py`    | `tests/unit/test_phase3_4.py`      |
-| `core/executor.py`      | `tests/unit/test_phase3_4.py`      |
+| `core/controller/controller.py`    | `tests/unit/test_phase3_4.py`      |
+| `core/jobs/executor.py`      | `tests/unit/test_phase3_4.py`      |
 | `parsing/`              | `tests/unit/test_phase2.py`        |
 | `modules/subagent/`     | `tests/unit/test_phase6.py`        |
 | `modules/trigger/`      | `tests/unit/test_phase7.py`        |
 | `core/environment.py`   | `tests/unit/test_environment.py`   |
 | `session/store.py`      | `tests/unit/test_session_store.py` |
-| `session/resume.py`     | `tests/unit/test_session_resume.py`|
+| `session/resume/resume.py`     | `tests/unit/test_session_resume.py`|
 | `bootstrap/`            | `tests/unit/test_bootstrap.py`     |
 | `terrarium/`            | `tests/unit/test_terrarium_modules.py` |
 
@@ -336,7 +336,7 @@ No Lab transport is started; these are sub-millisecond.
 
 For workflows that span the actual Lab dispatch logic
 (handshake → APP request → response), use `InProcTransport` from
-`laboratory/_internal/transport_inproc.py`. It implements the
+`laboratory/_internal/transport/inproc.py`. It implements the
 same `LabTransport` Protocol as the WebSocket transport but
 keeps everything in one event loop. See
 `tests/unit/laboratory/test_client_host.py::_start_host` for

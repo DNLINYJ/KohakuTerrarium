@@ -14,15 +14,15 @@ from kohakuterrarium.api.auth.dependencies import get_optional_user
 from kohakuterrarium.api.auth.models import User
 from kohakuterrarium.api.deps import get_service
 from kohakuterrarium.api.routes.sessions_v2 import drives as drives_mod
-from kohakuterrarium.terrarium.creature_host import Creature
+from kohakuterrarium.terrarium.creature.host import Creature
 from kohakuterrarium.terrarium.drive.config import (
     DriveRuntimeConfig,
     default_registrations,
 )
 from kohakuterrarium.terrarium.drive.errors import DriveError
 from kohakuterrarium.terrarium.drive.models import ActorRef
-from kohakuterrarium.terrarium.engine import Terrarium
-from kohakuterrarium.terrarium.service import LocalTerrariumService
+from kohakuterrarium.terrarium.engine.engine import Terrarium
+from kohakuterrarium.terrarium.service.service import LocalTerrariumService
 from kohakuterrarium.testing.terrarium import _FakeAgent
 
 pytestmark = pytest.mark.timeout(30)
@@ -57,7 +57,7 @@ def _client(service, *, user=None):
 
 
 async def _make_drive(service, graph_id):
-    from kohakuterrarium.studio.sessions import drives as facade
+    from kohakuterrarium.studio.sessions.drives import drives as facade
 
     view = await facade.create_record(
         service,

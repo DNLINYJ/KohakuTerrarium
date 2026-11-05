@@ -21,14 +21,14 @@ from kohakuterrarium.builtins.cli_rich.runtime import spawn
 from kohakuterrarium.builtins.cli_rich.theme import COLOR_USER, ICON_USER
 from kohakuterrarium.builtins.outputs.stdout import _write_safe
 from kohakuterrarium.llm.message import content_display_text
-from kohakuterrarium.session.history import (
+from kohakuterrarium.session.history.replay import (
     dedupe_adjacent_duplicate_events,
     select_live_event_ids,
 )
 from kohakuterrarium.utils.logging import get_logger
 
 if TYPE_CHECKING:
-    from kohakuterrarium.builtins.cli_rich.app import RichCLIApp
+    from kohakuterrarium.builtins.cli_rich.app.app import RichCLIApp
 
 logger = get_logger(__name__)
 

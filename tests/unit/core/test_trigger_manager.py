@@ -1,8 +1,11 @@
 """Unit tests for :mod:`kohakuterrarium.core.trigger_manager`."""
 
 import asyncio
+import gc
 import time
+import weakref
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 
@@ -315,6 +318,96 @@ class TestStartStopAll:
         assert mgr._triggers == {}
         assert mgr._tasks == {}
         assert mgr._created_at == {}
+
+
+class _HostAgent:
+    def __init__(self, name):
+        self.config = SimpleNamespace(name=name)
+
+
+class _ProtocolTrigger:
+    """A protocol-only trigger (not a BaseTrigger) with its own bind_host."""
+
+    def __init__(self):
+        self.bound: list[tuple[str, str]] = []
+
+    def bind_host(self, creature_id, agent_name, agent):
+        self.bound.append((creature_id, agent_name))
+
+    async def start(self):
+        pass
+
+    async def stop(self):
+        pass
+
+    async def wait_for_trigger(self):
+        await asyncio.Event().wait()
+
+    def set_context(self, context):
+        pass
+
+
+class TestHostBinding:
+    async def test_solo_host_falls_back_to_agent_name(self, mgr):
+        agent = _HostAgent("solo")
+        mgr.set_host_agent(agent)
+        t = _StubTrigger()
+        await mgr.add(t)
+        assert t.host_creature_id == "solo"
+        assert t.host_agent_name == "solo"
+        assert t.host_agent is agent
+        await mgr.stop_all()
+
+    async def test_runtime_config_and_rebound_triggers_share_the_creature_id(self, mgr):
+        agent = _HostAgent("bot")
+        mgr.set_host_agent(agent)
+        config_trigger = _StubTrigger()
+        # Config triggers are registered directly and started later.
+        mgr._triggers["cfg"] = config_trigger
+        mgr._created_at["cfg"] = datetime.now()
+        mgr.set_host_creature_id("bot_1a2b")
+        runtime = _StubTrigger()
+        await mgr.add(runtime)
+        await mgr.start_all()
+        assert config_trigger.host_creature_id == "bot_1a2b"
+        assert runtime.host_creature_id == "bot_1a2b"
+        await mgr.stop_all()
+
+    async def test_setting_the_creature_id_rebinds_existing_triggers(self, mgr):
+        agent = _HostAgent("bot")
+        mgr.set_host_agent(agent)
+        t = _StubTrigger()
+        await mgr.add(t)
+        assert t.host_creature_id == "bot"
+        mgr.set_host_creature_id("bot_99")
+        assert t.host_creature_id == "bot_99"
+        await mgr.stop_all()
+
+    async def test_protocol_trigger_bind_host_is_called(self, mgr):
+        agent = _HostAgent("bot")
+        mgr.set_host_agent(agent)
+        mgr.set_host_creature_id("bot_7")
+        t = _ProtocolTrigger()
+        await mgr.add(t, autostart=False)
+        assert t.bound[-1] == ("bot_7", "bot")
+
+    async def test_unbound_trigger_has_empty_host(self):
+        t = _StubTrigger()
+        assert t.host_creature_id == ""
+        assert t.host_agent is None
+
+    async def test_trigger_does_not_keep_its_agent_alive(self, mgr):
+        agent = _HostAgent("gone")
+        mgr.set_host_agent(agent)
+        t = _StubTrigger()
+        await mgr.add(t, autostart=False)
+        assert t.host_agent is agent
+        probe = weakref.ref(agent)
+        del agent
+        gc.collect()
+        assert probe() is None
+        assert t.host_agent is None
+        assert t.host_creature_id == "gone"
 
 
 # ── set_context_all ───────────────────────────────────────────────

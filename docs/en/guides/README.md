@@ -27,12 +27,13 @@ If you want a guided first walk-through, go to [Tutorials](../tutorials/README.m
 
 - [Configuration](configuration.md): task-oriented "how do I configure X" recipes.
 - [Creatures](creatures.md): authoring standalone agents.
-- [Plugins](plugins.md): prompt and lifecycle plugins.
+- [Plugins](plugins.md): lifecycle hooks and prompt contributions.
 - [Sub-agents](sub-agents.md): builtin and inline specialists, runtime budget plugins, and auto-compaction.
 - [Custom Modules](custom-modules.md): writing tools, inputs, outputs, triggers, sub-agents.
 - [MCP](mcp.md): registering MCP servers per-agent or globally.
 - [MCP server](mcp-server.md): expose KT tools and local delegation to external MCP clients.
 - [Packages](packages.md): `kohaku.yaml` manifests, install modes, publishing.
+- [UI extensions](ui-extensions.md): package-owned settings/overlays, owner RPC, shared controls and observed session work.
 
 ## Multi-agent and composition
 
@@ -55,8 +56,10 @@ If you want a guided first walk-through, go to [Tutorials](../tutorials/README.m
 - [Docker deployment](deployment-docker.md): three compose recipes (AIO, host + workers, distributed) using the official GHCR images.
 - [systemd deployment](deployment-systemd.md): install as a hardened systemd service via `kt service install`.
 - [Reverse-proxy deployment](deployment-reverse-proxy.md): nginx and Cloudflare Tunnel patterns for TLS termination.
+- [Desktop app](desktop-app.md): the installed app and `kt app`, the terminal command, how the local server is protected, first-run approval.
 - [App update](app-update.md): how the desktop app self-updates via its managed venv (no installer re-download).
 - [Frontend Layout](frontend-layout.md): web dashboard panels and presets.
+- [Chat widgets](chat-widgets.md): instant apps (`show_app`), what the canvas shows, and widget renderers for packages.
 
 ## Learn from code
 

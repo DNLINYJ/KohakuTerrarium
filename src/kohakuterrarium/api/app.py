@@ -1,7 +1,5 @@
 """FastAPI application factory."""
 
-from __future__ import annotations
-
 import asyncio
 import logging
 import os
@@ -17,11 +15,16 @@ from fastapi.staticfiles import StaticFiles
 from kohakuterrarium.api._io_executor import run_in_io_executor
 from kohakuterrarium.api.auth import load_auth_config
 from kohakuterrarium.api.auth import router as auth_router
+from kohakuterrarium.api.auth.asset_token import new_asset_secret
 from kohakuterrarium.api.boot_restore import auto_resume_enabled, restore_on_boot
 from kohakuterrarium.api.auth.db import ensure_migrated as ensure_auth_migrated
-from kohakuterrarium.api.auth.engine_pool import EnginePool
+from kohakuterrarium.api.auth.engine_pool import EnginePool, user_is_admin
+from kohakuterrarium.api.auth.launch_token import LaunchGate, LaunchTokenMiddleware
 from kohakuterrarium.api.auth.middleware import HostTokenMiddleware
 from kohakuterrarium.api.deps import _session_dir, get_engine, set_service
+from kohakuterrarium.api.ext import owner_routes as ext_owner_routes
+from kohakuterrarium.api.ext import routes as ext_ui_routes
+from kohakuterrarium.api.ext.dispatcher import ExtensionDispatcher
 from kohakuterrarium.errors import ConflictError, KTError, NotFoundError
 from kohakuterrarium.terrarium.drive.errors import (
     DriveBackpressureError,
@@ -39,7 +42,7 @@ from kohakuterrarium.laboratory._internal.client import (
 )
 from kohakuterrarium.laboratory._internal.membership import MembershipEvent
 from kohakuterrarium.serving.process_metrics import get_aggregator
-from kohakuterrarium.studio.identity import drive_settings as _drive_settings
+from kohakuterrarium.studio.identity.drive_settings import settings as _drive_settings
 from kohakuterrarium.utils.logging import get_logger
 from kohakuterrarium.utils.startup_trace import mark as mark_startup
 
@@ -47,6 +50,9 @@ logger = get_logger(__name__)
 
 # Route modules are grouped by Studio concern so this factory only owns
 # application-wide mounting, middleware, and lifecycle coordination.
+from kohakuterrarium.api.routes import app_open as app_open_route
+from kohakuterrarium.api.routes import app_secrets as app_secrets_route
+from kohakuterrarium.api.routes import app_shims as app_shims_route
 from kohakuterrarium.api.routes import app_update as app_update_route
 from kohakuterrarium.api.routes import health as health_route
 from kohakuterrarium.api.routes import lab_clients as lab_clients_route
@@ -57,8 +63,8 @@ from kohakuterrarium.api.routes.attach import files as catalog_attach_files
 from kohakuterrarium.api.routes.attach import policies as attach_policies
 from kohakuterrarium.api.routes.catalog import builtins as catalog_builtins
 from kohakuterrarium.api.routes.catalog import commands as catalog_commands
-from kohakuterrarium.api.routes.catalog import creatures as catalog_creatures
-from kohakuterrarium.api.routes.catalog import creatures_scan as catalog_creatures_scan
+from kohakuterrarium.api.routes.catalog.creatures import creatures as catalog_creatures
+from kohakuterrarium.api.routes.catalog.creatures import scan as catalog_creatures_scan
 from kohakuterrarium.api.routes.catalog import extensions as catalog_extensions
 from kohakuterrarium.api.routes.catalog import manifest as catalog_manifest
 from kohakuterrarium.api.routes.catalog import marketplace as catalog_marketplace
@@ -86,6 +92,9 @@ from kohakuterrarium.api.routes.identity import (
     session_summary as identity_session_summary,
 )
 from kohakuterrarium.api.routes.identity import settings as identity_settings
+from kohakuterrarium.api.routes.identity import (
+    module_defaults as identity_module_defaults,
+)
 from kohakuterrarium.api.routes.identity import ui_prefs as identity_ui_prefs
 from kohakuterrarium.api.routes.persistence import artifacts as persistence_artifacts
 from kohakuterrarium.api.routes.persistence import fork as persistence_fork
@@ -97,7 +106,7 @@ from kohakuterrarium.api.routes.persistence import open_sessions as persistence_
 from kohakuterrarium.api.routes.persistence import (
     restore_state as persistence_restore_state,
 )
-from kohakuterrarium.api.routes.persistence import resume as persistence_resume
+from kohakuterrarium.api.routes.persistence.resume import resume as persistence_resume
 from kohakuterrarium.api.routes.persistence import saved as persistence_saved
 from kohakuterrarium.api.routes.persistence import subagents as persistence_subagents
 from kohakuterrarium.api.routes.persistence import (
@@ -108,18 +117,34 @@ from kohakuterrarium.api.routes.persistence import saved_drives as persistence_d
 from kohakuterrarium.api.routes import runtime_graph as runtime_graph_route
 from kohakuterrarium.api.routes.sessions_v2 import (
     active as sessions_active,
-    creatures_chat as sessions_creatures_chat,
-    creatures_command as sessions_creatures_command,
-    creatures_ctl as sessions_creatures_ctl,
-    creatures_model as sessions_creatures_model,
-    creatures_modules as sessions_creatures_modules,
-    creatures_plugins as sessions_creatures_plugins,
-    creatures_state as sessions_creatures_state,
-    creatures_subagents as sessions_creatures_subagents,
     drives as sessions_drives,
     memory as sessions_memory,
     topology as sessions_topology,
     wiring as sessions_wiring,
+)
+from kohakuterrarium.api.routes.sessions_v2.creatures import (
+    chat as sessions_creatures_chat,
+)
+from kohakuterrarium.api.routes.sessions_v2.creatures import (
+    command as sessions_creatures_command,
+)
+from kohakuterrarium.api.routes.sessions_v2.creatures import (
+    ctl as sessions_creatures_ctl,
+)
+from kohakuterrarium.api.routes.sessions_v2.creatures import (
+    model as sessions_creatures_model,
+)
+from kohakuterrarium.api.routes.sessions_v2.creatures import (
+    modules as sessions_creatures_modules,
+)
+from kohakuterrarium.api.routes.sessions_v2.creatures import (
+    plugins as sessions_creatures_plugins,
+)
+from kohakuterrarium.api.routes.sessions_v2.creatures import (
+    state as sessions_creatures_state,
+)
+from kohakuterrarium.api.routes.sessions_v2.creatures import (
+    subagents as sessions_creatures_subagents,
 )
 from kohakuterrarium.api.studio import build_studio_router
 from kohakuterrarium.studio.persistence.session_index import close_session_index
@@ -169,7 +194,7 @@ async def lifespan(app: FastAPI):
     if lab_mode == "lab-host":
         from kohakuterrarium.laboratory import HostConfig
         from kohakuterrarium.laboratory._internal.host import HostEngine
-        from kohakuterrarium.laboratory._internal.transport_ws import WebSocketTransport
+        from kohakuterrarium.laboratory._internal.transport.ws import WebSocketTransport
         from kohakuterrarium.laboratory.adapters import (
             StudioCatalogAdapter,
             StudioIdentityAdapter,
@@ -180,7 +205,7 @@ async def lifespan(app: FastAPI):
         from kohakuterrarium.studio.sessions.registry import get_session_meta
         from kohakuterrarium.terrarium import MultiNodeTerrariumService, Terrarium
         from kohakuterrarium.terrarium.drive.config import DriveRuntimeConfig
-        from kohakuterrarium.terrarium.multi_node_channels import cluster_members_for
+        from kohakuterrarium.terrarium.multi_node.channels import cluster_members_for
 
         # Initialize shared mutable state before request tasks begin, avoiding
         # concurrent first-write handling in the lab-clients route.
@@ -419,8 +444,8 @@ def _parse_bind(bind: str) -> tuple[str, int]:
 
 
 async def _watch_membership(
-    host_engine: HostEngine,
-    service: MultiNodeTerrariumService,
+    host_engine: "HostEngine",
+    service: "MultiNodeTerrariumService",
 ) -> None:
     """Mirror host membership into remote routing state.
 
@@ -513,6 +538,8 @@ def create_app(
     # Freeze one auth configuration per application instance so all requests
     # observe coherent policy even if process environment variables change.
     app.state.auth_config = load_auth_config()
+    # Signs the path-embedded tokens on package UI asset URLs.
+    app.state.ui_asset_secret = new_asset_secret()
 
     # User-authenticated requests receive isolated Terrarium instances; other
     # modes bypass this pool. Each engine resolves a fresh immutable snapshot of
@@ -520,6 +547,7 @@ def create_app(
     app.state.engine_pool = EnginePool(
         max_active=10,
         drive_resolver=_drive_settings.resolve_drive_kwargs,
+        admin_resolver=user_is_admin,
     )
 
     app.add_middleware(
@@ -535,6 +563,11 @@ def create_app(
     # Authorization headers; the browser sends the real request only
     # after preflight succeeds).
     app.add_middleware(HostTokenMiddleware)
+
+    # Desktop shells set a per-launch token; outermost so nothing runs before it.
+    launch_gate = LaunchGate.from_env()
+    if launch_gate is not None:
+        app.add_middleware(LaunchTokenMiddleware, gate=launch_gate)
 
     # Configure config discovery directories on the new catalog scan routers.
     if creatures_dirs or terrariums_dirs:
@@ -646,6 +679,12 @@ def create_app(
     app.include_router(lab_clients_route.router, prefix="/api/lab", tags=["lab"])
     # /api/app/* — wrapper-aware self-update HTTP surface.
     app.include_router(app_update_route.router, prefix="/api/app", tags=["app-update"])
+    # /api/app/shims — opt-in terminal command (``kt``) for desktop installs.
+    app.include_router(app_shims_route.router, prefix="/api/app", tags=["app-shims"])
+    app.include_router(app_open_route.router, prefix="/api/app", tags=["app-open"])
+    app.include_router(
+        app_secrets_route.router, prefix="/api/app", tags=["app-secrets"]
+    )
     # /ws/app/update — progress stream for the update flow (no prefix).
     app.include_router(app_update_route.ws_router, tags=["app-update"])
 
@@ -656,6 +695,19 @@ def create_app(
 
     # Mount the concern-specific API surfaces under their canonical prefixes.
     _mount_phase0_stubs(app)
+
+    # Package UI: contribution listing, then assets and package API routes.
+    app.include_router(
+        ext_ui_routes.router, prefix="/api/extensions/ui", tags=["extensions"]
+    )
+    app.include_router(
+        ext_owner_routes.router, prefix="/api/extensions/owner", tags=["extensions"]
+    )
+    app.include_router(ext_owner_routes.ws_router, tags=["ws"])
+    app.mount(
+        "/api/ext",
+        ExtensionDispatcher(app, configure_subapp=_configure_extension_app),
+    )
 
     # WebSocket routes
     app.include_router(ws_daemon_logs.router, tags=["ws"])
@@ -675,6 +727,13 @@ def create_app(
     return app
 
 
+def _configure_extension_app(sub: FastAPI) -> None:
+    """Give a package API sub-app the host's typed-error handlers."""
+    sub.add_exception_handler(KTError, kt_error_handler)
+    sub.add_exception_handler(DriveError, drive_error_handler)
+    sub.add_exception_handler(RequestTimeoutError, lab_transport_error_handler)
+
+
 def _mount_phase0_stubs(app: FastAPI) -> None:
     """Mount catalog, identity, session, persistence, and attach routers."""
     # Catalog — read-only discovery
@@ -687,7 +746,7 @@ def _mount_phase0_stubs(app: FastAPI) -> None:
     # Marketplace — TerrariumMarket-backed browse + install + source mgmt.
     # Separate from /api/catalog/registry (which is the legacy bundled
     # static index) — this one hits live remote sources via
-    # ``packages/marketplace.py``.
+    # ``packages/marketplace/marketplace.py``.
     app.include_router(
         catalog_marketplace.router,
         prefix="/api/catalog/marketplace",
@@ -745,6 +804,9 @@ def _mount_phase0_stubs(app: FastAPI) -> None:
     # Identity configuration remains under ``/api/settings`` to match the
     # frontend settings contract.
     app.include_router(identity_llm.router, prefix="/api/settings", tags=["identity"])
+    app.include_router(
+        identity_module_defaults.router, prefix="/api/settings", tags=["identity"]
+    )
     app.include_router(
         identity_api_keys.router, prefix="/api/settings", tags=["identity"]
     )

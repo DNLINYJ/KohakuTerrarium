@@ -18,18 +18,18 @@ from kohakuterrarium.builtins.tui.widgets.drive_panel import (
 from kohakuterrarium.builtins.tui.widgets.drive_settings_pane import (
     build_settings_from_values,
 )
-from kohakuterrarium.builtins.cli_rich.dialogs.drive_format import (
+from kohakuterrarium.builtins.cli_rich.dialogs.drive.format import (
     enabled_actions,
     project_view,
 )
-from kohakuterrarium.studio.identity.drive_settings import DriveSettings
+from kohakuterrarium.studio.identity.drive_settings.settings import DriveSettings
 from kohakuterrarium.terrarium.drive.models import (
     ActorRef,
     DriveProgress,
     DriveRecord,
     DriveStatus,
 )
-from kohakuterrarium.terrarium.drive.wire_service import DriveView
+from kohakuterrarium.terrarium.drive.service.wire import DriveView
 
 NOW = datetime(2026, 7, 12, tzinfo=timezone.utc)
 USER = ActorRef("user", "local")

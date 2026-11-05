@@ -6,13 +6,14 @@ _EXPORTS = {
     "Activity": "kohakuterrarium.core.turn",
     "Agent": "kohakuterrarium.core.agent",
     "ConnectionResult": "kohakuterrarium.terrarium",
+    "ContextSnapshot": "kohakuterrarium.core.conversation.context_snapshot",
     "Creature": "kohakuterrarium.terrarium",
     "DisconnectionResult": "kohakuterrarium.terrarium",
     "EngineEvent": "kohakuterrarium.terrarium",
     "EventFilter": "kohakuterrarium.terrarium",
     "EventKind": "kohakuterrarium.terrarium",
     "FunctionTool": "kohakuterrarium.modules.tool.function",
-    "SessionReader": "kohakuterrarium.session.reader",
+    "SessionReader": "kohakuterrarium.session.readonly.reader",
     "SessionStore": "kohakuterrarium.session.store",
     "Studio": "kohakuterrarium.studio",
     "Terrarium": "kohakuterrarium.terrarium",
@@ -24,12 +25,13 @@ _EXPORTS = {
     "validate": "kohakuterrarium.validate",
 }
 
-__version__ = "2.1.6"
+__version__ = "2.2.0"
 
 __all__ = [
     "Activity",
     "Agent",
     "ConnectionResult",
+    "ContextSnapshot",
     "FunctionTool",
     "Creature",
     "DisconnectionResult",

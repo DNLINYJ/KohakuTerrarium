@@ -2,19 +2,24 @@ import { computed, defineComponent, h, reactive, ref } from "vue"
 
 import "./conversation-message.css"
 
+import { triggerRenderers } from "../../../ext/renderers.js"
+
 import { MediaImage } from "../../../public/chat/MediaPreview.js"
 import { computeRenderGroups } from "../../../public/chat/chatToolGrouping.js"
 import ToolCallBatch from "../ToolCallBatch.vue"
 import ToolCallBlock from "../ToolCallBlock.vue"
 import VideoFilePreview from "../VideoFilePreview.vue"
 import UIEventBlock from "../UIEventBlock.vue"
+import WidgetBlock from "../widgets/WidgetBlock.vue"
+import { widgetFromMessage } from "../widgets/widgetModel.js"
 
 function plainText(content) {
   return h("div", { class: "kt-conversation-text" }, content || "")
 }
 
-function renderedText(renderer, content, breaks = false) {
-  return renderer ? renderer(content, breaks) : plainText(content)
+// ``options`` marks assistant text (``{assistant, streaming}``) for hosts that draw inline UI.
+function renderedText(renderer, content, breaks = false, options = null) {
+  return renderer ? renderer(content, breaks, options) : plainText(content)
 }
 
 function compactLabel(message) {
@@ -37,7 +42,7 @@ export default defineComponent({
     renderContentPart: { type: Function, default: null },
     bare: { type: Boolean, default: false },
   },
-  emits: ["reply"],
+  emits: ["reply", "widget-message", "widget-state"],
   setup(props, { emit }) {
     const compactExpanded = ref(false)
     const expandedReasoning = reactive(new Set())
@@ -92,11 +97,16 @@ export default defineComponent({
       })
     }
 
-    function renderPart(part, index, textBreaks = false) {
+    function renderPart(part, index, textBreaks = false, assistant = false) {
       const key = expansionKey(part, index)
       let content = props.renderContentPart ? props.renderContentPart(part) : null
       if (!content && part.type === "text")
-        content = renderedText(props.renderText, part.content || part.text, textBreaks)
+        content = renderedText(
+          props.renderText,
+          part.content || part.text,
+          textBreaks,
+          assistant ? { assistant: true, streaming: part._streaming === true } : null,
+        )
       else if (!content && part.type === "reasoning") {
         const reasoningKey = part.id ?? `reasoning_${index}`
         const text = part.text || ""
@@ -209,15 +219,33 @@ export default defineComponent({
               message,
               onReply: (reply) => emit("reply", reply),
             })
+      } else if (role === "widget") {
+        // A host without its own widget transport gets the messages and
+        // state changes as ``widget-message`` / ``widget-state`` events.
+        content = h(WidgetBlock, {
+          widget: widgetFromMessage(message),
+          host: {
+            send: (name, data) =>
+              emit("widget-message", { eventId: message.eventId, name, data: data || {} }),
+            setState: (patch) =>
+              emit("widget-state", { eventId: message.eventId, state: patch || {} }),
+            close: () => {},
+            openInCanvas: () => {},
+            theme: {},
+          },
+        })
       } else if (role === "assistant") {
         const parts = assistantParts.value
         content = parts.length
           ? h(
               "div",
               { class: "kt-conversation-parts" },
-              parts.map((part, index) => renderPart(part, index)),
+              parts.map((part, index) => renderPart(part, index, false, true)),
             )
-          : renderedText(props.renderText, message.content)
+          : renderedText(props.renderText, message.content, false, {
+              assistant: true,
+              streaming: message._streaming === true,
+            })
       } else if (role === "user") {
         const userContent = message.contentParts?.length
           ? h(
@@ -309,9 +337,17 @@ export default defineComponent({
           message.preview ? renderedText(props.renderText, message.preview) : null,
         ])
       } else if (role === "trigger") {
+        const renderer =
+          (message.triggerName && triggerRenderers.get(message.triggerName)) ||
+          (message.triggerUiName && triggerRenderers.get(message.triggerUiName)) ||
+          null
         content = h("section", { class: "kt-conversation-banner is-compact" }, [
           h("strong", `Triggered by ${message.content || "event"}`),
-          message.triggerContent ? renderedText(props.renderText, message.triggerContent) : null,
+          renderer
+            ? h(renderer.component, { event: message })
+            : message.triggerContent
+              ? renderedText(props.renderText, message.triggerContent)
+              : null,
         ])
       } else if (role === "bg_result") {
         content = h("div", { class: "kt-conversation-divider" }, [

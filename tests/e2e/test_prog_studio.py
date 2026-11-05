@@ -44,11 +44,12 @@ from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.studio.attach.policies import Policy
-from kohakuterrarium.studio.editors.workspace_fs import LocalWorkspace
+from kohakuterrarium.studio.editors.workspace.fs import LocalWorkspace
 from kohakuterrarium.studio.persistence import store as _persistence_store_mod
 from kohakuterrarium.studio.persistence.session_index import close_session_index
 from kohakuterrarium.studio.studio import Studio
 from kohakuterrarium.testing.llm import ScriptedLLM
+from kohakuterrarium.testing.llm_seam import real_llm_providers
 
 pytestmark = pytest.mark.timeout(30)
 
@@ -165,7 +166,8 @@ class TestProgStudioJourney:
             subagent_names = {
                 s["name"] for s in studio.catalog.builtins.list("subagents")
             }
-            assert {"explore", "plan"} <= subagent_names
+            assert {"explore", "critic"} <= subagent_names
+            assert not {"worker", "plan", "research", "coordinator"} & subagent_names
             bash_info = studio.catalog.builtins.info("bash")
             assert bash_info["name"] == "bash"
             assert bash_info["source"] == "builtin"
@@ -423,9 +425,10 @@ class TestProgStudioJourney:
             # --- sessions.model: flip the live model --------------------
             studio.identity.keys.set("openai", "sk-journey-test-key")
             studio.identity.llm.save_profile("journey-fast", "gpt-4o-mini", "openai")
-            new_model = studio.sessions.model.switch(
-                session_id, creature_id, "openai/journey-fast"
-            )
+            with real_llm_providers():
+                new_model = studio.sessions.model.switch(
+                    session_id, creature_id, "openai/journey-fast"
+                )
             assert new_model == "openai/journey-fast"
             status = studio.sessions.list_creatures(session_id)[0]
             assert status["model"] == "gpt-4o-mini"
@@ -437,7 +440,8 @@ class TestProgStudioJourney:
             # A Drive-enabled Terrarium turns on its always-on Drive plugins on
             # every creature (the ``goal`` composition + the ``drive_runtime``
             # prompt contributor); every other builtin stays off until toggled.
-            terrarium_defaults = {"goal", "drive_runtime"}
+            # The renderer-gated UI plugins are on by default on every creature.
+            terrarium_defaults = {"goal", "drive_runtime", "ui.apps", "ui.declarative"}
             assert all(
                 p["enabled"] is False
                 for p in plugins

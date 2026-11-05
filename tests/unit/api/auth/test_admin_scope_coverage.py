@@ -36,6 +36,7 @@ _ADMIN_GATED_ROUTES: tuple[tuple[str, str], ...] = (
     ("/api/registry/uninstall", "POST"),
     ("/api/registry/", "POST"),  # update + update-all
     ("/api/registry/", "PUT"),  # write package file
+    ("/api/extensions/ui/", "PUT"),  # enable / disable package UI
 )
 
 

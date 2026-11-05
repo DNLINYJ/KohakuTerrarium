@@ -1,6 +1,6 @@
 ---
 name: tree
-description: List a directory as a tree, respecting .gitignore. Use to orient in an unfamiliar project. Not for finding a specific file - use glob.
+description: 'List a directory as a tree, respecting .gitignore. Use it to orient in an unfamiliar project. Not for finding a specific file - use glob.'
 category: builtin
 tags: [search, files]
 ---
@@ -16,6 +16,8 @@ Renders a directory as an indented tree.
 | path | string | no | Directory to render; defaults to the working directory |
 | depth | integer | no | Maximum depth to descend |
 | limit | integer | no | Maximum lines, default 100 |
+| hidden | boolean | no | Include dot-prefixed entries, default false |
+| gitignore | boolean | no | Follow .gitignore rules, default true |
 
 ## Behavior
 

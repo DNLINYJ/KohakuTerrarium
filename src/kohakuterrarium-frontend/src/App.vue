@@ -10,6 +10,11 @@
     </AuthGate>
     <CommandPalette />
     <ShortcutHelp />
+    <OverlayLayer />
+    <DesktopOpenHost />
+    <DesktopFirstRun />
+    <DesktopBackendBanner />
+    <DeepLinkInstallDialog />
     <ToastCenter />
     <HostPickerModal :open="hostPickerOpen" @close="hostPickerOpen = false" />
     <WorkspaceResumeDialog />
@@ -25,25 +30,41 @@ import AdminTokenModal from "@/components/auth/AdminTokenModal.vue"
 import AuthGate from "@/components/auth/AuthGate.vue"
 import LoginPromptModal from "@/components/auth/LoginPromptModal.vue"
 import CommandPalette from "@/components/chrome/CommandPalette.vue"
+import DesktopBackendBanner from "@/components/chrome/DesktopBackendBanner.vue"
+import DesktopFirstRun from "@/components/chrome/DesktopFirstRun.vue"
 import ShortcutHelp from "@/components/chrome/ShortcutHelp.vue"
 import ToastCenter from "@/components/chrome/ToastCenter.vue"
 import HostPickerModal from "@/components/host-picker/HostPickerModal.vue"
+import DeepLinkInstallDialog from "@/components/shell/DeepLinkInstallDialog.vue"
+import DesktopOpenHost from "@/components/shell/DesktopOpenHost.vue"
 import MacroShell from "@/components/shell/MacroShell.vue"
 import WorkspaceResumeDialog from "@/components/shell/modals/WorkspaceResumeDialog.vue"
+import OverlayLayer from "@/ext/OverlayLayer.vue"
 import { useArtifactDetector } from "@/composables/useArtifactDetector"
 import { useAutoTriggers } from "@/composables/useAutoTriggers"
 import { useBuiltinCommands } from "@/composables/useBuiltinCommands"
 import { useConnectIntent } from "@/composables/useConnectIntent"
 import { useDensity } from "@/composables/useDensity"
+import { useDesktopCommands } from "@/composables/useDesktopCommands"
+import { useDesktopMenu } from "@/composables/useDesktopMenu"
+import { useKeepAwake } from "@/composables/useKeepAwake"
+import { useWindowChrome } from "@/composables/useWindowChrome"
+import { useDesktopTrayItems } from "@/composables/useDesktopTrayItems"
+import { useDesktopTrayMenu } from "@/composables/useDesktopTrayMenu"
+import { useDesktopPopout } from "@/composables/useDesktopPopout"
+import { useDesktopSummon } from "@/composables/useDesktopSummon"
 import { useDocumentAttention } from "@/composables/useDocumentAttention"
 import { useAttentionEffects } from "@/composables/useAttentionEffects"
 import { useKeyboardShortcuts } from "@/composables/useKeyboardShortcuts"
+import { provideCodePin } from "@/public/chat/codePin"
 import { useAuthStore } from "@/stores/auth"
+import { useCanvasStore } from "@/stores/canvas"
 import { useHostsStore } from "@/stores/hosts"
 import { useInstancesStore } from "@/stores/instances"
 import { useLocaleStore } from "@/stores/locale"
 import { useThemeStore } from "@/stores/theme"
 import { useTabsStore } from "@/stores/tabs"
+import { installDeepLinks } from "@/utils/deepLink"
 import { installExternalLinkGuard } from "@/utils/externalLinks"
 
 const theme = useThemeStore()
@@ -79,11 +100,20 @@ const instances = useInstancesStore()
 instances.fetchAll()
 
 useKeyboardShortcuts()
+useDesktopSummon()
+useDesktopPopout()
+useDesktopCommands()
+useKeepAwake()
+useWindowChrome()
+useDesktopMenu()
+useDesktopTrayItems()
+useDesktopTrayMenu()
 useDocumentAttention()
 useAttentionEffects()
 useBuiltinCommands()
 useAutoTriggers()
 useArtifactDetector()
+provideCodePin((block) => useCanvasStore().pinBlock(block))
 
 // Host picker state — accessed by ``HostStatusChip`` via a global
 // event so we don't have to thread a prop through every shell
@@ -109,6 +139,7 @@ if (typeof window !== "undefined") {
   // shell has no back button, so a same-window external navigation is a
   // dead end.
   const uninstallExternalLinkGuard = installExternalLinkGuard()
+  const uninstallDeepLinks = installDeepLinks()
   // Auto-open when an Android ``ktconnect://`` deep-link is
   // queued — the modal's own watcher will consume + apply the URI.
   const { pendingUri } = useConnectIntent()
@@ -119,6 +150,7 @@ if (typeof window !== "undefined") {
     window.removeEventListener("kt-open-host-picker", openHostPicker)
     window.removeEventListener("kt:open-saved-session-history", openSavedSessionHistory)
     uninstallExternalLinkGuard()
+    uninstallDeepLinks()
   })
 }
 </script>

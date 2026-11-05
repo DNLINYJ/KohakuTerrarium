@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from kohakuterrarium.laboratory._internal.app import AppMessage
+from kohakuterrarium.laboratory._internal.app.app import AppMessage
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.sync import (
     NAMESPACE,
@@ -21,8 +21,8 @@ from kohakuterrarium.session.sync import (
     SessionMirrorWriter,
 )
 from kohakuterrarium.terrarium import Terrarium
-from kohakuterrarium.terrarium.session_coord import apply_merge
-from kohakuterrarium.terrarium.topology import TopologyDelta
+from kohakuterrarium.terrarium.session.coord import apply_merge
+from kohakuterrarium.terrarium.graph.topology import TopologyDelta
 
 pytestmark = pytest.mark.timeout(60)
 
@@ -230,7 +230,7 @@ class TestResumeOnWorkerDoesNotTeeFutureEvents:
 
         # Install the SessionAdapter, then drive its resume path
         # directly (bypassing the wire).
-        from kohakuterrarium.laboratory.adapters.terrarium_session import (
+        from kohakuterrarium.laboratory.adapters.terrarium.session import (
             TerrariumSessionAdapter,
         )
 

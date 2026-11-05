@@ -1,0 +1,242 @@
+"""Codex Responses API message-shape helpers."""
+
+import json as _json
+from typing import Any
+
+from kohakuterrarium.llm.media.artifacts import (
+    resolve_artifact_url as _resolve_artifact_url,
+)
+from kohakuterrarium.llm.media.artifacts import resolve_message_image_urls
+from kohakuterrarium.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+def to_responses_input(
+    messages: list[dict[str, Any]],
+    *,
+    model: str = "",
+    replay_reasoning: bool | None = None,
+) -> list[dict[str, Any]]:
+    """Convert messages with an optional plaintext-reasoning capability override."""
+    if replay_reasoning is None:
+        replay_reasoning = model.lower().startswith(("deepseek-", "deepseek/"))
+    elif not isinstance(replay_reasoning, bool):
+        raise ValueError("responses_reasoning_replay must be a boolean or null")
+    items: list[dict[str, Any]] = []
+    for msg in messages:
+        role = msg.get("role")
+        if role in ("user", "tool"):
+            # Resolve only input roles without changing the stored messages.
+            msg = resolve_message_image_urls([msg])[0]
+        content = msg.get("content", "")
+        if role == "user":
+            item = _user_item(content)
+            if item:
+                items.append(item)
+        elif role == "assistant":
+            reasoning = msg.get("reasoning_content")
+            if replay_reasoning and isinstance(reasoning, str) and reasoning:
+                items.append(
+                    {
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": [{"type": "reasoning_text", "text": reasoning}],
+                    }
+                )
+            items.extend(_assistant_items(content, msg.get("tool_calls", [])))
+        elif role == "tool":
+            items.append(_tool_item(content, msg.get("tool_call_id", "")))
+    return items
+
+
+def fix_tool_call_pairing(api_input: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Place matching outputs after each contiguous function-call batch."""
+    output_by_id: dict[str, dict[str, Any]] = {}
+    for item in api_input:
+        if item.get("type") == "function_call_output":
+            output_by_id[item["call_id"]] = item
+
+    result: list[dict[str, Any]] = []
+    pending_outputs: list[dict[str, Any]] = []
+    used_ids: set[str] = set()
+    for item in api_input:
+        if item.get("type") != "function_call":
+            result.extend(pending_outputs)
+            pending_outputs.clear()
+        if item.get("type") == "function_call_output":
+            continue
+        result.append(item)
+        if item.get("type") != "function_call":
+            continue
+        call_id = item["call_id"]
+        if call_id in output_by_id:
+            pending_outputs.append(output_by_id[call_id])
+        else:
+            pending_outputs.append(_missing_output_item(item))
+            logger.warning("Added missing function_call_output", call_id=call_id)
+        used_ids.add(call_id)
+    result.extend(pending_outputs)
+
+    orphan_ids = set(output_by_id) - used_ids
+    if orphan_ids:
+        logger.warning(
+            "Dropped orphan function_call_outputs", orphan_count=len(orphan_ids)
+        )
+    return result
+
+
+def maybe_capture_stream_rate_limit(
+    event: Any, parse_rate_limit_event, usage_snapshot_cls, set_cached
+) -> None:
+    """Cache a rate-limit event when it appears on the SDK's generic surface."""
+    try:
+        payload: Any = (
+            getattr(event, "data", None)
+            or getattr(event, "event", None)
+            or getattr(event, "raw", None)
+        )
+        if payload is None:
+            return
+        if hasattr(payload, "model_dump"):
+            payload_dict: Any = payload.model_dump()
+        elif isinstance(payload, dict):
+            payload_dict = payload
+        else:
+            return
+        if not isinstance(payload_dict, dict):
+            return
+        if payload_dict.get("type") != "codex.rate_limits":
+            return
+        snap = parse_rate_limit_event(_json.dumps(payload_dict))
+        if snap is not None and snap.has_data():
+            set_cached(usage_snapshot_cls(snapshots=[snap]))
+    except Exception as exc:  # pragma: no cover - telemetry must not break streaming
+        logger.warning(
+            "Codex rate-limit event capture failed",
+            error=str(exc),
+            exc_info=True,
+        )
+
+
+def _user_item(content: Any) -> dict[str, Any] | None:
+    if isinstance(content, str):
+        return {"role": "user", "content": [{"type": "input_text", "text": content}]}
+    if not isinstance(content, list):
+        return None
+    input_content: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype == "text":
+            input_content.append({"type": "input_text", "text": part.get("text", "")})
+        elif ptype == "image_url":
+            url = _image_url_value(part.get("image_url"))
+            if not url:
+                continue
+            input_content.append(
+                {"type": "input_image", "image_url": _resolve_artifact_url(url)}
+            )
+    return {"role": "user", "content": input_content} if input_content else None
+
+
+def _assistant_items(
+    content: Any, tool_calls: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    text = _content_text(content, assistant=True)
+    if text:
+        items.append(
+            {"role": "assistant", "content": [{"type": "output_text", "text": text}]}
+        )
+    for tc in tool_calls:
+        func = tc.get("function", {})
+        items.append(
+            {
+                "type": "function_call",
+                "call_id": tc.get("id", ""),
+                "name": func.get("name", ""),
+                "arguments": func.get("arguments", "{}"),
+            }
+        )
+    return items
+
+
+def _tool_item(content: Any, call_id: str) -> dict[str, Any]:
+    """Build a tool output, using multimodal parts only when images are present."""
+    parts = _tool_output_parts(content)
+    if parts is not None:
+        return {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": parts,
+        }
+    return {
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": _content_text(content),
+    }
+
+
+def _tool_output_parts(content: Any) -> list[dict[str, Any]] | None:
+    """Convert image-bearing tool results to Responses input parts."""
+    if not isinstance(content, list):
+        return None
+    if not any(isinstance(p, dict) and p.get("type") == "image_url" for p in content):
+        return None
+    parts: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype == "text":
+            text = part.get("text", "")
+            if text:
+                parts.append({"type": "input_text", "text": text})
+        elif ptype == "image_url":
+            url = _image_url_value(part.get("image_url"))
+            if not url:
+                continue
+            parts.append(
+                {"type": "input_image", "image_url": _resolve_artifact_url(url)}
+            )
+    return parts or None
+
+
+def _image_url_value(image_url: Any) -> str:
+    """Extract a URL from either supported ``image_url`` representation."""
+    if isinstance(image_url, str):
+        return image_url
+    if isinstance(image_url, dict):
+        return image_url.get("url", "") or ""
+    return ""
+
+
+def _content_text(content: Any, *, assistant: bool = False) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    text_parts = []
+    image_count = 0
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text":
+            text_parts.append(part.get("text", ""))
+        elif part.get("type") == "image_url":
+            image_count += 1
+    text = "\n".join(text_parts)
+    if image_count and not text:
+        label = "assistant" if assistant else "tool"
+        text = f"[{label} multimodal content: {image_count} image(s)]"
+    return text
+
+
+def _missing_output_item(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "function_call_output",
+        "call_id": item["call_id"],
+        "output": f"[{item.get('name', '')}] Result unavailable (removed by context compaction).",
+    }

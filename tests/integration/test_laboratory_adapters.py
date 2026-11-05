@@ -26,21 +26,23 @@ in-process so coverage instrumentation captures their execution.
 """
 
 import asyncio
+import base64
 import hashlib
 import os
+from pathlib import Path
 
 import pytest
 
-from kohakuterrarium.core.config import AgentConfig
-from kohakuterrarium.session.resource_gate import GATE, try_fast
-from kohakuterrarium.studio.catalog.packages_scan import invalidate_scan_caches
+from kohakuterrarium.core.config.load import AgentConfig
+from kohakuterrarium.session.occupancy.gate import GATE, try_fast
+from kohakuterrarium.studio.catalog.packages.scan import invalidate_scan_caches
 
 from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
 from kohakuterrarium.laboratory.config import ClientConfig, HostConfig
 from kohakuterrarium.laboratory._internal.client import ClientConnector
 from kohakuterrarium.laboratory._internal.host import HostEngine
-from kohakuterrarium.laboratory._internal.transport_inproc import InProcTransport
+from kohakuterrarium.laboratory._internal.transport.inproc import InProcTransport
 from kohakuterrarium.laboratory.adapters import (
     StudioCatalogAdapter,
     StudioDeployAdapter,
@@ -51,16 +53,17 @@ from kohakuterrarium.laboratory.adapters import (
     TerrariumSessionAdapter,
 )
 from kohakuterrarium.laboratory.adapters._worker_session import WorkerSessionAttacher
-from kohakuterrarium.laboratory.adapters.studio_identity import (
+from kohakuterrarium.laboratory.adapters.studio.identity import (
     StudioIdentityAdapter,
 )
 from kohakuterrarium.laboratory.identity_cache import IdentityCache
-from kohakuterrarium.llm.api_keys import (
+from kohakuterrarium.llm.profiles.api_keys import (
     clear_api_key_resolver,
     register_api_key_resolver,
 )
 from kohakuterrarium.terrarium import Terrarium
 from kohakuterrarium.testing.llm import ScriptedLLM
+from kohakuterrarium.testing.terrarium import TestTerrariumBuilder
 
 pytestmark = pytest.mark.timeout(60)
 
@@ -162,7 +165,9 @@ class TestTerrariumFilesAdapter:
                     },
                     timeout=5.0,
                 )
-                assert "error" not in (resp or {}), f"write error: {resp}"
+                hello_sha = hashlib.sha256(b"hello").hexdigest()
+                assert resp == {"written": 5, "sha256": hello_sha}
+                assert (worker_cfg_dir / "test.txt").read_bytes() == b"hello"
 
                 # stat — verb 2
                 resp = await host.request(
@@ -172,7 +177,10 @@ class TestTerrariumFilesAdapter:
                     body={"scope": "config://", "path": "test.txt"},
                     timeout=5.0,
                 )
-                assert "error" not in (resp or {}), f"stat error: {resp}"
+                assert resp["stat"]["size"] == 5
+                assert resp["stat"]["is_dir"] is False
+                assert resp["stat"]["sha256"] == hello_sha
+                assert Path(resp["stat"]["path"]) == worker_cfg_dir / "test.txt"
 
                 # read — verb 3
                 resp = await host.request(
@@ -182,13 +190,10 @@ class TestTerrariumFilesAdapter:
                     body={"scope": "config://", "path": "test.txt"},
                     timeout=5.0,
                 )
-                assert "error" not in (resp or {}), f"read error: {resp}"
-                # content round-tripped (key name varies: content/bytes_b64)
-                if isinstance(resp, dict):
-                    content = (
-                        resp.get("content") or resp.get("bytes_b64") or resp.get("data")
-                    )
-                    assert content is not None, f"no content in {resp}"
+                assert resp == {
+                    "bytes_b64": base64.b64encode(b"hello").decode(),
+                    "sha256": hello_sha,
+                }
 
                 # list — verb 4
                 resp = await host.request(
@@ -198,7 +203,9 @@ class TestTerrariumFilesAdapter:
                     body={"scope": "config://", "path": ""},
                     timeout=5.0,
                 )
-                assert "error" not in (resp or {}), f"list error: {resp}"
+                assert [
+                    (e["name"], e["is_dir"], e["size"]) for e in resp["entries"]
+                ] == [("test.txt", False, 5)]
 
                 # write_begin / write_chunk / write_commit — verbs 5,6,7
                 resp = await host.request(
@@ -417,52 +424,48 @@ class TestTerrariumSessionAdapter:
             try:
                 await _wait_joined(host, "w-sess")
 
-                # stores — verb 1 (list session stores on worker)
-                resp = await host.request(
-                    to_node="w-sess",
-                    namespace="terrarium.session",
-                    type="stores",
-                    body={},
-                    timeout=5.0,
-                )
-                assert resp is not None
+                async def call(type_, body):
+                    return await host.request(
+                        to_node="w-sess",
+                        namespace="terrarium.session",
+                        type=type_,
+                        body=body,
+                        timeout=5.0,
+                    )
 
-                # history — verb 2 (read history for a session id; even if
-                # empty, the verb itself must respond cleanly)
-                resp = await host.request(
-                    to_node="w-sess",
-                    namespace="terrarium.session",
-                    type="history",
-                    body={"session_id": "nonexistent"},
-                    timeout=5.0,
-                )
-                assert resp is not None
+                # A fresh worker holds no session stores.
+                assert await call("stores", {}) == {"session_ids": []}
 
-                # search — verb 3
-                resp = await host.request(
-                    to_node="w-sess",
-                    namespace="terrarium.session",
-                    type="search",
-                    body={"session_id": "nonexistent", "query": "test"},
-                    timeout=5.0,
-                )
-                assert resp is not None
+                # history and search name their missing argument.
+                resp = await call("history", {"session_id": "nonexistent"})
+                assert resp["error"] == {
+                    "kind": "invalid",
+                    "message": "agent is required",
+                }
+                resp = await call("search", {"session_id": "nonexistent"})
+                assert resp["error"] == {
+                    "kind": "invalid",
+                    "message": "query is required",
+                }
 
-                # resume — verb 4 (will error since no session exists, but
-                # the verb dispatch path is exercised)
-                resp = await host.request(
-                    to_node="w-sess",
-                    namespace="terrarium.session",
-                    type="resume",
-                    body={
-                        "session_id": "nonexistent",
-                        "kohakutr_path": "/does/not/exist",
-                    },
-                    timeout=5.0,
+                # With complete arguments, a session with no live store is not_found.
+                resp = await call(
+                    "history", {"session_id": "nonexistent", "agent": "ghost"}
                 )
-                # Error is expected for nonexistent session — the verb
-                # dispatch reached the handler.
-                assert resp is not None
+                assert resp["error"]["kind"] == "not_found"
+                assert "nonexistent" in resp["error"]["message"]
+                resp = await call("search", {"session_id": "nonexistent", "query": "q"})
+                assert resp["error"]["kind"] == "not_found"
+                assert "nonexistent" in resp["error"]["message"]
+
+                # resume needs a path (or scope + rel) to a saved session.
+                resp = await call("resume", {"session_id": "nonexistent"})
+                assert resp["error"] == {
+                    "kind": "invalid",
+                    "message": "path or scope+rel is required",
+                }
+                resp = await call("resume", {"path": "/does/not/exist"})
+                assert resp["error"]["kind"] == "session"
                 for operation in ("delete_transfer", "rollback_resume"):
                     target = transfer_root / (operation + ".kohakutr")
                     target.write_bytes(b"transfer")
@@ -604,40 +607,39 @@ class TestStudioIdentityAdapter:
             try:
                 await _wait_joined(host, "w-id")
 
-                # get_api_key — verb 1
-                # Try cached fetch; if backend isn't registered, drive
-                # the verb via raw RPC.
-                try:
-                    key = await identity.get_api_key("openai")
-                    assert key == "sk-test-key", f"got key={key!r}"
-                except Exception:
-                    # Fall back to raw RPC — verb dispatch path still
-                    # exercised even if the backend isn't loaded.
-                    resp = await client.request(
-                        to_node="_host",
-                        namespace="studio.identity",
-                        type="get_api_key",
-                        body={"provider": "openai"},
-                        timeout=5.0,
-                    )
-                    assert resp is not None
-
-                # Drive the remaining verbs via raw RPC for full sweep.
-                for verb, body in [
-                    ("list_profiles", {}),
-                    ("get_profile", {"name": "openai/test-preset"}),
-                    ("list_mcp_servers", {}),
-                    ("get_mcp_server", {"name": "nonexistent"}),
-                    ("get_codex_token", {}),
-                ]:
-                    resp = await client.request(
+                async def call(verb, body):
+                    return await client.request(
                         to_node="_host",
                         namespace="studio.identity",
                         type=verb,
                         body=body,
                         timeout=5.0,
                     )
-                    assert resp is not None, f"verb {verb} returned None"
+
+                # The worker resolves the host's key through the identity cache.
+                assert await identity.get_api_key("openai") == "sk-test-key"
+
+                profiles = (await call("list_profiles", {}))["profiles"]
+                assert [(p["name"], p["provider"], p["model"]) for p in profiles] == [
+                    ("test-preset", "openai", "test-model")
+                ]
+                assert (profiles[0]["max_context"], profiles[0]["max_output"]) == (
+                    4096,
+                    256,
+                )
+
+                resp = await call("get_profile", {"name": "no-such-preset"})
+                assert resp["error"]["kind"] == "not_found"
+                assert "no-such-preset" in resp["error"]["message"]
+
+                assert await call("list_mcp_servers", {}) == {"servers": []}
+                resp = await call("get_mcp_server", {"name": "nonexistent"})
+                assert resp["error"]["kind"] == "not_found"
+                assert "nonexistent" in resp["error"]["message"]
+
+                resp = await call("get_codex_token", {})
+                assert resp["error"]["kind"] == "not_found"
+                assert "Codex tokens" in resp["error"]["message"]
             finally:
                 clear_api_key_resolver()
                 await client.stop()
@@ -683,36 +685,28 @@ class TestStudioCatalogAdapter:
                     "worker-local"
                 ] == str(local_config)
 
-                # list — verb 1
-                resp = await host.request(
-                    to_node="w-cat",
-                    namespace="studio.catalog",
-                    type="list",
-                    body={},
-                    timeout=5.0,
-                )
-                assert resp is not None
+                async def call(type_, body):
+                    return await host.request(
+                        to_node="w-cat",
+                        namespace="studio.catalog",
+                        type=type_,
+                        body=body,
+                        timeout=5.0,
+                    )
 
-                # install — verb 2 (will error on nonexistent package
-                # but the verb dispatch is exercised)
-                resp = await host.request(
-                    to_node="w-cat",
-                    namespace="studio.catalog",
-                    type="install",
-                    body={"name": "@nonexistent/pkg"},
-                    timeout=5.0,
-                )
-                assert resp is not None
+                # No package is installed on the worker, and removing an
+                # absent one reports that nothing was removed.
+                assert await call("list", {}) == {"packages": []}
+                assert await call("uninstall", {"name": "@nonexistent/pkg"}) == {
+                    "removed": False
+                }
 
-                # uninstall — verb 3
-                resp = await host.request(
-                    to_node="w-cat",
-                    namespace="studio.catalog",
-                    type="uninstall",
-                    body={"name": "@nonexistent/pkg"},
-                    timeout=5.0,
-                )
-                assert resp is not None
+                # install names its missing argument.
+                resp = await call("install", {"name": "@nonexistent/pkg"})
+                assert resp["error"] == {
+                    "kind": "invalid",
+                    "message": "source is required",
+                }
             finally:
                 await client.stop()
         finally:
@@ -731,15 +725,24 @@ class TestStudioDeployAdapter:
     bundle, the worker reconstructs it under ``recipe://<name>/``."""
 
     async def test_deploy_namespace_full_sweep(
-        self, tmp_path, _reset_inproc, scripted_llm
+        self, tmp_path, _reset_inproc, scripted_llm, monkeypatch
     ):
-        import os
-
-        # Worker needs a config dir for recipe:// scope resolution.
         worker_cfg = tmp_path / "w-deploy-cfg"
         worker_cfg.mkdir(parents=True, exist_ok=True)
-        old_config_dir = os.environ.get("KT_CONFIG_DIR")
-        os.environ["KT_CONFIG_DIR"] = str(worker_cfg)
+        monkeypatch.setenv("KT_CONFIG_DIR", str(worker_cfg))
+
+        def bundle_entry(text: str) -> list[str]:
+            blob = text.encode()
+            return [hashlib.sha256(blob).hexdigest(), base64.b64encode(blob).decode()]
+
+        async def push(host, name, files):
+            return await host.request(
+                to_node="w-deploy",
+                namespace="studio.deploy",
+                type="push_creature_bundle",
+                body={"name": name, "files": files},
+                timeout=10.0,
+            )
 
         host = await _start_host(port=5)
         try:
@@ -750,35 +753,51 @@ class TestStudioDeployAdapter:
             try:
                 await _wait_joined(host, "w-deploy")
 
-                # push_creature_bundle — single verb
-                resp = await host.request(
-                    to_node="w-deploy",
-                    namespace="studio.deploy",
-                    type="push_creature_bundle",
-                    body={
-                        "name": "test-creature",
-                        "files": [
-                            {
-                                "path": "config.yaml",
-                                "content_b64": (
-                                    # "name: test\n" base64
-                                    "bmFtZTogdGVzdAo="
-                                ),
-                            },
-                        ],
+                # A first push lands every file under the worker's recipe scope.
+                resp = await push(
+                    host,
+                    "test-creature",
+                    {
+                        "config.yaml": bundle_entry("name: test\n"),
+                        "prompts/system.md": bundle_entry("be brief\n"),
                     },
-                    timeout=10.0,
                 )
-                # Bundle reaches the worker — error or success both
-                # exercise the dispatch path.
-                assert resp is not None
+                assert sorted(resp["deployed"]) == ["config.yaml", "prompts/system.md"]
+                assert resp["conflicts"] == []
+                target = Path(resp["target_path"])
+                assert (target / "config.yaml").read_text() == "name: test\n"
+                assert (target / "prompts" / "system.md").read_text() == "be brief\n"
+
+                # Re-pushing identical bytes is a no-op, not a conflict.
+                resp = await push(
+                    host, "test-creature", {"config.yaml": bundle_entry("name: test\n")}
+                )
+                assert resp["deployed"] == [] and resp["conflicts"] == []
+
+                # Different bytes at an existing path are reported and not written.
+                resp = await push(
+                    host,
+                    "test-creature",
+                    {"config.yaml": bundle_entry("name: other\n")},
+                )
+                assert resp["deployed"] == []
+                assert resp["conflicts"] == ["config.yaml"]
+                assert (target / "config.yaml").read_text() == "name: test\n"
+
+                # A corrupted digest and an unsafe name are refused as invalid.
+                resp = await push(
+                    host,
+                    "bad-hash",
+                    {"config.yaml": ["0" * 64, base64.b64encode(b"x").decode()]},
+                )
+                assert resp["error"]["kind"] == "invalid"
+                assert "mismatched hash" in resp["error"]["message"]
+                resp = await push(host, "../escape", {})
+                assert resp["error"]["kind"] == "invalid"
+                assert not (worker_cfg.parent / "escape").exists()
             finally:
                 await client.stop()
                 await engine.shutdown()
-                if old_config_dir is None:
-                    os.environ.pop("KT_CONFIG_DIR", None)
-                else:
-                    os.environ["KT_CONFIG_DIR"] = old_config_dir
         finally:
             await host.stop()
 
@@ -796,86 +815,82 @@ class TestTerrariumBroadcastAdapter:
     async def test_broadcast_namespace_full_sweep(
         self, tmp_path, _reset_inproc, scripted_llm
     ):
+        async def call(host, type_, body):
+            return await host.request(
+                to_node="w-bcast",
+                namespace="terrarium.broadcast",
+                type=type_,
+                body=body,
+                timeout=5.0,
+            )
+
         host = await _start_host(port=6)
         try:
             client = await _start_client("w-bcast", port=6)
-            engine = Terrarium(session_dir=str(tmp_path / "w-bcast-sess"))
-            TerrariumBroadcastAdapter(engine, client)
+            engine = await (
+                TestTerrariumBuilder().with_creature("a").with_channel("chat").build()
+            )
+            adapter = TerrariumBroadcastAdapter(engine, client)
+            peer_client = await _start_client("w-peer", port=6)
+            peer_engine = Terrarium(session_dir=str(tmp_path / "w-peer-sess"))
+            peer_adapter = TerrariumBroadcastAdapter(peer_engine, peer_client)
+            gid = engine.list_graphs()[0].graph_id
+            channel = engine._environments[gid].shared_channels.get("chat")
+            probe = channel.subscribe("probe")
             try:
                 await _wait_joined(host, "w-bcast")
+                await _wait_joined(host, "w-peer")
+                where = {"graph_id": gid, "channel": "chat"}
 
-                # subscribe — verb 1
-                resp = await host.request(
-                    to_node="w-bcast",
-                    namespace="terrarium.broadcast",
-                    type="subscribe",
-                    body={
-                        "graph_id": "test-graph",
-                        "channel": "test-channel",
-                        "peer_node": "_host",
-                    },
-                    timeout=5.0,
-                )
-                assert resp is not None
+                # subscribe records the requesting node as a peer of the channel.
+                assert await call(host, "subscribe", where) == {"subscribed": True}
+                assert adapter.peers_for(gid, "chat") == {"_host"}
 
-                # proxy_subscribe — verb 2
-                resp = await host.request(
-                    to_node="w-bcast",
-                    namespace="terrarium.broadcast",
-                    type="proxy_subscribe",
-                    body={
-                        "graph_id": "test-graph",
-                        "channel": "test-channel",
-                        "peer_node": "w-other",
-                    },
-                    timeout=5.0,
+                # inject replays a peer's message through the local channel.
+                message = {"sender": "remote-a", "content": "broadcast test"}
+                assert await call(host, "inject", {**where, "message": message}) == {
+                    "injected": True
+                }
+                received = await probe.receive(timeout=2.0)
+                assert (received.sender, received.content) == (
+                    "remote-a",
+                    "broadcast test",
                 )
-                assert resp is not None
+                assert received._injected is True
 
-                # inject — verb 3
-                resp = await host.request(
-                    to_node="w-bcast",
-                    namespace="terrarium.broadcast",
-                    type="inject",
-                    body={
-                        "graph_id": "test-graph",
-                        "channel": "test-channel",
-                        "sender": "host",
-                        "content": "broadcast test",
-                    },
-                    timeout=5.0,
+                # An unknown channel is a typed not_found error.
+                resp = await call(
+                    host, "inject", {**where, "channel": "ghost", "message": message}
                 )
-                assert resp is not None
+                assert resp["error"]["kind"] == "not_found"
 
-                # proxy_unsubscribe — verb 4
-                resp = await host.request(
-                    to_node="w-bcast",
-                    namespace="terrarium.broadcast",
-                    type="proxy_unsubscribe",
-                    body={
-                        "graph_id": "test-graph",
-                        "channel": "test-channel",
-                        "peer_node": "w-other",
-                    },
-                    timeout=5.0,
-                )
-                assert resp is not None
+                # proxy_subscribe makes the worker subscribe itself to a peer,
+                # which then records the worker (not the host) as its subscriber.
+                proxied = {**where, "peer": "w-peer"}
+                assert await call(host, "proxy_subscribe", proxied) == {
+                    "subscribed": True
+                }
+                assert adapter._my_subs == {(gid, "chat"): {"w-peer"}}
+                assert peer_adapter.peers_for(gid, "chat") == {"w-bcast"}
 
-                # unsubscribe — verb 5
-                resp = await host.request(
-                    to_node="w-bcast",
-                    namespace="terrarium.broadcast",
-                    type="unsubscribe",
-                    body={
-                        "graph_id": "test-graph",
-                        "channel": "test-channel",
-                        "peer_node": "_host",
-                    },
-                    timeout=5.0,
-                )
-                assert resp is not None
+                assert await call(host, "proxy_unsubscribe", proxied) == {
+                    "unsubscribed": True
+                }
+                assert adapter._my_subs == {}
+                assert peer_adapter.peers_for(gid, "chat") == set()
+
+                # unsubscribe drops the peer and the empty bucket.
+                assert await call(host, "unsubscribe", where) == {"unsubscribed": True}
+                assert adapter.peers_for(gid, "chat") == set()
+                assert (gid, "chat") not in adapter._subs
+
+                # An unknown verb is rejected by name.
+                resp = await call(host, "bogus", where)
+                assert resp["error"]["kind"] == "unknown_type"
             finally:
+                await peer_client.stop()
                 await client.stop()
+                await peer_engine.shutdown()
                 await engine.shutdown()
         finally:
             await host.stop()
@@ -894,32 +909,67 @@ class TestTerrariumOutputWireAdapter:
     async def test_output_wire_namespace_full_sweep(
         self, tmp_path, _reset_inproc, scripted_llm
     ):
+        async def call(host, type_, body):
+            return await host.request(
+                to_node="w-ow",
+                namespace="terrarium.output_wire",
+                type=type_,
+                body=body,
+                timeout=5.0,
+            )
+
         host = await _start_host(port=7)
         try:
             client = await _start_client("w-ow", port=7)
-            engine = Terrarium(session_dir=str(tmp_path / "w-ow-sess"))
+            engine = await TestTerrariumBuilder().with_creature("dst").build()
             TerrariumOutputWireAdapter(engine, client)
+            dst = engine.get_creature("dst")
+            relay = {
+                "target_name": "dst",
+                "event": {"type": "creature_output", "content": "forwarded output"},
+                "source_creature_id": "src",
+                "source_graph_id": "src-graph",
+                "hop": 1,
+                "peer": "_host",
+            }
             try:
                 await _wait_joined(host, "w-ow")
 
-                # inject — single verb
-                resp = await host.request(
-                    to_node="w-ow",
-                    namespace="terrarium.output_wire",
-                    type="inject",
-                    body={
-                        "to_creature_id": "nonexistent",
-                        "from_node": "_host",
-                        "from_creature_id": "src",
-                        "from_creature_name": "source",
-                        "content": "forwarded output",
-                        "prompt_format": "simple",
-                    },
-                    timeout=5.0,
+                # A claim of a different sender than the real peer is refused.
+                resp = await call(host, "inject", {**relay, "peer": "somebody-else"})
+                assert resp == {
+                    "delivered": False,
+                    "error": "invalid routing identity",
+                }
+
+                # A worker only accepts relayed events that name the exact target.
+                resp = await call(host, "inject", relay)
+                assert resp == {
+                    "delivered": False,
+                    "error": "missing exact target identity",
+                }
+
+                # A target id this worker does not host is not delivered.
+                exact = {
+                    **relay,
+                    "target_creature_id": "ghost",
+                    "target_graph_id": dst.graph_id,
+                }
+                resp = await call(host, "inject", exact)
+                assert resp == {"delivered": False, "error": "target not found locally"}
+
+                # A hosted creature in a different graph than claimed is not either.
+                resp = await call(
+                    host,
+                    "inject",
+                    {**exact, "target_creature_id": "dst", "target_graph_id": "other"},
                 )
-                # Either responds with an error (creature not found) or
-                # succeeds — the dispatch path runs either way.
-                assert resp is not None
+                assert resp == {"delivered": False, "error": "target graph mismatch"}
+
+                # An unknown verb is a typed failure, not a silent drop.
+                resp = await call(host, "bogus", relay)
+                assert resp["delivered"] is False
+                assert "unknown output-wire op: bogus" in resp["error"]
             finally:
                 await client.stop()
                 await engine.shutdown()

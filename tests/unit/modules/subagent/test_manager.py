@@ -10,7 +10,7 @@ import asyncio
 import pytest
 
 from kohakuterrarium.core.budget import IterationBudget
-from kohakuterrarium.core.job import JobState, JobType
+from kohakuterrarium.core.jobs.job import JobState, JobType
 from kohakuterrarium.core.registry import Registry
 from kohakuterrarium.modules.subagent.config import SubAgentConfig
 from kohakuterrarium.modules.subagent.manager import SubAgentManager
@@ -54,6 +54,14 @@ class TestRegistration:
 
     def test_subagents_prompt_empty_when_none_registered(self):
         assert _manager().get_subagents_prompt() == ""
+
+    def test_subagents_prompt_lists_only_visible_names(self):
+        mgr = _manager()
+        mgr.register(SubAgentConfig(name="explore", description="finds"))
+        mgr.register(SubAgentConfig(name="critic", description="critiques"))
+        prompt = mgr.get_subagents_prompt(lambda name: name == "critic")
+        assert "- critic: critiques" in prompt and "explore" not in prompt
+        assert mgr.get_subagents_prompt(lambda name: False) == ""
 
     def test_subagents_prompt_does_not_repeat_framework_guidance(self):
         # Sub-agent isolation is stated once in the execution-model block, not
@@ -223,7 +231,9 @@ class TestInteractiveModelResolution:
     async def test_start_interactive_resolves_child_model(self, monkeypatch):
         # An interactive child must run on its resolved ``config.model``
         # provider, not the parent's LLM.
-        from kohakuterrarium.modules.subagent import interactive_mgr
+        from kohakuterrarium.modules.subagent.interactive import (
+            manager as interactive_mgr,
+        )
 
         child_llm = ScriptedLLM(["child"])
         seen: dict[str, str] = {}
@@ -352,7 +362,7 @@ class TestRunSubagentOutcomes:
         # The parent's post_subagent_run hook may return a new
         # SubAgentResult — the manager must adopt it.
         from kohakuterrarium.modules.plugin.base import BasePlugin
-        from kohakuterrarium.modules.plugin.manager import PluginManager
+        from kohakuterrarium.modules.plugin.manager.manager import PluginManager
         from kohakuterrarium.modules.subagent.result import SubAgentResult
 
         class _RewritePlugin(BasePlugin):
@@ -428,7 +438,7 @@ class TestRunSubagentOutcomes:
         # job.run() itself raising (not the LLM, but the job wrapper) is
         # caught by _run_subagent's generic handler → failed result +
         # ERROR job status.
-        from kohakuterrarium.core.job import JobStatus, JobType
+        from kohakuterrarium.core.jobs.job import JobStatus, JobType
         from kohakuterrarium.modules.subagent.result import SubAgentJob
 
         mgr = _manager(ScriptedLLM(["x"]))

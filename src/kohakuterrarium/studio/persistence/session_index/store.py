@@ -19,6 +19,8 @@ from typing import Any
 from kohakuvault import KVault, TextVault
 
 from kohakuterrarium.session import run_state
+from kohakuterrarium.session.vault.handles import dispose
+from kohakuterrarium.session.vault.io import read_prefix, read_values, scan_keys
 from kohakuterrarium.studio.persistence.session_index.entry import (
     SCHEMA_VERSION,
     SessionIndexEntry,
@@ -28,13 +30,12 @@ from kohakuterrarium.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-# KVault yields byte keys and paginates internally; normalize filenames to
-# strings at the boundary.
-_DEFAULT_KEY_BATCH = 100_000
+_ABSENT = object()
 
 
-def _iter_kv_keys(kv: KVault, batch: int = _DEFAULT_KEY_BATCH) -> Iterator[str]:
-    for k in kv.keys(limit=batch):
+def _iter_kv_keys(kv: KVault) -> Iterator[str]:
+    """Every key of ``kv`` as a filename string."""
+    for k in scan_keys(kv):
         yield k.decode("utf-8") if isinstance(k, (bytes, bytearray)) else str(k)
 
 
@@ -162,9 +163,7 @@ class SessionIndex:
         finally:
             if meta is not None:
                 try:
-                    meta.close()
-                    if hasattr(meta, "_inner"):
-                        del meta._inner
+                    dispose(meta)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "meta probe close failed", error=str(exc), exc_info=True
@@ -218,11 +217,7 @@ class SessionIndex:
         with self._write_lock:
             cols = entry.to_search_columns()
             self._mark_changed(entry.filename)
-            existing = (
-                self._entries.get(entry.filename)
-                if entry.filename in self._entries
-                else None
-            )
+            existing = self._entries.get(entry.filename)
             rowid = int((existing or {}).get("_search_rowid", 0))
             if rowid:
                 try:
@@ -284,11 +279,10 @@ class SessionIndex:
         the filename was already absent.
         """
         with self._write_lock:
-            if filename not in self._entries:
-                self._mark_changed(filename)
-                return False
             self._mark_changed(filename)
-            existing = self._entries.get(filename)
+            existing = self._entries.get(filename, _ABSENT)
+            if existing is _ABSENT:
+                return False
             rowid = int((existing or {}).get("_search_rowid", 0))
             if rowid:
                 try:
@@ -319,18 +313,22 @@ class SessionIndex:
                 logger.warning("clear search failed", error=str(exc), exc_info=True)
 
     def get(self, filename: str) -> dict[str, Any] | None:
-        if filename not in self._entries:
-            return None
-        return _strip_internal(self._entries.get(filename))
+        entry = self._entries.get(filename)
+        return None if entry is None else _strip_internal(entry)
 
     def fingerprint(self, filename: str) -> tuple[float, int] | None:
-        if filename not in self._entries:
-            return None
         d = self._entries.get(filename)
+        if d is None:
+            return None
         return (float(d.get("file_mtime", 0.0)), int(d.get("file_size", 0)))
 
     def all_filenames(self) -> list[str]:
         return list(_iter_kv_keys(self._entries))
+
+    def _entry_rows(self) -> Iterator[dict[str, Any]]:
+        for _, entry in read_prefix(self._entries, what="index entry"):
+            if isinstance(entry, dict):
+                yield entry
 
     def iter_entries(self) -> Iterator[dict[str, Any]]:
         """Yield all entries without internal search fields.
@@ -338,21 +336,11 @@ class SessionIndex:
         Full scans support aggregation; filtered and paginated callers should
         use :meth:`list` to benefit from FTS and sorting.
         """
-        for fname in _iter_kv_keys(self._entries):
-            entry = self._entries.get(fname)
-            if entry is None:
-                continue
+        for entry in self._entry_rows():
             yield _strip_internal(entry)
 
     def count(self) -> int:
-        # KVault has no cheap count; the safety cap bounds scans of malformed
-        # or unexpectedly large sidecars.
-        n = 0
-        for _ in _iter_kv_keys(self._entries):
-            n += 1
-            if n >= 100_000:
-                break
-        return n
+        return len(self._entries)
 
     def list(
         self,
@@ -425,14 +413,11 @@ class SessionIndex:
         limit: int,
         offset: int,
     ) -> SessionIndexPage:
-        rows: list[dict[str, Any]] = []
-        for fname in _iter_kv_keys(self._entries):
-            entry_dict = self._entries.get(fname)
-            if not entry_dict or not self._passes(
-                entry_dict, status, config_type, node_id
-            ):
-                continue
-            rows.append(entry_dict)
+        rows = [
+            entry
+            for entry in self._entry_rows()
+            if entry and self._passes(entry, status, config_type, node_id)
+        ]
         rows.sort(key=lambda e: (e.get(sort) or ""), reverse=(order == "desc"))
         total = len(rows)
         page = [_strip_internal(e) for e in rows[offset : offset + limit]]
@@ -455,14 +440,18 @@ class SessionIndex:
         # baseline of 2,000 hits.
         k = max(2_000, limit + offset, (limit + offset) * 5)
         k = max(200, k)
-        hits = self._search.search(q, k=k)
+        hits = [
+            (value, score)
+            for _rowid, score, value in self._search.search(q, k=k)
+            if isinstance(value, str) and value
+        ]
+        # Orphaned FTS rows are absent here; reconciliation owns their cleanup.
+        found = dict(
+            read_values(self._entries, [f for f, _ in hits], what="index entry")
+        )
         rows: list[dict[str, Any]] = []
-        for _rowid, score, value in hits:
-            fname = value if isinstance(value, str) else None
-            if not fname or fname not in self._entries:
-                # Reconciliation owns cleanup of orphaned FTS rows.
-                continue
-            entry_dict = self._entries.get(fname)
+        for fname, score in hits:
+            entry_dict = found.get(fname)
             if not entry_dict or not self._passes(
                 entry_dict, status, config_type, node_id
             ):
@@ -482,9 +471,7 @@ class SessionIndex:
         return SessionIndexPage(page, total, offset, limit)
 
     def meta_get(self, key: str, default: Any = None) -> Any:
-        if key not in self._meta:
-            return default
-        return self._meta.get(key)
+        return self._meta.get(key, default)
 
     def meta_put(self, key: str, value: Any) -> None:
         self._meta.put(key, value)
@@ -510,25 +497,11 @@ class SessionIndex:
 
     def _close_tables(self) -> None:
         """Dispose native handles after the shared writer has drained."""
-        # TextVault has no close method; its underlying vault is released
-        # explicitly after closable tables are handled.
         for table in (self._entries, self._search, self._meta):
-            close = getattr(table, "close", None)
-            if not callable(close):
-                continue
             try:
-                close()
+                dispose(table)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("close table failed", error=str(exc), exc_info=True)
-        for table in (self._entries, self._meta):
-            try:
-                del table._inner
-            except AttributeError:
-                pass
-        try:
-            del self._search._vault
-        except AttributeError:
-            pass
 
     @property
     def path(self) -> str:

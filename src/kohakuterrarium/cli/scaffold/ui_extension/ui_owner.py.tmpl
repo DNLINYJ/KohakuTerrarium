@@ -1,0 +1,34 @@
+"""Package-wide UI owner for {{name}}'s settings section."""
+
+from kohakuterrarium.modules.ui_owner import (
+    OwnerArgumentError,
+    OwnerForbiddenError,
+    UIOwnerMixin,
+)
+
+
+class PackageUI(UIOwnerMixin):
+    """One instance per host process, shared by every user of the host.
+
+    Both methods take ``context`` so the package also works on multi-user
+    hosts: ``context.multi_user`` tells the two modes apart and
+    ``context.is_admin`` gates host-wide changes.
+    """
+
+    def __init__(self) -> None:
+        self.greeting = "Hello"
+
+    def ui_state(self, context=None) -> dict:
+        return {"greeting": self.greeting}
+
+    def ui_call(self, action: str, args: dict, context=None):
+        if action == "set_greeting":
+            if context is not None and context.multi_user and not context.is_admin:
+                raise OwnerForbiddenError("only an admin may change the greeting")
+            self.greeting = str(args.get("greeting") or "Hello")
+            self.ui_emit("state", self.ui_state())
+            return self.ui_state()
+        raise OwnerArgumentError(f"unknown action {action!r}")
+
+    def close(self) -> None:
+        """Called when this handler is replaced (package updated or reinstalled)."""

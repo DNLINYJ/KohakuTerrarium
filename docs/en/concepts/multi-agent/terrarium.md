@@ -169,25 +169,25 @@ others can DM it via `send_channel`) and, if a root exists, a
 
 ## How we implement it
 
-- `terrarium/engine.py`: the `Terrarium` class. One per process.
+- `terrarium/engine/engine.py`: the `Terrarium` class. One per process.
   Owns the topology state, live creatures, environments, attached
   session stores, and the event-subscriber list. Async context manager
   (`async with Terrarium() as t:`) plus classmethod factories
   (`from_recipe`, `with_creature`, `resume`).
-- `terrarium/topology.py`: pure-data graph model
+- `terrarium/graph/topology.py`: pure-data graph model
   (`TopologyState`, `GraphTopology`, `ChannelInfo`, `TopologyDelta`).
   No live agent references; testable without asyncio. Connected
   components are computed via BFS over the bipartite creature ↔
   channel graph; mutations return a delta describing
   `merge` / `split` / `nothing`. The engine layers live state on top.
-- `terrarium/creature_host.py`: `Creature`, the engine's per-creature
+- `terrarium/creature/host.py`: `Creature`, the engine's per-creature
   wrapper. Combines the old standalone-agent and channel-aware
   surfaces into one type.
-- `terrarium/recipe.py`: walks a `TerrariumConfig` and applies it to
+- `terrarium/recipe/loader.py`: walks a `TerrariumConfig` and applies it to
   the engine: declare channels, auto-direct channels per creature,
   `report_to_root` when a root is declared, wire listen / send edges,
   inject channel triggers, start everything.
-- `terrarium/channels.py`: channel injection (when a creature joins
+- `terrarium/channels/channels.py`: channel injection (when a creature joins
   a graph with channels it listens to, a `ChannelTrigger` is added to
   its agent), plus the bodies of `connect_creatures` /
   `disconnect_creatures`.
@@ -199,7 +199,7 @@ others can DM it via `send_channel`) and, if a root exists, a
   registration and user-IO mounting stay at higher layers. Use it any
   time you build a graph imperatively and want the normal "one-team,
   one-root" topology without going through a recipe file.
-- `terrarium/session_coord.py`: session merge / split policy. On a
+- `terrarium/session/coord.py`: session merge / split policy. On a
   graph merge, both old stores are unioned into a new one. On a graph
   split, the parent store is duplicated to each side.
 - `terrarium/events.py`: the `EngineEvent` taxonomy plus

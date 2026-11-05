@@ -7,26 +7,26 @@ from typing import Any, Literal
 
 from kohakuterrarium.bootstrap.plugins import init_plugins
 from kohakuterrarium.bootstrap.tools import create_tool
-from kohakuterrarium.core.backgroundify import PromotionResult
-from kohakuterrarium.core.config_types import ToolConfigItem
-from kohakuterrarium.core.execution_context import ExecutionBinding
-from kohakuterrarium.core.executor import Executor
-from kohakuterrarium.core.job import JobResult
+from kohakuterrarium.core.jobs.backgroundify import PromotionResult
+from kohakuterrarium.core.config.types import ToolConfigItem
+from kohakuterrarium.core.tools.execution_context import ExecutionBinding
+from kohakuterrarium.core.jobs.executor import Executor
+from kohakuterrarium.core.jobs.job import JobResult
 from kohakuterrarium.core.loader import ModuleLoader
 from kohakuterrarium.core.registry import Registry
-from kohakuterrarium.core.tool_dispatch import (
+from kohakuterrarium.core.tools.dispatch import (
     ToolDispatchBlocked,
     dispatch_tool_hooks,
     start_tool_task,
     tool_background_handle,
 )
-from kohakuterrarium.llm.tools import build_tool_schemas
+from kohakuterrarium.llm.tools.build import build_tool_schemas
 from kohakuterrarium.mcp_server.config import MCPToolsConfig
-from kohakuterrarium.mcp_server.delegation import DelegationRuntime
+from kohakuterrarium.mcp_server.delegation.delegation import DelegationRuntime
 from kohakuterrarium.modules.plugin.base import BasePlugin, PluginContext
 from kohakuterrarium.modules.tool.base import ToolContext
 from kohakuterrarium.parsing import ToolCallEvent
-from kohakuterrarium.utils.file_guard import FileReadState, PathBoundaryGuard
+from kohakuterrarium.utils.file.guard import FileReadState, PathBoundaryGuard
 
 _EXECUTION_OPTIONS = {"max_output"}
 _UNSUPPORTED_HOOKS = (
@@ -73,6 +73,7 @@ class ToolCatalog:
             [p.model_dump(by_alias=True, exclude_none=True) for p in config.plugins],
             loader,
             strict=True,
+            catalog_defaults=False,
         )
         for plugin in plugins:
             self.plugins.register(plugin)

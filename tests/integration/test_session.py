@@ -12,12 +12,13 @@ v1→v2 migration) is the production collaborator.
 The workflows mirror how the codebase actually drives session:
 ``studio/sessions/lifecycle.py`` builds a ``SessionStore``, calls
 ``init_meta``, then ``agent.attach_session_store(store)``; the agent's
-``SessionOutput`` sink records every turn; ``session/resume.py`` rebuilds
+``SessionOutput`` sink records every turn; ``session/resume/resume.py`` rebuilds
 the agent from the ``config_path`` in meta and re-injects state;
-``studio/sessions/memory_search.py`` indexes events and searches.
+``studio/sessions/memory/search.py`` indexes events and searches.
 """
 
 import asyncio
+import copy
 import hashlib
 import os
 import subprocess
@@ -30,32 +31,44 @@ import pytest
 
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
+from kohakuterrarium.core.agent.history import message_history as _message_history_mod
 from kohakuterrarium.core.agent import Agent
-from kohakuterrarium.core.branch_continuation import selected_branch_view
+from kohakuterrarium.core.conversation.continuation import selected_branch_view
 from kohakuterrarium.core.events import create_user_input_event
+from kohakuterrarium.core.conversation.pinned import pin_message, unpin_message
+from kohakuterrarium.core.conversation.pinned import state_key as pinned_state_key
+from kohakuterrarium.errors import RendererUnavailable
+from kohakuterrarium.llm.message import ImagePart, TextPart
+from kohakuterrarium.builtins.kt_ui.inline_state import block_ids
+from kohakuterrarium.modules.output.widgets.service import WidgetMessage
 from kohakuterrarium.modules.tool.base import BaseTool, ExecutionMode, ToolResult
 from kohakuterrarium.modules.trigger.timer import TimerTrigger
-from kohakuterrarium.session.attachment_service import get_attach_state
-from kohakuterrarium.session.embedding import BaseEmbedder
+from kohakuterrarium.session.history import replay as _history_mod
+from kohakuterrarium.session.resume import resume as _resume_mod
+from kohakuterrarium.session.resume import branch as _resume_branch_mod
+from kohakuterrarium.session.attach.service import get_attach_state
+from kohakuterrarium.session.output.output import SessionOutput
+from kohakuterrarium.session.memory.embedding import BaseEmbedder
 from kohakuterrarium.session.errors import (
     AlreadyAttachedError,
     ForkNotStableError,
     NotAttachedError,
 )
 from kohakuterrarium.session.session import Session
-from kohakuterrarium.session.history_records import (
+from kohakuterrarium.session.history.records import (
     history_detail,
     history_page,
 )
 
-from kohakuterrarium.session.history import (
+from kohakuterrarium.session.history.replay import (
     collect_branch_metadata,
     collect_user_groups,
     normalize_resumable_events,
     replay_conversation,
 )
-from kohakuterrarium.session.memory import SessionMemory
-from kohakuterrarium.session.memory_async import live_memory_for_store
+from kohakuterrarium.session.memory.index import SessionMemory
+from kohakuterrarium.session.memory.async_search import live_memory_for_store
+from kohakuterrarium.session.readonly.candidate import read_metadata_candidate
 from kohakuterrarium.session.migrations import (
     discover_versions,
     ensure_latest_version,
@@ -63,20 +76,28 @@ from kohakuterrarium.session.migrations import (
     migration_marker,
     path_for_version,
 )
-from kohakuterrarium.session.readonly import read_session_meta
-from kohakuterrarium.session.readonly_view import SessionReadView
-from kohakuterrarium.session.resource_gate import try_fast
-from kohakuterrarium.session.raw_history import UserMessageSelector
-from kohakuterrarium.session.resume import detect_session_type, resume_agent
-from kohakuterrarium.session.resume_async import resume_agent_async
+from kohakuterrarium.session.readonly.metadata import read_session_meta
+from kohakuterrarium.session.readonly.view import SessionReadView
+from kohakuterrarium.session.occupancy.gate import try_fast
+from kohakuterrarium.session.history.raw import UserMessageSelector
+from kohakuterrarium.session.resume.resume import detect_session_type, resume_agent
+from kohakuterrarium.session.resume.async_flow import resume_agent_async
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.session.version import FORMAT_VERSION, detect_format_version
+from kohakuterrarium.session.store.lifecycle.version import (
+    FORMAT_VERSION,
+    detect_format_version,
+)
+from kohakuterrarium.studio.attach._event_stream import StreamOutput
+from kohakuterrarium.studio.attach.widget_frames import handle_widget_frame
 from kohakuterrarium.testing.llm import ScriptedLLM
 
 pytestmark = pytest.mark.timeout(60)
 
 
 # ── deterministic collaborators ──────────────────────────────────
+
+
+INLINE_BLOCK = '<ui><state tip={10}/><slider bind="tip" min={0} max={30}/></ui>'
 
 
 class _HashEmbedder(BaseEmbedder):
@@ -148,6 +169,9 @@ def patched_llm(monkeypatch):
 CHILD = "tests.helpers.live_store_stress_child"
 
 
+_PIN_PIXEL = "data:image/png;base64,iVBORw0KGgo="
+
+
 def _write_agent_config(config_dir, name: str = "scribe") -> str:
     """Write a minimal but complete creature config dir. Returns the path."""
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -183,7 +207,9 @@ def _new_store(path, *, config_path: str, agents: list[str]) -> SessionStore:
 class TestSessionIntegration:
     """Each method = one full session workflow, start to finish."""
 
-    async def test_run_record_close_reopen_resume(self, patched_llm, tmp_path):
+    async def test_run_record_close_reopen_resume(
+        self, patched_llm, tmp_path, monkeypatch
+    ):
         """The canonical session integration workflow.
 
         init store → real Agent attaches it → run chat turns that write
@@ -198,7 +224,7 @@ class TestSessionIntegration:
         # ---- phase 1: a live agent runs turns against a real store ----
         store = _new_store(session_path, config_path=config_path, agents=["scribe"])
         patched_llm["script"] = [
-            "Hello, I am the scribe.",
+            f"Hello, I am the scribe.\n\n{INLINE_BLOCK}",
             "[/echo]persisted[echo/]",
             "The echo tool ran and I recorded it.",
         ]
@@ -209,6 +235,12 @@ class TestSessionIntegration:
         agent.attach_session_store(store)
         await agent.start()
         try:
+            pin_message(
+                agent,
+                "persona",
+                "user",
+                [TextPart(text="PINNED-PERSONA"), ImagePart(url=_PIN_PIXEL)],
+            )
             await agent._process_event(create_user_input_event("introduce yourself"))
             await agent._process_event(create_user_input_event("use the echo tool"))
             # Drive the SessionOutput activity surface the runtime uses:
@@ -290,8 +322,121 @@ class TestSessionIntegration:
             agent.session.scratchpad.set("project", "terrarium")
             agent.compact_manager._compact_count = 3
             await agent._process_event(create_user_input_event("remember the project"))
+
+            # Widgets: a web client says hello, a widget opens, a waiter
+            # takes its message, an unclaimed message drives a turn, and
+            # client state is merged and recorded.
+            renderer_changes = []
+            router.add_renderers_listener(lambda old, new: renderer_changes.append(new))
+            web_frames = asyncio.Queue()
+            web = StreamOutput("scribe", web_frames, [], agent=agent)
+            router.add_secondary(web)
+            with pytest.raises(RendererUnavailable):
+                await router.widgets.open("kt.ui", {"root": {}})
+            web.set_client_renderers({"kt.ui": 1})
+            handle = await router.widgets.open(
+                "kt.ui",
+                {"root": {"type": "number", "bind": "tip"}},
+                state={"tip": 10},
+                title="Tip",
+                fallback="Tip calculator",
+            )
+            widget_id = handle.id
+            waiter = asyncio.create_task(handle.wait({"submit"}, timeout_s=5))
+            await asyncio.sleep(0)
+            submit = WidgetMessage(widget_id, "submit", {"tip": 12})
+            assert router.widgets.submit_message(submit) == "accepted"
+            assert (await waiter).data == {"tip": 12}
+            unclaimed = WidgetMessage(widget_id, "share", {"tip": 12}, origin="app")
+            assert router.widgets.submit_message(unclaimed) == "accepted"
+            await router.widgets.drain()
+            assert router.widgets.submit_state(widget_id, {"tip": 15}) == "accepted"
+            await router.widgets.drain()
+            widget_turn = str(agent.controller.conversation.to_messages())
+            assert f'<widget_event widget="{widget_id}"' in widget_turn
+            assert 'name="share"' in widget_turn and 'trust="untrusted"' in widget_turn
+            frames = [web_frames.get_nowait() for _ in range(web_frames.qsize())]
+            web_types = [frame["type"] for frame in frames]
+            opens = [
+                f
+                for f in frames
+                if f["type"] == "widget" and not f.get("update_target")
+            ]
+            assert len(opens) == 1
+            waits = [
+                f["payload"]["awaiting"]
+                for f in frames
+                if f["type"] == "widget" and "awaiting" in f.get("payload", {})
+            ]
+            assert waits == [True, False], "the client sees the tool wait start and end"
+            assert "widget_state" in web_types
+
+            # Inline UI: a client moves the slider of the <ui> block in the
+            # first reply; the state is checked against the recorded reply,
+            # reaches the other client and is recorded.
+            first = next(
+                e
+                for e in store.get_events("scribe")
+                if e["type"] == "assistant_message"
+                and INLINE_BLOCK in str(e["message"].get("content"))
+            )
+            address = (first["turn_index"], first["branch_id"])
+            ((block, _),) = block_ids(INLINE_BLOCK)
+            other_frames = asyncio.Queue()
+            other = StreamOutput("scribe", other_frames, [], agent=agent)
+            router.add_secondary(other)
+            acks = []
+            frame = {
+                "ui_turn": address[0],
+                "ui_branch": address[1],
+                "block": block,
+                "state": {"tip": 18, "ghost": 1},
+            }
+            handle_widget_frame(
+                "inline_ui_state", frame, agent, web, "scribe", acks.append
+            )
+            handle_widget_frame(
+                "inline_ui_state",
+                {**frame, "ui_branch": address[1] + 1},
+                agent,
+                web,
+                "scribe",
+                acks.append,
+            )
+            await asyncio.sleep(0)
+            assert [a["status"] for a in acks] == ["unknown"]
+            forwarded = [other_frames.get_nowait() for _ in range(other_frames.qsize())]
+            assert [
+                f["state"] for f in forwarded if f["type"] == "inline_ui_state"
+            ] == [{"tip": 18}]
+            assert all(
+                f.get("type") != "inline_ui_state"
+                for f in [web_frames.get_nowait() for _ in range(web_frames.qsize())]
+            ), "the sending client gets no echo"
+            router.remove_secondary(other)
+            router.remove_secondary(web)
+            assert renderer_changes == [{"kt.ui": 1}, {}]
         finally:
             await agent.stop()
+
+        inline_rows = [
+            (e["ui_turn"], e["ui_branch"], e["block"], e["state"])
+            for e in store.get_events("scribe")
+            if e["type"] == "inline_ui_state"
+        ]
+        assert inline_rows == [(*address, block, {"tip": 18})]
+
+        widget_rows = [
+            (e["type"], e.get("name"), e.get("routed_to"))
+            for e in store.get_events("scribe")
+            if e["type"].startswith("widget")
+        ]
+        assert widget_rows == [
+            ("widget", None, None),
+            ("widget_message", "submit", "waiter"),
+            ("widget_message", "share", "agent"),
+            ("widget_state", None, None),
+        ]
 
         # The SessionOutput sink restored cumulative token totals from
         # state and accumulated the live token_usage call on top.
@@ -574,6 +719,13 @@ class TestSessionIntegration:
         source_mtime = session_path.stat().st_mtime_ns
         assert detect_format_version(session_path.as_uri()) == FORMAT_VERSION
         assert read_session_meta(session_path.as_uri())["agents"] == ["scribe"]
+        selected_meta = read_metadata_candidate(
+            session_path, eligible=True, keys=("agents", "format_version", "absent")
+        )
+        assert selected_meta.meta == {
+            "agents": ["scribe"],
+            "format_version": FORMAT_VERSION,
+        }
         with SessionReadView(session_path.as_uri()) as view:
             assert try_fast(session_path, eligible=True).reason == "legacy_enrolled"
             selected = view.items("events", prefix="scribe:e")
@@ -696,6 +848,12 @@ class TestSessionIntegration:
             )
             # Scratchpad restored exactly.
             assert resumed_agent.session.scratchpad.get("project") == "terrarium"
+            # Inline UI state came back from the recorded rows, and the
+            # resumed agent still accepts edits for the same block.
+            inline = resumed_agent.output_router.inline_ui
+            assert inline.get(*address, block) == {"tip": 18}
+            assert inline.submit(*address, block, {"tip": 21}) == "accepted"
+            assert inline.get(*address, block) == {"tip": 21}
             assert resumed_agent.compact_manager._compact_count == 3
             # The store was re-attached and marked running for continued
             # recording.
@@ -706,6 +864,29 @@ class TestSessionIntegration:
             # the surviving timer is staged, never the removed one.
             staged = getattr(resumed_agent, "_pending_resume_triggers", None)
             assert staged and staged[0]["trigger_id"] == t2_id
+            # The pin came back once, from session state, outside the history.
+            pins = resumed_agent.controller.pinned
+            assert [key for key, _ in pins.pinned()] == ["persona"]
+            assert pins.image_count() == 1
+            assert "PINNED-PERSONA" not in str(resumed_messages)
+            wire = pins.apply(resumed_messages)
+            assert wire[1]["content"][0]["text"] == "PINNED-PERSONA"
+            assert str(wire).count("PINNED-PERSONA") == 1
+            pin_message(resumed_agent, "persona", "user", "PINNED-PERSONA v2")
+            saved = resumed_store.state[pinned_state_key("scribe")]
+            assert [e["message"]["content"] for e in saved] == ["PINNED-PERSONA v2"]
+            assert unpin_message(resumed_agent, "persona") is True
+            assert resumed_store.state[pinned_state_key("scribe")] == []
+            assert len(pins) == 0
+            # A message to the widget from before the restart rebuilds the
+            # widget registry from the store and reaches the resumed agent.
+            widgets = resumed_agent.output_router.widgets
+            recalc = WidgetMessage(widget_id, "recalc", {"tip": 18})
+            assert widgets.submit_message(recalc) == "accepted"
+            await widgets.drain()
+            assert widgets.registry.get(widget_id).state == {"tip": 15}
+            resumed_turn = str(resumed_agent.controller.conversation.to_messages())
+            assert 'name="recalc"' in resumed_turn and '"tip": 18' in resumed_turn
         finally:
             await resumed_agent.stop()
             resumed_store.close()
@@ -780,8 +961,14 @@ class TestSessionIntegration:
         # Resume interrupted output through the async API, then stop with a
         # short tail that never reached the durable streaming checkpoint.
         interrupted = SessionStore(str(session_path))
+        interrupted_text = "interrupted async response" * 512
         try:
-            interrupted.state["scribe:open_text"] = "interrupted async response"
+            interrupted_output = SessionOutput("scribe", interrupted, None)
+            for offset in range(0, len(interrupted_text), 512):
+                await interrupted_output.write_stream(
+                    interrupted_text[offset : offset + 512]
+                )
+            await interrupted_output.drain()
         finally:
             interrupted.close(update_status=False)
         async_agent, async_store = await resume_agent_async(session_path)
@@ -799,10 +986,187 @@ class TestSessionIntegration:
                 for e in verified.get_events("scribe")
                 if e["type"] == "text_chunk"
             ]
-            assert chunks[-2:] == ["interrupted async response", "graceful tail"]
+            assert chunks[-2:] == [interrupted_text, "graceful tail"]
             assert not verified.state.get("scribe:open_text")
         finally:
             verified.close(update_status=False)
+
+        fallback = SessionStore(session_path)
+        canonical = {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "canonical resumed answer"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": (
+                            "data:image/png;base64,"
+                            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="
+                        )
+                    },
+                },
+            ],
+            "reasoning_content": "preserved reasoning",
+        }
+        try:
+            _, anchor = fallback.append_event(
+                "scribe",
+                "assistant_round_start",
+                {},
+                turn_index=3,
+                branch_id=1,
+                parent_branch_path=[(1, 1), (2, 1)],
+            )
+            fallback.append_event(
+                "scribe",
+                "assistant_message",
+                {"round_start_event_id": anchor, "message": canonical},
+                turn_index=3,
+                branch_id=1,
+                parent_branch_path=[(1, 1), (2, 1)],
+            )
+            snapshot = fallback.load_conversation("scribe")
+            fallback.save_conversation("scribe", snapshot)
+            fallback.save_branch_snapshot(
+                "scribe",
+                snapshot,
+                branch={
+                    "turn_index": 3,
+                    "branch_id": 2,
+                    "parent_branch_path": [(1, 1), (2, 1)],
+                },
+                watermark=fallback.max_event_id("scribe"),
+            )
+            expected_pending = fallback.get_resumable_events("scribe")
+        finally:
+            fallback.close(update_status=False)
+        replay_counts = []
+        replay_indexes = []
+        replaying = False
+        replay = _resume_branch_mod.replay_with_settled_tools
+
+        def observe_replay(events, **kwargs):
+            nonlocal replaying
+            replay_counts.append(len(events))
+            replaying = True
+            try:
+                return replay(events, **kwargs)
+            finally:
+                replaying = False
+
+        preparing = False
+        preparation_indexes = []
+        prepare = _resume_mod.prepare_saved_snapshot
+        index = _history_mod.index_parent_paths
+        compact_restore_reads = []
+        get_events = SessionStore.get_events
+
+        def observe_event_read(store, namespace, *args, **kwargs):
+            if namespace == "scribe":
+                compact_restore_reads.append(namespace)
+            return get_events(store, namespace, *args, **kwargs)
+
+        def observe_index(events):
+            if preparing:
+                preparation_indexes.append([event.get("event_id") for event in events])
+            if replaying:
+                replay_indexes.append(tuple(map(id, events)))
+            return index(events)
+
+        def observe_prepare(*args, **kwargs):
+            nonlocal preparing
+            preparing = True
+            try:
+                return prepare(*args, **kwargs)
+            finally:
+                preparing = False
+
+        with monkeypatch.context() as tracing:
+            tracing.setattr(
+                _resume_branch_mod, "replay_with_settled_tools", observe_replay
+            )
+            tracing.setattr(_resume_mod, "prepare_saved_snapshot", observe_prepare)
+            tracing.setattr(_resume_branch_mod, "index_parent_paths", observe_index)
+            tracing.setattr(_history_mod, "index_parent_paths", observe_index)
+            tracing.setattr(_message_history_mod, "index_parent_paths", observe_index)
+            tracing.setattr(SessionStore, "get_events", observe_event_read)
+            fallback_agent, fallback_store = await resume_agent_async(session_path)
+        try:
+            with monkeypatch.context() as tracing:
+                tracing.setattr(SessionStore, "get_events", observe_event_read)
+                fallback_agent.attach_session_store(None)
+                await fallback_agent.start()
+                assert fallback_agent.compact_manager._compact_count == 0
+                assert fallback_agent.compact_manager._last_compact_time == 0.0
+                fallback_agent.attach_session_store(fallback_store)
+                fallback_agent.attach_session_store(fallback_store)
+                assert compact_restore_reads == ["scribe"]
+            wire = fallback_agent.controller.conversation.to_messages()
+            assert [
+                m["content"]
+                for m in wire
+                if m.get("role") == "user" and m["content"] in recorded_user_turns
+            ] == recorded_user_turns
+            assert wire[-1]["content"] == canonical["content"]
+            assert wire[-1]["reasoning_content"] == canonical["reasoning_content"]
+            assert (fallback_agent._turn_index, fallback_agent._branch_id) == (3, 1)
+            assert fallback_agent._parent_branch_path == [(1, 1), (2, 1)]
+            assert fallback_agent._context_cutoff_event_id == 0
+            assert fallback_agent.session.scratchpad.get("project") == "terrarium"
+            assert [
+                t["trigger_id"] for t in fallback_agent._pending_resume_triggers
+            ] == [t2_id]
+            assert fallback_agent._pending_resume_events == expected_pending
+            raw = fallback_store.get_events("scribe")
+            assert replay_counts == [len(raw)]
+            assert len(replay_indexes) == 2
+            assert replay_indexes[0] != replay_indexes[1]
+            assert preparation_indexes == [[event["event_id"] for event in raw]]
+            continuation_llm = ScriptedLLM(["continued after recovery"])
+            fallback_agent.llm = fallback_agent.controller.llm = continuation_llm
+            result = await fallback_agent.run("continue recovered history")
+            assert result.text == "continued after recovery"
+            assert (fallback_agent._turn_index, fallback_agent._branch_id) == (4, 1)
+            assert fallback_agent._parent_branch_path == [(1, 1), (2, 1), (3, 1)]
+            continued_messages = [
+                dict(message.to_dict(), metadata=message.metadata)
+                for message in fallback_agent.controller.conversation.get_messages()
+            ]
+        finally:
+            await fallback_agent.stop()
+            await fallback_agent._session_output.drain()
+            await asyncio.to_thread(fallback_store.close, update_status=False)
+
+        continued_agent, continued_store = await resume_agent_async(session_path)
+        try:
+            assert [
+                dict(message.to_dict(), metadata=message.metadata)
+                for message in continued_agent.controller.conversation.get_messages()
+            ] == continued_messages
+            assert (continued_agent._turn_index, continued_agent._branch_id) == (4, 1)
+            assert continued_agent._parent_branch_path == [(1, 1), (2, 1), (3, 1)]
+            assert continued_agent._context_cutoff_event_id == 0
+            assert continued_agent.session.scratchpad.get("project") == "terrarium"
+            assert (
+                continued_agent._pending_resume_events
+                == continued_store.get_resumable_events("scribe")
+            )
+            assert [
+                t["trigger_id"] for t in continued_agent._pending_resume_triggers
+            ] == [t2_id]
+            persisted_users = [
+                event
+                for event in continued_store.get_events("scribe")
+                if event["type"] == "user_message"
+            ]
+            assert persisted_users[-1]["content"] == "continue recovered history"
+            assert (
+                persisted_users[-1]["turn_index"],
+                persisted_users[-1]["branch_id"],
+            ) == (4, 1)
+        finally:
+            await continued_agent._session_output.drain()
+            await asyncio.to_thread(continued_store.close, update_status=False)
 
         # An unknown io_mode is rejected loudly before any agent is built.
         with pytest.raises(ValueError, match="Unknown IO mode"):
@@ -909,7 +1273,7 @@ class TestSessionIntegration:
     ):
         """Run an agent, then index + search its session memory.
 
-        Mirrors ``studio/sessions/memory_search.py``: open the store,
+        Mirrors ``studio/sessions/memory/search.py``: open the store,
         build a ``SessionMemory`` over an embedder, ``index_events`` per
         agent, then ``search``. Asserts the EXACT recorded user turn is
         the top hit for both FTS and semantic modes.
@@ -1387,6 +1751,7 @@ class TestSessionIntegration:
         agent.attach_session_store(store)
         await agent.start()
         try:
+            pin_message(agent, "persona", "user", "PINNED-PERSONA")
             await agent._process_event(create_user_input_event("turn one"))
             await agent._process_event(create_user_input_event("turn two"))
             await agent._process_event(create_user_input_event("turn three"))
@@ -1463,6 +1828,51 @@ class TestSessionIntegration:
         child.close()
         store.close()
 
+        patched_llm["script"] = ["Continued on the regenerated lineage."]
+        resumed, resumed_store = resume_agent(session_path)
+        try:
+            resumed_messages = resumed.controller.conversation.to_messages()
+            assert [m["content"] for m in resumed_messages if m["role"] == "user"] == (
+                default_users
+            )
+            assert resumed._turn_index == 3
+            assert resumed._branch_id == 2
+            prefix = copy.deepcopy(resumed_messages)
+            await resumed.start()
+            try:
+                await resumed._process_event(
+                    create_user_input_event("continue selected lineage")
+                )
+                continued = resumed.controller.conversation.to_messages()
+                assert continued[: len(prefix)] == prefix
+                assert continued[-2:] == [
+                    {"role": "user", "content": "continue selected lineage"},
+                    {
+                        "role": "assistant",
+                        "content": "Continued on the regenerated lineage.",
+                    },
+                ]
+                continuation = next(
+                    event
+                    for event in resumed_store.get_events("brancher")
+                    if event.get("type") == "user_input"
+                    and event.get("content") == "continue selected lineage"
+                )
+                assert continuation["turn_index"] == 4
+                assert dict(continuation["parent_branch_path"])[2] == 2
+                assert dict(continuation["parent_branch_path"])[3] == 2
+            finally:
+                await resumed.stop()
+        finally:
+            resumed_store.close()
+
+        cold_again, cold_store = resume_agent(session_path)
+        try:
+            assert cold_again.controller.conversation.to_messages() == continued
+            assert cold_again._turn_index == 4
+        finally:
+            cold_store.close()
+
         forked_agent, forked_store = resume_agent(fork_path)
         try:
             forked_users = [
@@ -1476,6 +1886,13 @@ class TestSessionIntegration:
             # truncated event log — the leaf is turn 2, branch 1.
             assert forked_agent._turn_index == 2
             assert forked_agent._branch_id == 1
+            # The fork carries the pin once, outside its replayed history.
+            assert [k for k, _ in forked_agent.controller.pinned.pinned()] == [
+                "persona"
+            ]
+            assert "PINNED-PERSONA" not in str(
+                forked_agent.controller.conversation.to_messages()
+            )
         finally:
             forked_store.close()
 

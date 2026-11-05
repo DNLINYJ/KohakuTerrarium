@@ -35,29 +35,50 @@ vi.mock("@/utils/i18n", () => ({
 }))
 
 import SettingsPage from "./SettingsPage.vue"
+import SettingsTab from "@/components/shell/tabs/SettingsTab.vue"
+import { useTabsStore } from "@/stores/tabs"
+import { useDensity } from "@/composables/useDensity"
+import {
+  registerSettingsSection,
+  unregisterSettingsSection,
+} from "@/stores/settingsSectionRegistry"
+import { selectSection } from "@/stores/settingsNav"
 import { configAPI, settingsAPI } from "@/utils/api"
 
-function mountSettingsPage() {
+function mountSettingsPage(section = "", compact = false) {
+  if (section) selectSection(section)
   return shallowMount(SettingsPage, {
+    props: compact ? { section, sectionRequest: 1 } : {},
     global: {
       plugins: [ElementPlus],
       stubs: {
         OAuthProviderRow: false,
+        PackageProviderRow: false,
         ProviderKeyRow: false,
         ProviderRow: false,
         ElButton: false,
         ElInput: false,
         ElTag: false,
-        ElTabs: { template: "<div><slot /></div>" },
-        ElTabPane: { template: "<section><slot /></section>" },
+        SettingsLayout: compact ? false : { template: "<div><slot /></div>" },
+        PhonePage: false,
+        SectionShell: { template: "<section><slot name='aside' /><slot /></section>" },
       },
     },
   })
 }
 
+it("opens Tools & Plugins defaults from global settings", async () => {
+  setActivePinia(createPinia())
+  const wrapper = mountSettingsPage("modules")
+  await flushPromises()
+  expect(wrapper.findComponent({ name: "ModuleSettings" }).exists()).toBe(true)
+  wrapper.unmount()
+})
+
 describe("SettingsPage model presets", () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    selectSection("providers")
     vi.stubGlobal("localStorage", {
       getItem: vi.fn(() => null),
       setItem: vi.fn(),
@@ -117,6 +138,48 @@ describe("SettingsPage model presets", () => {
     expect(wrapper.vm.codexModalOpen).toBe(true)
   })
 
+  it("lists package-provided backends in their own section, not as editable custom providers", async () => {
+    configAPI.getModels.mockResolvedValue([])
+    settingsAPI.getBackends.mockResolvedValue({
+      backends: [
+        { name: "openai", backend_type: "openai", built_in: true, source: "builtin" },
+        {
+          name: "echo",
+          backend_type: "echo",
+          built_in: false,
+          source: "package",
+          package: "pkg-x",
+          credentials: "external",
+          available: true,
+        },
+        {
+          name: "echo-2",
+          backend_type: "echo",
+          built_in: false,
+          source: "user",
+          package: "pkg-x",
+          credentials: "external",
+        },
+      ],
+    })
+    const wrapper = mountSettingsPage()
+    await flushPromises()
+    const pkg = wrapper.get('[data-provider-section="package"]')
+    expect(pkg.findAll(".provider-row")).toHaveLength(1)
+    expect(pkg.text()).toContain("settings.providers.fromPackage:pkg-x")
+    expect(pkg.findAll("button")).toHaveLength(0)
+    const custom = wrapper.get('[data-provider-section="custom"]')
+    expect(custom.text()).toContain("echo-2")
+    expect(custom.text()).not.toContain("pkg-x")
+  })
+
+  it("hides the package section when no package provides a backend", async () => {
+    configAPI.getModels.mockResolvedValue([])
+    const wrapper = mountSettingsPage()
+    await flushPromises()
+    expect(wrapper.find('[data-provider-section="package"]').exists()).toBe(false)
+  })
+
   it("saves the key for the selected provider and updates its configured state", async () => {
     configAPI.getModels.mockResolvedValue([])
     settingsAPI.getBackends.mockResolvedValue({
@@ -140,140 +203,67 @@ describe("SettingsPage model presets", () => {
     expect(keys.find("input").exists()).toBe(false)
   })
 
-  it("groups attention preferences by channel instead of rendering one flat list", async () => {
-    configAPI.getModels.mockResolvedValue([])
-    const wrapper = mountSettingsPage()
-    await flushPromises()
-
-    expect(wrapper.find('[data-attention-group="in-app"]').exists()).toBe(true)
-    expect(wrapper.find('[data-attention-group="notifications"]').exists()).toBe(true)
-    expect(wrapper.find('[data-attention-group="sound"]').exists()).toBe(true)
-    expect(wrapper.find('[data-attention-group="desktop"]').exists()).toBe(true)
-    expect(wrapper.findAll("[data-attention-setting]")).toHaveLength(11)
-    expect(wrapper.find("[data-in-app-toggle]").exists()).toBe(true)
-  })
-
-  it("uses a permission action instead of the system-notification preference switch", async () => {
-    configAPI.getModels.mockResolvedValue([])
-    const wrapper = mountSettingsPage()
-    await flushPromises()
-
-    const permissionButton = wrapper.find("[data-notification-permission-action]")
-    expect(permissionButton.exists()).toBe(true)
-    expect(wrapper.find('[data-attention-setting="systemNotifications"]').exists()).toBe(false)
-    expect(
-      wrapper.find('[data-attention-setting="notifyWaiting"]').attributes("disabled"),
-    ).toBeDefined()
-
-    await permissionButton.trigger("click")
-    await flushPromises()
-
-    expect(requestNotificationPermission).toHaveBeenCalledOnce()
-    expect(wrapper.vm.attentionPrefs.state.systemNotifications).toBe(true)
-    expect(wrapper.vm.notificationPermission).toBe("granted")
-  })
-
-  it("unlocks audio immediately when attention sound is enabled", async () => {
-    configAPI.getModels.mockResolvedValue([])
-    const wrapper = mountSettingsPage()
-    await flushPromises()
-
-    wrapper.vm.setAttentionPreference("attentionSound", true)
-
-    expect(wrapper.vm.attentionPrefs.state.attentionSound).toBe(true)
-    expect(requestAttentionAudioUnlock).toHaveBeenCalledOnce()
-  })
-
-  it("does not offer browser notification authorization inside the desktop shell", async () => {
-    window.pywebview = { api: {} }
-    vi.stubGlobal("Notification", { permission: "denied" })
-    configAPI.getModels.mockResolvedValue([])
-
-    const wrapper = mountSettingsPage()
-    await flushPromises()
-
-    expect(wrapper.vm.desktopSurface).toBe(true)
-    expect(wrapper.vm.notificationPermission).toBe("desktop")
-    expect(wrapper.find("[data-notification-permission-action]").exists()).toBe(false)
-    expect(
-      wrapper.find('[data-attention-group="notifications"]').attributes("data-desktop-surface"),
-    ).toBe("true")
-  })
-
-  it("updates notification capability when pywebview is injected after mount", async () => {
-    configAPI.getModels.mockResolvedValue([])
-    const wrapper = mountSettingsPage()
-    await flushPromises()
-    expect(wrapper.vm.notificationPermission).toBe("default")
-
-    window.pywebview = { api: {} }
-    window.dispatchEvent(new Event("pywebviewready"))
-    await nextTick()
-
-    expect(wrapper.vm.desktopSurface).toBe(true)
-    expect(wrapper.vm.notificationPermission).toBe("desktop")
-    expect(wrapper.find("[data-notification-permission-action]").exists()).toBe(false)
-  })
-
-  it("keeps the desktop attention card content left aligned", async () => {
-    configAPI.getModels.mockResolvedValue([])
-    const wrapper = mountSettingsPage()
-    await flushPromises()
-
-    const desktop = wrapper.find('[data-attention-group="desktop"]')
-    expect(desktop.classes()).toContain("attention-group")
-    expect(desktop.classes()).not.toContain("attention-setting-row")
-    expect(desktop.find(".attention-setting-row").exists()).toBe(true)
-  })
-
-  it("refreshes the selected preset without reporting a successful default change as failed", async () => {
-    const preset = { name: "fast", provider: "openai", source: "user", is_default: false }
-    const refreshed = { ...preset, is_default: true }
-    configAPI.getModels.mockResolvedValueOnce([preset]).mockResolvedValueOnce([refreshed])
-    settingsAPI.setDefaultModel.mockResolvedValue({ status: "set", default_model: "openai/fast" })
-    const success = vi.spyOn(ElMessage, "success").mockImplementation(() => {})
-    const error = vi.spyOn(ElMessage, "error").mockImplementation(() => {})
-
-    const wrapper = mountSettingsPage()
-    await flushPromises()
-    wrapper.vm.selectPreset(preset)
-
-    await wrapper.vm.handleSetDefault(preset)
-
-    // A bare name would resolve to whichever provider ships it first.
-    expect(settingsAPI.setDefaultModel).toHaveBeenCalledWith("openai/fast")
-    expect(success).toHaveBeenCalledWith("settings.models.defaultSet:openai/fast")
-    expect(error).not.toHaveBeenCalled()
-    expect(wrapper.vm.editorPreset).toEqual(refreshed)
-  })
-
-  it("sets a built-in preset as default with its provider-qualified identifier", async () => {
-    const preset = {
-      name: "claude-opus-4.8",
-      provider: "anthropic",
-      source: "preset",
-      is_default: false,
+  it("lists registered sections last, in the Extensions group, and renders the open one", async () => {
+    const DemoSection = { name: "DemoSection", template: "<p>demo body</p>" }
+    registerSettingsSection({ id: "ext:demo/s", label: "Demo", order: 15, component: DemoSection })
+    try {
+      const wrapper = mountSettingsPage("ext:demo/s")
+      await flushPromises()
+      const ids = wrapper.vm.sections.map((s) => s.id)
+      expect(ids.at(-1)).toBe("ext:demo/s")
+      expect(wrapper.vm.groups.at(-1).id).toBe("extensions")
+      expect(ids).not.toContain("sites")
+      expect(wrapper.findComponent(DemoSection).exists()).toBe(true)
+      await wrapper.setProps({ section: "ext:demo/s", sectionRequest: 1 })
+      expect(wrapper.vm.activeTab).toBe("ext:demo/s")
+      selectSection("models")
+      registerSettingsSection({ id: "ext:other/s", label: "Other", component: DemoSection })
+      await flushPromises()
+      expect(wrapper.vm.activeTab).toBe("models")
+      unregisterSettingsSection("ext:other/s")
+      await wrapper.setProps({ sectionRequest: 2 })
+      expect(wrapper.vm.activeTab).toBe("ext:demo/s")
+      unregisterSettingsSection("ext:demo/s")
+      await flushPromises()
+      expect(wrapper.findComponent(DemoSection).exists()).toBe(false)
+      expect(wrapper.vm.activeTab).toBe(wrapper.vm.sections[0].id)
+      wrapper.unmount()
+      useDensity().setOverride("compact")
+      registerSettingsSection({ id: "ext:demo/s", label: "Demo", component: DemoSection })
+      const phone = mountSettingsPage("ext:demo/s", true)
+      await flushPromises()
+      expect(phone.find("[data-test='settings-page']").exists()).toBe(true)
+      await phone.find("[data-test='phone-page-back']").trigger("click")
+      expect(phone.find("[data-settings-nav]").exists()).toBe(true)
+      await phone.setProps({ sectionRequest: 2 })
+      expect(phone.find("[data-test='settings-page']").exists()).toBe(true)
+      phone.unmount()
+      const tabs = useTabsStore()
+      tabs.openTab({ kind: "settings", id: "settings", section: "ext:demo/s" })
+      const mountTab = () =>
+        shallowMount(SettingsTab, {
+          props: { tab: tabs.byId.settings },
+          global: { stubs: { SettingsPage: false, SettingsLayout: true } },
+        })
+      const tab = mountTab()
+      await flushPromises()
+      expect(tab.findComponent(SettingsPage).vm.activeTab).toBe("ext:demo/s")
+      expect(tabs.byId.settings.section).toBe("")
+      selectSection("models")
+      await flushPromises()
+      tab.unmount()
+      const remounted = mountTab()
+      await flushPromises()
+      expect(remounted.findComponent(SettingsPage).vm.activeTab).toBe("models")
+      tabs.openTab({ kind: "settings", id: "settings", section: "ext:demo/s" })
+      await flushPromises()
+      expect(remounted.findComponent(SettingsPage).vm.activeTab).toBe("ext:demo/s")
+      expect(tabs.byId.settings.section).toBe("")
+      remounted.unmount()
+    } finally {
+      useDensity().setOverride("auto")
+      unregisterSettingsSection("ext:demo/s")
+      unregisterSettingsSection("ext:other/s")
     }
-    const refreshed = { ...preset, is_default: true }
-    configAPI.getModels.mockResolvedValueOnce([preset]).mockResolvedValueOnce([refreshed])
-    settingsAPI.setDefaultModel.mockResolvedValue({
-      status: "set",
-      default_model: "anthropic/claude-opus-4.8",
-    })
-    const success = vi.spyOn(ElMessage, "success").mockImplementation(() => {})
-    const error = vi.spyOn(ElMessage, "error").mockImplementation(() => {})
-
-    const wrapper = mountSettingsPage()
-    await flushPromises()
-    wrapper.vm.selectPreset(preset)
-    // Built-in presets open read-only, which used to hide the button.
-    expect(wrapper.vm.editorMode).toBe("view")
-
-    await wrapper.vm.handleSetDefault(preset)
-
-    expect(settingsAPI.setDefaultModel).toHaveBeenCalledWith("anthropic/claude-opus-4.8")
-    expect(success).toHaveBeenCalledWith("settings.models.defaultSet:anthropic/claude-opus-4.8")
-    expect(error).not.toHaveBeenCalled()
-    expect(wrapper.vm.editorPreset).toEqual(refreshed)
   })
 })

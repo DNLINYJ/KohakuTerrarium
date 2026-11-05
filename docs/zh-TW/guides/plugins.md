@@ -1,6 +1,6 @@
 ---
 title: 外掛
-summary: Prompt 外掛與 lifecycle 外掛：各自掛在哪裡、怎麼組合，以及什麼時候該用。
+summary: 外掛既掛在執行期事件上，也能貢獻 prompt 文字：各自掛在哪裡、怎麼組合，以及什麼時候該用。
 tags:
   - guides
   - plugin
@@ -11,7 +11,7 @@ tags:
 
 給想在模組之間的*接縫*加上行為、又不想 fork 任何模組的讀者。
 
-外掛修改的是 controller、工具、子代理與 LLM 之間的連接方式，而不是模組本身。分成兩類：**prompt 外掛** 會往 system prompt 塞內容，**lifecycle 外掛** 則掛在執行時事件上（pre/post LLM、pre/post tool 等）。
+外掛修改的是 controller、工具、子代理與 LLM 之間的連接方式，而不是模組本身。外掛是一個類別 `BasePlugin`：它掛在執行時事件上（pre/post LLM、pre/post tool 等），也可以往 system prompt 貢獻內容。
 
 概念先讀：[plugin](../concepts/modules/plugin.md)、[patterns](../concepts/patterns.md)。
 
@@ -23,13 +23,13 @@ tags:
 
 如果你的需求是「每次在 X 前後，都做 Y」，答案幾乎總是 plugin。
 
-## Prompt 外掛
+## Prompt 貢獻
 
 契約：
 
 - 繼承 `BasePlugin`。
-- 設定 `name`、`priority`（數字越小，越早出現在最終 prompt）。
-- 實作 `get_content(context) -> str | None`。
+- 設定 `name`、`priority`（數字越小，在外掛貢獻中越靠前）。
+- 實作 `get_prompt_content(context) -> str | None`。
 
 ```python
 # plugins/project_header.py
@@ -38,36 +38,27 @@ from kohakuterrarium.modules.plugin.base import BasePlugin
 
 class ProjectHeaderPlugin(BasePlugin):
     name = "project_header"
-    priority = 35          # 在 ProjectInstructionsPlugin (30) 之前
+    priority = 35
 
     def __init__(self, text: str = ""):
         super().__init__()
         self.text = text
 
-    def get_content(self, context) -> str | None:
+    def get_prompt_content(self, context) -> str | None:
         if not self.text:
             return None
         return f"## Project Header\n\n{self.text}"
 ```
 
-內建 prompt 外掛（永遠存在）：
-
-| Plugin | Priority | 用途 |
-|---|---|---|
-| `ProjectInstructionsPlugin` | 30 | 載入 `CLAUDE.md` / `.claude/rules.md` |
-| `EnvInfoPlugin` | 40 | 工作目錄、平台、日期 |
-| `FrameworkHintsPlugin` | 45 | 工具呼叫語法 + 框架命令範例（`info`、`jobs`、`wait`） |
-| `ToolListPlugin` | 50 | 每個工具的一行描述 |
-
-執行期外掛也可以實作 `get_prompt_content(context) -> str | None` 來貢獻 prompt 文字。這些內容會被聚合到框架提示之前，並同時適用於父代理與子代理。
+prompt 聚合器會依 priority 收集這些貢獻，放進 system prompt 的「外掛貢獻」位置，同時適用於父代理與子代理。框架自己的區段（工具清單、工具指引、skills、group 區塊、執行模型）是框架區塊而不是外掛，請見 [prompt 聚合](../concepts/impl-notes/prompt-aggregation.md)。
 
 執行期外掛也可以實作 `get_tool_visibility(context) -> ToolVisibility | None`，按請求裁切暴露給模型的原生工具目錄（`allowed_tools` / `allowed_subagents`，`None` 表示不限制）。
 
-除了 prompt 外掛以外，工具本身也可以透過 `prompt_contribution()` 貢獻短的 prompt 指引；位置同樣在框架提示之前。
+除了外掛以外，工具本身也可以透過 `prompt_contribution()` 貢獻短的 prompt 指引，彙整進 `## Tool guidance` 區段。
 
 Priority 越低越早執行。你可以藉此把外掛插到正確位置。
 
-## Lifecycle 外掛
+## Lifecycle hook
 
 繼承 `BasePlugin`，並實作以下任意 hook。全部都是 async。
 
@@ -91,6 +82,12 @@ Fire-and-forget 回呼（沒有回傳值、也無法修改內容）：
 - `on_compact_start`, `on_compact_complete`
 - `on_event`
 
+### 固定上下文（pinned context）
+
+`context.pin_message(key, role, content)` 會把一則訊息放在每次請求的 system prompt 之後；`role` 為 `"user"` 或 `"system"`，`content` 可以是字串或內容片段清單（可含圖片）。同一個 key 再次 pin 會原地取代，`context.unpin_message(key)` 移除它。
+
+固定訊息不在對話歷史裡：壓縮（compaction）不會摘要或丟棄它們，壓縮後的順序是 system prompt、固定訊息、摘要、近期回合；edit、regenerate、rewind、切換分支與 `/clear` 都會保留它們，這些操作使用的訊息索引也不計入它們；它們存在 session state 中，resume 與 fork 後各恢復一次；fork 出來的子代理與旁支對話會繼承它們。詳見英文文件 [plugins.md](../../en/guides/plugins.md#pinned-context)。
+
 ## 範例：tool guard
 
 阻擋危險的 shell 命令。
@@ -107,8 +104,8 @@ class ToolGuard(BasePlugin):
         super().__init__()
         self.deny_patterns = deny_patterns
 
-    async def pre_tool_execute(self, name: str, args: dict) -> dict | None:
-        if name != "bash":
+    async def pre_tool_execute(self, args: dict, **kwargs) -> dict | None:
+        if kwargs.get("tool_name") != "bash":
             return None
         command = args.get("command", "")
         for pat in self.deny_patterns:

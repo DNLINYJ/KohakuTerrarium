@@ -4,7 +4,7 @@ This module owns the ``@`` *path-reference* grammar
 (``@<package>[/sub/path]`` → filesystem path; the empty package name is
 the local project, so ``@/sub/path``).  The marketplace
 *install-spec* grammar (``@name`` / ``@name@version`` / ``@source/name``)
-lives in :mod:`kohakuterrarium.packages.marketplace` — the two look alike
+lives in :mod:`kohakuterrarium.packages.marketplace.marketplace` — the two look alike
 but are routed by context: config loaders call :func:`resolve_any_path`,
 installers call ``install_package_spec``.
 """
@@ -26,6 +26,35 @@ from kohakuterrarium.packages.walk import list_packages
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def package_root_map() -> dict[str, str]:
+    """Map each resolved package root to its package name."""
+    mapping: dict[str, str] = {}
+    for pkg in list_packages():
+        root = get_package_root(pkg["name"])
+        if root is not None:
+            mapping[str(root.resolve())] = pkg["name"]
+    return mapping
+
+
+def package_ref(path: Path, roots: dict[str, str] | None = None) -> str | None:
+    """Return the ``@pkg/...`` reference of ``path``, or None outside packages.
+
+    The longest matching root wins, so a nested package does not inherit its
+    parent's reference. The local project uses an empty package name.
+    """
+    resolved = path.resolve()
+    mapping = package_root_map() if roots is None else roots
+    best: str | None = None
+    for root in mapping:
+        if resolved.is_relative_to(root) and (best is None or len(root) > len(best)):
+            best = root
+    if best is None:
+        return None
+    relative = resolved.relative_to(best).as_posix()
+    name = mapping[best]
+    return f"@{name}/{relative}" if relative != "." else f"@{name}"
 
 
 def resolve_package_path(ref: str) -> Path:
@@ -117,6 +146,25 @@ def ensure_package_importable(package_name: str) -> bool:
         sys.path.insert(0, root_str)
         logger.debug("Added package to sys.path", package=package_name, path=root_str)
     return True
+
+
+def ensure_module_importable(module_path: str) -> bool:
+    """Put the root of the installed package that ships ``module_path`` on sys.path.
+
+    Matches the top-level name against a ``<name>/`` folder or ``<name>.py``
+    file in each installed package root. Returns True when a root was found.
+    """
+    top = module_path.split(".", 1)[0]
+    if not top:
+        return False
+    for pkg in list_packages():
+        name = pkg.get("name", "")
+        root = get_package_root(name) if name else None
+        if root is None:
+            continue
+        if (root / top).is_dir() or (root / f"{top}.py").is_file():
+            return ensure_package_importable(name)
+    return False
 
 
 def resolve_package_tool(tool_name: str) -> tuple[str, str] | None:

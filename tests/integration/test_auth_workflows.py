@@ -24,13 +24,17 @@ Workflow exercised in one function:
     12. Second user registers via invitation token.
     13. Each user's engine pool slot is distinct.
     14. Logout drops the session; subsequent /me → 401.
+    15. Two signed-in users each subscribe to package:virtual-pet and
+        only receive their own library pushes.
 
 This is one regression-protection workflow against the four-layer
 composition; unit tier covers each cell independently.
 """
 
 import asyncio
+import base64
 import time
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -44,8 +48,16 @@ from kohakuterrarium.api.auth.db import (
 )
 from kohakuterrarium.api.auth.users import create_user
 from kohakuterrarium.api.deps import set_service
-from kohakuterrarium.terrarium.creature_host import Creature
+from kohakuterrarium.packages import locations as _pkg_locations
+from kohakuterrarium.studio.catalog.packages import scan as _packages_scan
+from kohakuterrarium.studio.catalog.packages.packages import (
+    install_package_op,
+    uninstall_package_op,
+)
+from kohakuterrarium.terrarium.creature.host import Creature
 from kohakuterrarium.testing.terrarium import _FakeAgent
+
+from tests.helpers.pet_archive import pet_archive
 
 _TEST_ROUNDS = 4
 
@@ -84,7 +96,9 @@ class TestAuthIntegration:
     """One fat workflow.  No per-step assertions duplicated as
     separate test methods — that's the unit tier's job."""
 
-    def test_full_lifecycle_register_login_mutate_rotate_logout(self, app):
+    def test_full_lifecycle_register_login_mutate_rotate_logout(
+        self, app, tmp_path, monkeypatch
+    ):
         host_bearer = {"Authorization": "Bearer HOST-TOKEN"}
         wrong_bearer = {"Authorization": "Bearer NOT-THE-RIGHT-ONE"}
 
@@ -109,13 +123,13 @@ class TestAuthIntegration:
             r = client.get("/api/auth/me", headers=host_bearer)
             assert r.status_code == 401
             # Distinguishable from L2 by the X-Auth-Required header.
-            assert r.headers.get("X-Auth-Required", "").lower() in ("user", "")
+            assert r.headers["X-Auth-Required"] == "user"
 
             # ── 5. Admin seeded directly via DB (registration is
             #     invite_only — no self-register without a token; the
             #     operator's CLI path is ``kt admin users add``) ─────
             with connection() as conn:
-                create_user(
+                operator = create_user(
                     conn,
                     "operator",
                     "ops-pw",
@@ -131,11 +145,16 @@ class TestAuthIntegration:
             )
             assert r.status_code == 200, r.text
             assert "kt_session" in client.cookies
+            operator_cookie = client.cookies["kt_session"]
 
             # ── 7. Authenticated /me works ───────────────────────────
             r = client.get("/api/auth/me", headers=host_bearer)
             assert r.status_code == 200
             assert r.json()["username"] == "operator"
+
+            # ── 7b. The admin's engine may use host-wide resources ───
+            client.get("/api/nodes", headers=host_bearer)
+            assert app.state.engine_pool.peek(operator.id).host_resources is True
 
             # ── 8. Config-mutation without admin token → L3 rejects ──
             # ``/api/settings/keys`` is one of the L3-gated routes
@@ -216,6 +235,112 @@ class TestAuthIntegration:
 
             live = set(app.state.engine_pool.live_user_ids())
             assert None not in live
+
+            # ── 13b. A non-admin user's engine gets no host resources ─
+            alice_id = r.json()["id"]
+            client2.get("/api/nodes", headers=new_bearer)
+            assert app.state.engine_pool.peek(alice_id).host_resources is False
+
+            # ── 15. Two libraries, one package, no foreign push ─────
+            # The operator cookie was saved before the first client
+            # closed; this client stays open so both sockets are live.
+            monkeypatch.setattr(_pkg_locations, "PACKAGES_DIR", tmp_path / "pkgs")
+            _packages_scan.invalidate_scan_caches()
+            pet_source = Path(__file__).parents[2] / "examples/packages/virtual_pet"
+            ref = {"owner": "package:virtual-pet"}
+            ws_headers = {
+                "sec-websocket-protocol": f"kt-token.{new_token}",
+                "Cookie": f"kt_session={operator_cookie}",
+            }
+
+            def archive(name):
+                return base64.b64encode(
+                    pet_archive(metadata={"displayName": name})
+                ).decode()
+
+            def owner_call(action, args, headers=None):
+                return client2.post(
+                    "/api/extensions/owner/call",
+                    json={**ref, "action": action, "args": args},
+                    headers=new_bearer if headers is None else headers,
+                )
+
+            operator_headers = {
+                **new_bearer,
+                "Cookie": f"kt_session={operator_cookie}",
+            }
+            installed = None
+            try:
+                installed = install_package_op(
+                    str(pet_source), editable=True, deps="never"
+                )
+                enabled = client2.put(
+                    "/api/extensions/ui/virtual-pet",
+                    json={"enabled": True},
+                    headers={**operator_headers, "X-Admin-Token": "ADMIN-TOKEN"},
+                )
+                assert enabled.status_code == 200, enabled.text
+                with client2.websocket_connect(
+                    "/ws/extensions/owner", headers=ws_headers
+                ) as operator_ws:
+                    operator_ws.send_json({"op": "subscribe", "id": "pets", **ref})
+                    assert operator_ws.receive_json()["type"] == "subscribed"
+                    with client2.websocket_connect(
+                        "/ws/extensions/owner",
+                        subprotocols=[f"kt-token.{new_token}"],
+                    ) as alice_ws:
+                        alice_ws.send_json({"op": "subscribe", "id": "pets", **ref})
+                        assert alice_ws.receive_json()["type"] == "subscribed"
+                        imported = owner_call(
+                            "import",
+                            {"archive": archive("Operator")},
+                            operator_headers,
+                        )
+                        assert imported.status_code == 200, imported.text
+                        key_a = imported.json()["result"]["selected"]
+                        pushed = operator_ws.receive_json()["data"]
+                        assert pushed["selected"] == key_a
+                        assert [pet["key"] for pet in pushed["pets"]] == [key_a]
+                        alice_state = client2.post(
+                            "/api/extensions/owner/state",
+                            json=ref,
+                            headers=new_bearer,
+                        )
+                        assert alice_state.json()["state"]["pets"] == []
+                        for action in ("select", "remove"):
+                            denied = owner_call(action, {"key": key_a})
+                            assert denied.status_code == 400
+                            assert denied.json()["detail"]["error"] == "bad_request"
+                        imported_b = owner_call("import", {"archive": archive("Alice")})
+                        assert imported_b.status_code == 200, imported_b.text
+                        key_b = imported_b.json()["result"]["selected"]
+                        assert key_b != key_a
+                        alice_push = alice_ws.receive_json()["data"]
+                        assert alice_push["selected"] == key_b
+                        assert [pet["key"] for pet in alice_push["pets"]] == [key_b]
+                        removed = owner_call("remove", {"key": key_a}, operator_headers)
+                        assert removed.status_code == 200
+                        assert operator_ws.receive_json()["data"]["pets"] == []
+                        removed_b = owner_call("remove", {"key": key_b})
+                        assert removed_b.status_code == 200
+                        assert alice_ws.receive_json()["data"]["pets"] == []
+                client2.post("/api/auth/logout", headers=new_bearer)
+                relogin = client2.post(
+                    "/api/auth/login",
+                    json={"username": "alice", "password": "x"},
+                    headers=new_bearer,
+                )
+                assert relogin.status_code == 200, relogin.text
+                reloaded = client2.post(
+                    "/api/extensions/owner/state", json=ref, headers=new_bearer
+                )
+                assert reloaded.status_code == 200
+                assert reloaded.json()["state"]["pets"] == []
+                assert reloaded.json()["state"]["selected"] is None
+            finally:
+                if installed:
+                    uninstall_package_op(installed)
+                _packages_scan.invalidate_scan_caches()
 
             # ── 14. Logout drops the session ─────────────────────────
             client2.post("/api/auth/logout", headers=new_bearer)

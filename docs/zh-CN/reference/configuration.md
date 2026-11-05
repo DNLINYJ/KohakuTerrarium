@@ -24,7 +24,7 @@ Config 中引用其他文件或套件的字段时，解析顺序如下：
 
 ## Creature配置 (`config.yaml`)
 
-由 `kohakuterrarium.core.config.load_agent_config` 加载。文件查找顺序：`config.yaml` → `config.yml` → `config.json` → `config.toml`。
+由 `kohakuterrarium.core.config.load.load_agent_config` 加载。文件查找顺序：`config.yaml` → `config.yml` → `config.json` → `config.toml`。
 
 ### 顶层字段
 
@@ -81,7 +81,7 @@ Config 中引用其他文件或套件的字段时，解析顺序如下：
 | `extra_body` | dict | `{}` | 与解析后 preset 的 `extra_body` 做深度合并 (preset 里可能已带有 variation patch)。 |
 | `tool_doc_mode`、`include_tools_in_prompt`、`include_hints_in_prompt`、`max_messages`、`ephemeral`、`tool_format` | | | 对映顶层同名字段。 |
 
-每回合解析顺序 (见 `llm/profiles.py:resolve_controller_llm`)：
+每回合解析顺序 (见 `llm/profiles/resolve.py:resolve_controller_llm`)：
 
 1. CLI 旗标 `--llm` 优先于 YAML 的 `controller.llm`。
 2. 否则使用 `controller.llm` (preset 名称 + 可选的 `@group=option` 选择器)。
@@ -507,7 +507,7 @@ Root（面向用户的特权节点）：
 - 规范路径：`config_dir() / "drive-settings.yaml"`，通常是
   `~/.kohakuterrarium/drive-settings.yaml`（尊重 `KT_CONFIG_DIR`）。它
   **不是** launcher 的 `app-settings.json`。
-- 由 `kohakuterrarium.studio.identity.drive_settings` 加载 / 校验。
+- 由 `kohakuterrarium.studio.identity.drive_settings.settings` 加载 / 校验。
 - 只存可序列化的选择和选项——绝不存活的 Python 对象，也绝不存 Drive
   记录（那些活在 Drive 仓库 / session sidecar 里）。
 - **缺失** 的文件解析为运行时 **禁用** 的默认。**格式错误** 的文件抛一个
@@ -625,6 +625,12 @@ subagent_models:
   explore: openrouter/mimo-v2.5-pro
   worker: codex/gpt-5.5
 
+# 可选：group_add_node 与 group_spawn_child 的子 creature 默认模型。
+# 键是规范化后的 @pkg/...；default 是全局 child 默认。
+child_models:
+  default: openrouter/mimo-v2.5-pro
+  "@kt-biome/creatures/swe": codex/gpt-5.5
+
 backends:
   <provider-name>:
     backend_type: openai | anthropic | codex  # transport 实现
@@ -657,7 +663,9 @@ presets:
 
 内置 provider 名称 (`codex`、`openai`、`openrouter`、`anthropic`、`gemini`、`mimo`、`kimi-code`、`glm-coding`) 无法删除；它们的 base URL 与 `api_key_env` 是内置默认固定的。每只代理仍可通过 `controller.base_url` / `controller.api_key_env` 覆盖。
 
-`subagent_models` 允许用户不修改上游 creature 包，直接设置各 subagent 的默认模型。键会与最终的 `SubAgentConfig.name` 精确匹配。creature 或 subagent 模块中具体的 `model` 仍然优先；`parent`、`inherit`、`default` 明确表示继承父 LLM。未设置模型、使用 `subagent-default` 或 `subagent_default` 时会优先采用同名配置，未命中则继承父模型。该映射在创建 subagent 时读取，因此修改只影响之后创建的 job。Conversation 与 Inspector Trace 会记录每个新 job 实际绑定的模型，优先显示规范化 profile selector，缺失时回退到 raw model id。
+`subagent_models` 允许用户不修改上游 creature 包，直接设置各 subagent 的默认模型。键会与最终的 `SubAgentConfig.name` 精确匹配。命中的用户配置会覆盖未设置的模型，以及 `parent`、`inherit`、`default`、`subagent-default`、`subagent_default`。直接写在该 subagent 配置上的具体 selector 仍然优先；没有命中时继承父 LLM。该映射在创建 subagent 时读取，因此修改只影响之后创建的 job。Conversation 与 Inspector Trace 会记录每个新 job 实际绑定的模型，优先显示规范化 profile selector，缺失时回退到 raw model id。
+
+`child_models` 为 `group_add_node` 和 `group_spawn_child` 提供同类的用户默认模型。它不影响 `kt run`、Studio、recipe 和直接 Python API。本次调用的 `llm` 参数优先。具名 `@pkg/...` 配置会覆盖具体模型，但表内 `default` 不会；它只用于未写模型或 `parent`、`inherit`、`default`。结果返回 `requested_llm`、`llm`、`llm_source`、`matched_key`、`llm_fallback_from` 和 `fallback_reason`。查表时按规范化的 `@pkg/...`，从当前 creature 到 `base_config` 祖先，由近到远使用第一个命中的键。键不匹配 `config.name`、spawn 的 `name` 或本地路径。表内 `default` 是全局 child 默认，和配置哨兵 `default` 不是同一个意思。表中的选择器不可用时，回退到调用者模型，再回退到 `default_model`。工具返回 `llm`、`llm_source` 和 `llm_fallback_from`。文件在 spawn 时读取，修改只影响之后的 spawn。
 
 ### 添加自定义 LLM backend provider
 

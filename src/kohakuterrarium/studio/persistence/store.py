@@ -13,9 +13,12 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
-from kohakuterrarium.session.resource_gate import acquire_legacy
+from kohakuterrarium.session.occupancy.gate import acquire_legacy
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.session.store_lock import acquire_writer_lock, release_writer_lock
+from kohakuterrarium.session.store.lifecycle.lock import (
+    acquire_writer_lock,
+    release_writer_lock,
+)
 from kohakuterrarium.studio.persistence.delete_family import (
     detach_file_family,
     remove_detached_family,
@@ -33,7 +36,7 @@ from kohakuterrarium.studio.persistence.viewer.paths import (
 from kohakuterrarium.studio.sessions import live as _live
 from kohakuterrarium.utils import drive_migration_lock
 from kohakuterrarium.utils.config_dir import config_dir
-from kohakuterrarium.utils.fs_path import coerce_fs_path
+from kohakuterrarium.utils.file.path import coerce_fs_path
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -210,7 +213,7 @@ def session_targets(store: SessionStore, meta: dict[str, Any]) -> list[str]:
             seen.add(target)
             targets.append(target)
 
-    for key_bytes in store.conversation.keys(limit=2**31 - 1):
+    for key_bytes in store.conversation.keys():
         target = key_bytes.decode() if isinstance(key_bytes, bytes) else key_bytes
         if target and target not in seen:
             seen.add(target)

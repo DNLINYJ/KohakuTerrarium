@@ -5,8 +5,6 @@ swap files, and unknown sidecars are out of scope and must remain untouched.
 Production code does not call ``try_fast``.
 """
 
-from __future__ import annotations
-
 import asyncio
 import threading
 from pathlib import Path
@@ -14,13 +12,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from kohakuterrarium.laboratory._internal.app import AppMessage
-from kohakuterrarium.laboratory.adapters import terrarium_session as sess_mod
-from kohakuterrarium.laboratory.adapters.terrarium_session import (
+from kohakuterrarium.laboratory._internal.app.app import AppMessage
+from kohakuterrarium.laboratory.adapters.terrarium import session as sess_mod
+from kohakuterrarium.laboratory.adapters.terrarium.session import (
     TerrariumSessionAdapter,
 )
-from kohakuterrarium.session.file_family import acquire_family
-from kohakuterrarium.session.resource_gate import (
+from kohakuterrarium.session.occupancy.family import acquire_family
+from kohakuterrarium.session.occupancy.gate import (
     GATE,
     REASON_LEGACY_ENROLLED,
     REASON_LEGACY_PENDING,

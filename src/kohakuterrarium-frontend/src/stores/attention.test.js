@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it } from "vitest"
 
 import {
   attentionForScope,
+  attentionOverview,
+  waitingAttentionTargets,
   clearAttentionRegistry,
   createAttentionState,
   markAttentionRead,
@@ -9,8 +11,10 @@ import {
   reduceAttention,
   reduceAttentionEdge,
   removeAttentionScope,
+  restoreAttentionFromHistory,
   subscribeAttentionEdges,
   totalAttention,
+  workForScope,
 } from "./attention"
 
 describe("chat attention", () => {
@@ -26,6 +30,116 @@ describe("chat attention", () => {
     expect(state.pending.size).toBe(1)
     state = reduceAttention(state, { type: "ui_reply_ack", event_id: "x", status: "accepted" })
     expect(state.pending.size).toBe(0)
+  })
+
+  it("treats interactive legacy widgets and awaiting widgets as waiting input", () => {
+    let state = createAttentionState()
+    const confirm = {
+      type: "widget",
+      event_id: "w1",
+      interactive: true,
+      payload: { renderer: "kt.confirm" },
+    }
+    const progress = {
+      type: "widget",
+      event_id: "w2",
+      interactive: true,
+      payload: { renderer: "kt.progress" },
+    }
+    const app = {
+      type: "widget",
+      event_id: "w3",
+      interactive: true,
+      payload: { renderer: "kt.app", awaiting: true },
+    }
+    const idleApp = {
+      type: "widget",
+      event_id: "w4",
+      interactive: true,
+      payload: { renderer: "kt.app" },
+    }
+    const displayCard = {
+      type: "widget",
+      event_id: "w5",
+      interactive: false,
+      payload: { renderer: "kt.card" },
+    }
+    for (const event of [confirm, progress, app, idleApp, displayCard])
+      state = reduceAttention(state, event)
+    expect(state.pending).toEqual(new Set(["w1", "w3"]))
+
+    const edge = reduceAttentionEdge(createAttentionState(), confirm, { scope: "s", tab: "t" }).edge
+    expect(edge).toMatchObject({ kind: "waiting-input", eventId: "w1" })
+
+    state = reduceAttention(state, {
+      type: "widget_ack",
+      event_id: "w1",
+      kind: "message",
+      status: "rate_limited",
+    })
+    state = reduceAttention(state, {
+      type: "widget_ack",
+      event_id: "w1",
+      kind: "state",
+      status: "accepted",
+    })
+    expect(state.pending.has("w1")).toBe(true)
+    state = reduceAttention(state, {
+      type: "widget_ack",
+      event_id: "w1",
+      kind: "message",
+      status: "accepted",
+    })
+    state = reduceAttention(state, {
+      type: "widget",
+      event_id: "w3",
+      update_target: "w3",
+      payload: { awaiting: false },
+    })
+    expect(state.pending.size).toBe(0)
+  })
+
+  it("rebuilds widget prompts from history rows", () => {
+    let state = createAttentionState()
+    const rows = [
+      { type: "widget", widget_id: "a", renderer: "kt.ask_text", interactive: true },
+      { type: "widget", widget_id: "b", renderer: "kt.selection", interactive: true },
+      { type: "widget_message", widget_id: "b", name: "submit" },
+      { type: "widget", widget_id: "c", renderer: "kt.card", interactive: true },
+      { type: "widget_close", widget_id: "c" },
+    ]
+    for (const [index, row] of rows.entries()) {
+      state = reduceAttention(state, { ...row, event_id: index + 1, history: true })
+    }
+    expect(state.pending).toEqual(new Set(["a"]))
+  })
+
+  it.each([
+    { type: "widget_ack", kind: "message", status: "accepted" },
+    { type: "widget_close", payload: { reason: "replied" } },
+    { type: "widget_close", payload: { reason: "timeout" } },
+  ])("resolves a history-restored widget with a live $type frame", (close) => {
+    let state = restoreAttentionFromHistory([
+      {
+        type: "widget",
+        event_id: 42,
+        widget_id: "ask",
+        renderer: "kt.ask_text",
+        interactive: true,
+      },
+    ])
+    expect(state.pending).toEqual(new Set(["ask"]))
+    state = reduceAttention(state, { ...close, event_id: "ask" })
+    expect(state.pending.size).toBe(0)
+  })
+
+  it("uses a legacy payload prompt id instead of the history row id", () => {
+    const state = restoreAttentionFromHistory([
+      { type: "ask_text", event_id: 1, interactive: true, payload: { event_id: "ask" } },
+      { type: "ui_supersede", event_id: 2, payload: { event_id: "ask" } },
+    ])
+    expect(state.pending.size).toBe(0)
+    expect(state.seen).toEqual(new Set(["ask"]))
   })
 
   it("rebuilds pending input from history without emitting an external edge", () => {
@@ -85,7 +199,11 @@ describe("chat attention", () => {
 
     expect(state.completed).toBe(0)
     expect(state.processing).toBe(false)
+    expect(state.background).toBe(true)
     expect(edges).toEqual([])
+    for (const type of ["processing_error", "turn_error", "interrupt", "stopped"]) {
+      expect(reduceAttention(state, { type }).background).toBe(false)
+    }
   })
 
   it("counts the genuine completion after the background wait ends", () => {
@@ -178,6 +296,47 @@ describe("chat attention", () => {
     expect(state.pending).toEqual(new Set(["ask"]))
   })
 
+  it("carries a confirm prompt's question and answer buttons on its waiting edge", () => {
+    const edges = []
+    const unsubscribe = subscribeAttentionEdges((edge) => edges.push(edge))
+    reduceAttentionEdge(
+      createAttentionState(),
+      {
+        type: "confirm",
+        interactive: true,
+        ui_event_id: "gate1",
+        payload: {
+          prompt: "Allow tool: bash?",
+          detail: "ls -la",
+          options: [
+            { id: "allow_once", label: "Allow once", style: "primary" },
+            { id: "bad" },
+            { id: "deny", label: "Deny", style: "danger" },
+          ],
+        },
+      },
+      { scope: "graph-a", tab: "root" },
+    )
+    reduceAttentionEdge(
+      createAttentionState(),
+      { type: "ask_text", interactive: true, ui_event_id: "ask1", payload: { prompt: "Name?" } },
+      { scope: "graph-a", tab: "root" },
+    )
+    unsubscribe()
+
+    expect(edges[0]).toMatchObject({
+      kind: "waiting-input",
+      eventId: "gate1",
+      prompt: "Allow tool: bash?",
+      detail: "ls -la",
+      options: [
+        { id: "allow_once", label: "Allow once", style: "primary" },
+        { id: "deny", label: "Deny", style: "danger" },
+      ],
+    })
+    expect(edges[1].options).toBeUndefined()
+  })
+
   it("marks completion read without clearing pending input", () => {
     let state = createAttentionState()
     state = reduceAttention(state, { type: "processing_start" })
@@ -199,7 +358,152 @@ describe("chat attention", () => {
     expect(attentionForScope("graph-a")).toEqual({ pending: 1, completed: 2 })
     expect(totalAttention()).toEqual({ pending: 1, completed: 3 })
 
+    let root = createAttentionState()
+    let worker = createAttentionState()
+    const drive = (tab, state, event) => {
+      const next = reduceAttention(state, event)
+      publishAttention("graph-a", tab, next, event)
+      return next
+    }
+    root = drive("root", root, { type: "processing_start" })
+    expect(workForScope("graph-a")).toMatchObject({ status: "waiting", busy: true, started: 1 })
+    root = drive("root", root, { type: "processing_start" })
+    worker = drive("worker", worker, { type: "processing_start" })
+    expect(workForScope("graph-a").started).toBe(1)
+    root = drive("root", root, { type: "processing_end" })
+    expect(workForScope("graph-a").busy).toBe(true)
+    publishAttention("graph-a", "reviewer", createAttentionState())
+    worker = drive("worker", worker, { type: "processing_error" })
+    expect(workForScope("graph-a")).toMatchObject({ status: "failed", busy: false })
+    publishAttention("graph-a", "reviewer", createAttentionState())
+    worker = drive("worker", worker, { type: "processing_start", replay: true })
+    expect(workForScope("graph-a").started).toBe(1)
+    publishAttention("graph-a", "worker", { ...createAttentionState(), processing: true })
+    expect(workForScope("graph-a").started).toBe(1)
+    worker = drive("worker", worker, { type: "idle" })
+    worker = drive("worker", worker, { type: "processing_start" })
+    expect(workForScope("graph-a").started).toBe(2)
+    expect(workForScope("graph-a").status).toBe("running")
+    worker = drive("worker", worker, { type: "processing_end", awaiting_background: true })
+    expect(workForScope("graph-a")).toMatchObject({ status: "running", busy: true })
+    worker = drive("worker", worker, { type: "processing_start" })
+    expect(workForScope("graph-a").started).toBe(2)
+    worker = drive("worker", worker, { type: "processing_end" })
+    expect(workForScope("graph-a").busy).toBe(false)
+    worker = drive("worker", worker, { type: "turn_error" })
+    root = drive("root", root, { type: "processing_start" })
+    expect(workForScope("graph-a").status).toBe("running")
+    root = drive("root", root, { type: "processing_end" })
+    expect(workForScope("graph-a").status).toBe("ready")
     removeAttentionScope("graph-a")
+    expect(workForScope("graph-a")).toEqual({ status: "idle", busy: false, started: 0 })
     expect(totalAttention()).toEqual({ pending: 0, completed: 1 })
+  })
+
+  it("rebaselines settled outcomes on restored work without replaying live starts", () => {
+    let root = createAttentionState()
+    let worker = createAttentionState()
+    const drive = (tab, state, event) => {
+      const next = reduceAttention(state, event)
+      publishAttention("g", tab, next, event)
+      return next
+    }
+    root = drive("root", root, { type: "processing_start" })
+    root = drive("root", root, { type: "processing_error" })
+    expect(workForScope("g")).toEqual({ status: "failed", busy: false, started: 1 })
+    publishAttention("g", "root", root)
+    expect(workForScope("g").status).toBe("failed")
+    root = { ...root, processing: true }
+    publishAttention("g", "root", root)
+    publishAttention("g", "root", root)
+    expect(workForScope("g")).toEqual({ status: "running", busy: true, started: 1 })
+    root = drive("root", root, { type: "processing_end" })
+    expect(workForScope("g")).toEqual({ status: "ready", busy: false, started: 1 })
+
+    root = drive("root", root, { type: "processing_start" })
+    worker = drive("worker", worker, { type: "processing_start" })
+    worker = drive("worker", worker, { type: "processing_error" })
+    publishAttention("g", "root", root)
+    expect(workForScope("g")).toEqual({ status: "running", busy: true, started: 2 })
+    root = drive("root", root, { type: "processing_end" })
+    expect(workForScope("g")).toEqual({ status: "failed", busy: false, started: 2 })
+
+    worker = { ...worker, background: true }
+    publishAttention("g", "worker", worker)
+    expect(workForScope("g")).toEqual({ status: "running", busy: true, started: 2 })
+    publishAttention("g", "worker", { ...worker, background: false }, { type: "tool_done" })
+    expect(workForScope("g")).toEqual({ status: "ready", busy: false, started: 2 })
+  })
+
+  it("retains a failed period through its background yield and settlement", () => {
+    let state = createAttentionState()
+    const drive = (event) => {
+      state = reduceAttention(state, event)
+      publishAttention("g", "root", state, event)
+    }
+    drive({ type: "processing_start" })
+    drive({ type: "processing_error" })
+    drive({ type: "processing_end", awaiting_background: true })
+    drive({ type: "idle" })
+    expect(workForScope("g")).toEqual({ status: "running", busy: true, started: 1 })
+    state = { ...state, background: false }
+    drive({ type: "tool_done" })
+    expect(workForScope("g")).toEqual({ status: "failed", busy: false, started: 1 })
+    expect(state.completed).toBe(0)
+    drive({ type: "processing_start" })
+    drive({ type: "processing_end" })
+    expect(workForScope("g")).toEqual({ status: "ready", busy: false, started: 2 })
+  })
+
+  it("counts a failed turn once, stops it running, and clears the count when read", () => {
+    let state = createAttentionState()
+    state = reduceAttention(state, { type: "processing_start" })
+    expect(state.processing).toBe(true)
+    state = reduceAttention(state, { type: "processing_end", awaiting_background: true })
+    state = reduceAttention(state, { type: "activity", activity_type: "processing_error" })
+    expect(state).toMatchObject({ processing: false, background: false, errors: 1, completed: 0 })
+    state = reduceAttention(state, { type: "processing_error" })
+    expect(state.errors).toBe(2)
+
+    const replayed = reduceAttention(state, { type: "processing_error", replay: true })
+    expect(replayed.errors).toBe(2)
+    const historic = reduceAttention(state, { type: "processing_error", history: true })
+    expect(historic.errors).toBe(2)
+
+    expect(markAttentionRead(state).errors).toBe(0)
+    const legacy = reduceAttention(
+      { completed: 0, processing: true, seen: new Set(), pending: new Set() },
+      { type: "processing_error" },
+    )
+    expect(legacy.errors).toBe(1)
+  })
+
+  it("does not raise an attention edge for a failed turn", () => {
+    const { edge, state } = reduceAttentionEdge(
+      { ...createAttentionState(), processing: true },
+      { type: "activity", activity_type: "processing_error" },
+      { scope: "g", tab: "root" },
+    )
+    expect(edge).toBeNull()
+    expect(state.errors).toBe(1)
+  })
+
+  it("summarises every state across tabs and lists what waits for the user", () => {
+    publishAttention("graph-a", "root", {
+      ...createAttentionState(),
+      processing: true,
+      completed: 2,
+    })
+    publishAttention("graph-a", "helper", {
+      ...createAttentionState(),
+      pending: new Set(["x", "y"]),
+      errors: 1,
+    })
+    publishAttention("graph-b", "root", { ...createAttentionState(), processing: true })
+    expect(attentionOverview()).toEqual({ waiting: 2, failed: 1, running: 2, finished: 2 })
+    expect(waitingAttentionTargets()).toEqual([{ scope: "graph-a", tab: "helper", pending: 2 }])
+    clearAttentionRegistry()
+    expect(attentionOverview()).toEqual({ waiting: 0, failed: 0, running: 0, finished: 0 })
+    expect(waitingAttentionTargets()).toEqual([])
   })
 })

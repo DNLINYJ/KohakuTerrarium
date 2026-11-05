@@ -1,14 +1,8 @@
 """Declare how a tool's media results are transported and presented.
 
-A tool result may carry images or video. Two questions follow every such
-result and the answers belong to the tool, not to the executor or the UI:
-
-* Is this media the tool's *product* (generated, worth keeping with the
-  session) or a *reference* to something that already exists on disk?
-* Should a UI keep the media on screen when the tool block is collapsed?
-
-:class:`MediaPolicy` answers both. A tool sets its default on the class; a
-single result may override it through ``ToolResult.metadata["media_policy"]``.
+:class:`MediaPolicy` controls artifact persistence, inline fallback, and
+collapsed previews. A tool sets its default on the class; a single result
+may override it through ``ToolResult.metadata["media_policy"]``.
 """
 
 from dataclasses import dataclass
@@ -22,10 +16,11 @@ class MediaPolicy:
     """Transport and presentation rules for inline media in a tool result.
 
     ``persist`` copies inline (``data:``) media into the session artifact
-    store and lists the copy as a saved artifact. A tool whose media already
-    lives on disk returns a ``file://`` reference and sets this False so nothing
-    is duplicated; inline data under ``persist=False`` stays inline and is the
-    tool's own responsibility.
+    store and lists the copy as a saved artifact. ``persist=False`` leaves
+    inline bytes untouched. Live ``file://`` references always pass through.
+
+    ``inline_fallback`` retains inline bytes if artifact storage is unavailable
+    or fails, instead of replacing the image with a text placeholder.
 
     ``pinned`` keeps the media visible when the tool block is collapsed. Set
     it False for media that is context rather than output, such as a file the
@@ -34,9 +29,14 @@ class MediaPolicy:
 
     persist: bool = True
     pinned: bool = True
+    inline_fallback: bool = False
 
     def to_dict(self) -> dict[str, bool]:
-        return {"persist": self.persist, "pinned": self.pinned}
+        return {
+            "persist": self.persist,
+            "pinned": self.pinned,
+            "inline_fallback": self.inline_fallback,
+        }
 
     @classmethod
     def coerce(cls, value: Any, base: "MediaPolicy | None" = None) -> "MediaPolicy":
@@ -48,6 +48,9 @@ class MediaPolicy:
             return cls(
                 persist=bool(value.get("persist", base.persist)),
                 pinned=bool(value.get("pinned", base.pinned)),
+                inline_fallback=bool(
+                    value.get("inline_fallback", base.inline_fallback)
+                ),
             )
         return base
 

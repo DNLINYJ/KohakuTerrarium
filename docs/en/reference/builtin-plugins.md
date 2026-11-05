@@ -1,6 +1,6 @@
 ---
 title: Built-in plugins
-summary: Reference for the four runtime plugins shipped with the framework. Sandbox, budget, permgate, compact.auto.
+summary: Reference for the runtime plugins shipped with the framework. Sandbox, budget, permgate, compact.auto, ui.apps.
 tags:
   - reference
   - plugins
@@ -9,7 +9,7 @@ tags:
 
 # Built-in plugins
 
-Four runtime plugins ship with KohakuTerrarium. None of them are
+These runtime plugins ship with KohakuTerrarium. None of them are
 privileged in the framework; they use the same hooks user plugins
 do. They are auto-discovered at agent start; configs activate them
 under `plugins:` like any other plugin.
@@ -24,9 +24,28 @@ of the sandbox plugin, see
 | [`budget`](#budget) | 5 | `pre_llm_call`, `post_llm_call`, `pre_tool_execute`, `pre_subagent_run`, `get_prompt_content` | Turn / tool-call / walltime budget accounting. |
 | [`compact.auto`](#compactauto) | 30 | `post_llm_call`, `on_load` | Trigger eager context compaction after high-token LLM calls. |
 | [`permgate`](#permgate) | 100 | `pre_tool_execute`, `on_load` | Interactive user approval for tool calls. |
+| [`ui.apps`](#uiapps) | 50 | `contribute_tools`, `presentation_contribution` | Adds `show_app`: model-written HTML apps in the web UI. |
+| [`ui.declarative`](#uideclarative) | 50 | `presentation_contribution`, `pre_llm_call` | Inline UI: `<ui>` components in replies (renderer `kt.ui`). |
 
 Lower priority runs earlier on `pre_*` hooks. The order above is the
 default registration order.
+
+`ui.apps` and `ui.declarative` are **on by default**; every other plugin
+starts off. Both add nothing until an attached client draws their renderer, so
+a headless creature gets no prompt or tool from them. Turn one off with an
+entry in `plugins:`:
+
+```yaml
+plugins:
+  - name: ui.apps
+    enabled: false
+```
+
+A plugin that is on only by default yields: if one of its tools has a name a
+configured tool or another plugin already uses, it is turned off with a
+warning instead of failing the build. A user's own toggle in the Plugins tab is
+saved with the session and wins on resume. KohakuTerrarium's own MCP tool
+server, which has no chat client, starts both off.
 
 ## `sandbox`
 
@@ -50,6 +69,9 @@ presets: `src/kohakuterrarium/modules/sandbox/profile.py`.
 | `tmp` | enum | `default` / `private` / `shared` | from profile | Temp directory isolation. |
 | `fs_deny` | list[str] | paths | `[]` | Additional path deny-list (env-var expansion supported). |
 | `network_allowlist` | list[str] | hostnames | `[]` | Allowed hosts when `network=allow`. Empty list = allow all when network is allowed. |
+| `os_enforce` | enum | `auto` / `require` / `off` | `auto` | Kernel write confinement for subprocesses (macOS `sandbox-exec`, Linux Landlock). `auto` = confine where the OS supports it, `require` = refuse to spawn where it does not, `off` = policy checks only. |
+| `fs_write_allow` | list[str] | paths | `[]` | Exceptions you name: writable even inside `fs_deny` (not under `fs_write=deny`). |
+| `locked` | bool | true / false | false | Refuse runtime disable, option changes and working-directory switches (409 from the HTTP API). Can be turned on at runtime, not off; unlock by restarting the server with `KT_SANDBOX_ALLOW_UNLOCK=1`. |
 | `blocked_tools` | list[str] | tool names | `[]` | Tools the agent cannot call regardless of args. |
 
 ### Profile presets
@@ -78,6 +100,58 @@ presets: `src/kohakuterrarium/modules/sandbox/profile.py`.
   (`pure` blocks all spawns, `fs` blocks network calls, `shell`
   allows everything) and the network allowlist before delegating to
   `asyncio.create_subprocess_exec`.
+- **Kernel write confinement** (macOS and Linux): the runner launches each
+  command so the kernel confines it and every process it starts, whatever
+  they do. A script that calls `shutil.rmtree(os.environ["HOME"])` fails
+  with `Operation not permitted` (macOS) or `Permission denied` (Linux).
+  `workspace` allows writes under the working directory, the system temp
+  directories, the user caches (`~/.cache`, `~/Library/Caches`, `~/.npm`)
+  and `/dev`; `deny` allows only `/dev`; `broad` allows everything.
+  `fs_deny` paths are then unwritable, and so are the directory entries
+  above them, so a denied path cannot be moved away by renaming a parent.
+  `fs_write_allow` entries are writable again, so a narrow exception such as
+  `~/.ssh/sockets` (ssh connection sharing) or `~/.config/gcloud` survives a
+  denied parent. `write` / `edit` checks under `fs_write=workspace` admit
+  the same roots.
+  - **macOS** runs commands under `sandbox-exec` with a Seatbelt profile.
+    Launchers that would run work outside the sandbox (`open`, `osascript`,
+    `launchctl` and the LaunchServices / Apple Events services) are refused,
+    and so are connections to the control sockets of Docker (Desktop,
+    Colima, OrbStack), Podman, GNU screen, tmux (including `TMUX_TMPDIR`)
+    and iTerm2, which would run commands unconfined. This is a denylist:
+    other local unix sockets stay reachable, because a default-deny would
+    also cut DNS (`mDNSResponder`) and `ssh-agent`.
+  - **Linux** uses Landlock (kernel 5.13 or later with Landlock enabled, as
+    in current Ubuntu, Debian, Fedora and Arch kernels; no root or extra
+    package), applied by a small launcher that starts before the command.
+    Landlock can only grant access, so an `fs_deny` path inside a writable
+    root is carved out by granting the entries beside it instead. As a
+    result, nothing new can be created directly in a directory above a
+    denied path (with `fs_write=broad` and the default deny list, that
+    includes the home directory itself), and writable roots and
+    `fs_write_allow` paths must exist when the command starts. Commands run
+    with `no_new_privs`, so `sudo` and other setuid programs cannot gain
+    privileges. `truncate(2)` is confined from kernel 6.2 (Landlock ABI 3);
+    before 5.19 (ABI 2) every rename or link between directories is refused.
+    Landlock does not cover metadata, so `chmod`, `chown` and extended
+    attributes stay possible on any file the user owns (contents and
+    directory entries stay protected).
+    Launchers and control sockets are not refused on Linux: a command can
+    still reach `systemd-run --user`, Docker or tmux through their sockets.
+  Reads and network are not confined by the kernel, so secrets stay
+  readable. The `env` option is recorded but does not strip variables yet,
+  so API keys in the server's environment reach every command. The
+  confinement targets accidental damage (a misdirected `rmtree`, a stray
+  `open`); it is not a boundary against a program that deliberately
+  escapes, for example by submitting a launchd or systemd job or logging in
+  again over `ssh localhost`. Work started that way runs unconfined; run
+  untrusted code as a separate user or in a VM. The shared `/tmp` stays
+  writable, so a creature can still damage another process's scratch files
+  there, and a hard link made inside the workspace can be written through.
+  Since an agent can reach the local API, set `locked: true` so it cannot
+  switch the sandbox off. Commands run in their own process group, and a
+  timeout or cancellation kills the whole tree. Other platforms (Windows)
+  run unconfined under `auto`; use `require` to refuse instead.
 - **`backend=audit`**: violations are logged via the agent logger
   rather than raised. Useful for first-pass discovery on a new
   workload.
@@ -235,6 +309,73 @@ plugins:
     options:
       tools: ["bash", "write", "edit"]
       whitelist: ["read", "grep", "glob"]
+```
+
+## `ui.apps`
+
+Contributes the `show_app` tool: the agent shows one HTML document as an
+interactive app in the web UI canvas or chat. It is the full-page option for
+when inline UI is not enough. The tool, its guidance and its part of
+`## Presenting your answer` are visible to the model only while an attached
+client renders `kt.app`. Implementation: `src/kohakuterrarium/builtins/plugins/apps/plugin.py`
+and `src/kohakuterrarium/builtins/tools/app/show.py`.
+
+### Options
+
+| Option | Type | Default | Purpose |
+|---|---|---|---|
+| `allowed_hosts` | str / list[str] | `common` | Hosts the app may load scripts, styles, fonts and images from: preset names (`common`, `fonts`, `tailwind`) and bare host names. `[]` = no network. `connect-src` is always `'none'`. |
+| `default_surface` | `canvas` / `chat` | `canvas` | Where a new app opens. |
+| `max_document_kb` | int | 256 | Largest app document. |
+
+### Example
+
+```yaml
+plugins:
+  - name: ui.apps
+    options:
+      allowed_hosts: [fonts, cdn.jsdelivr.net]
+```
+
+See [Chat widgets](../guides/chat-widgets.md) for the bridge, the sandbox
+and compaction behaviour.
+
+## `ui.declarative`
+
+Inline UI: the model writes `kt.ui` components (tables, charts, diagrams,
+stats, tabs, inputs, buttons) as `<ui>` blocks inside its normal replies.
+Implementation: `src/kohakuterrarium/builtins/plugins/ui_declarative/` and
+`src/kohakuterrarium/builtins/kt_ui/markup.py`.
+
+### Behaviour
+
+- While an attached client reports `kt.ui` (the web UI after its
+  `client_hello`, the Rich CLI and the TUI), the plugin adds the
+  inline-components part of `## Presenting your answer`: when to use each
+  component, the markup, the props of the common components and one
+  example. The less common components (`accordion`, `timeline`, `tree`,
+  `gallery`, `quiz`, `timer`, `html` …) are named in one line;
+  `info("ui:<name>")` returns their props and an example. When the model
+  cannot call `info`, every component is written out. Headless creatures
+  never get the part.
+- A block that fails to convert or validate is drawn as an error box; the
+  next model request carries one note naming the block and its errors, with
+  the props (and an example) of each component the errors name.
+- The VS Code view cannot run app frames inside its chat, so a `show_app`
+  app or an inline `html` block opens in its own editor tab, behind a fixed
+  policy with no network connections. The app's bridge is relayed through
+  the extension, and each `kt.send` asks the user first ("Send" or "Always
+  for this app"), because every script in that tab is the model's.
+- A button or form `send` posts its text as the user's next message.
+
+The plugin has no options (an old `default_surface` option is accepted and
+ignored). See [guides/chat-widgets](../guides/chat-widgets.md#inline-ui).
+
+### Example
+
+```yaml
+plugins:
+  - name: ui.declarative
 ```
 
 ## Activation summary

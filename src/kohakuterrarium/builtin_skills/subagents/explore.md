@@ -1,25 +1,32 @@
 ---
 name: explore
-description: Search and understand unfamiliar code, read-only. Use when you do not know where the relevant code lives. Not for making changes - use worker.
+description: 'Investigate a workspace question and return file evidence, read-only. Dispatch it whenever an answer means reading across many files; hand it the scope.'
 category: subagent
 tags: [search, exploration, analysis]
 ---
 
 # explore
 
-Investigates a codebase across many files and reports what it found.
+A lightweight, read-only investigation in a fresh context. The parent retains
+planning and decision-making; graph creatures own substantial delegated work.
 
 ## Task shape
 
-Name the question, not the file. Say what you already know, what you need to
-learn, and what a useful answer looks like. Include paths you have ruled out.
+Supply the question, relevant paths or search boundaries, existing findings, and
+what remains uncertain. The sub-agent does not see the parent conversation.
 
 ## Returns
 
-A prose report with file and line references. No edits.
+**Answer**, **Evidence** with paths/symbols/line references, and **Limits** when
+coverage is partial. A failed search reports its scope, not a claim of absence.
 
 ## Limits
 
-- Read-only: glob, grep, read, tree.
-- Cannot ask you follow-up questions, so an ambiguous task returns an
-  ambiguous answer.
+- Inspection tools only: glob, grep, read, tree. No shell, writes, web, or delegation.
+- Budget plugin: 8/12 soft/hard model calls and 24/40 tool calls. Stop expanding
+  scope at the soft limit; at the hard limit tools are blocked and text reporting
+  remains available. The absolute loop cap is 14 model calls.
+- Emergency whole-run timeout: 600 seconds. No automatic compaction or extension
+  is enabled by this preset.
+- The model follows the configured sub-agent mapping, otherwise the parent.
+- Return useful partial findings rather than pretending the investigation is complete.

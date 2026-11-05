@@ -1,14 +1,13 @@
 """AgentTUI - Textual application for the KohakuTerrarium TUI."""
 
 import asyncio
-import threading
-import time
 from typing import Any
 
 from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
+from textual.timer import Timer
 from textual.widgets import Footer, Header, Static, TabbedContent, TabPane
 
 from kohakuterrarium.builtins.tui._safe_text import plain
@@ -90,7 +89,8 @@ class AgentTUI(App):
         self._is_processing = False
         self._mounted_event = asyncio.Event()
         self._thinking_active = False
-        self._thinking_thread: threading.Thread | None = None
+        self._thinking_timer: Timer | None = None
+        self._thinking_frame = 0
         # Callbacks receive no arguments for interrupt, (job_id, job_name) for
         # cancellation, and job_id for background promotion.
         self.on_interrupt: Any = None
@@ -104,6 +104,12 @@ class AgentTUI(App):
         pending = any(state.get("pending") for state in attention.values())
         active = self.get_active_tab_name() if self._terrarium_tabs else "_default"
         state = attention.get(active, attention.get("_default", {}))
+        self._is_processing = bool(state.get("processing"))
+        if self._is_processing:
+            self.start_thinking_animation()
+        else:
+            self.stop_thinking_animation()
+            self._set_status_text(IDLE_STATUS)
         if pending:
             self.title = "KohakuTerrarium - Input required"
         elif state.get("processing"):
@@ -410,34 +416,25 @@ class AgentTUI(App):
             refresh_hints(self.get_active_tab_name())
 
     def start_thinking_animation(self) -> None:
+        if self._thinking_active:
+            return
         self._thinking_active = True
-        self._thinking_thread = threading.Thread(
-            target=self._thinking_loop, daemon=True
-        )
-        self._thinking_thread.start()
+        self._thinking_frame = 0
+        self._thinking_timer = self.set_interval(0.3, self._advance_thinking)
+        self._advance_thinking()
 
     def stop_thinking_animation(self) -> None:
         self._thinking_active = False
-        try:
-            self.call_from_thread(self._clear_status)
-        except Exception as e:
-            logger.warning(
-                "Failed to clear status on stop thinking", error=str(e), exc_info=True
-            )
+        if self._thinking_timer is not None:
+            self._thinking_timer.stop()
+            self._thinking_timer = None
 
-    def _thinking_loop(self) -> None:
-        idx = 0
-        while self._thinking_active:
-            frame = THINKING_FRAMES[idx % len(THINKING_FRAMES)]
-            try:
-                self.call_from_thread(self._set_status_text, frame)
-            except Exception as e:
-                logger.warning(
-                    "Thinking animation loop ended", error=str(e), exc_info=True
-                )
-                break
-            idx += 1
-            time.sleep(0.3)
+    def _advance_thinking(self) -> None:
+        if self._thinking_active:
+            self._set_status_text(
+                THINKING_FRAMES[self._thinking_frame % len(THINKING_FRAMES)]
+            )
+            self._thinking_frame += 1
 
     def _set_status_text(self, text: str) -> None:
         try:

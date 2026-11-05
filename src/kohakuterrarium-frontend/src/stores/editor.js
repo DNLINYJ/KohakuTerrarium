@@ -10,7 +10,7 @@
 import { defineStore } from "pinia"
 import { getCurrentInstance } from "vue"
 
-import { injectScope, registerScopeDisposer } from "@/composables/useScope"
+import { injectScope, disposeScopeStore, registerScopeDisposer } from "@/composables/useScope"
 import { filesAPI } from "@/utils/api"
 
 const _treeRequests = new WeakMap()
@@ -314,9 +314,9 @@ function _factoryFor(scope) {
     useFn = defineStore(`editor:${key}`, _editorStoreOptions)
     _editorFactories.set(key, useFn)
     if (scope) {
-      registerScopeDisposer(scope, () => {
+      registerScopeDisposer(scope, (pinia) => {
         try {
-          const store = useFn()
+          const store = useFn(pinia)
           const state = _treeRequests.get(store)
           if (state) state.generation++
           _treeRequests.delete(store)
@@ -325,7 +325,7 @@ function _factoryFor(scope) {
             files.disposed = true
             files.reads.clear()
           }
-          store.$dispose?.()
+          disposeScopeStore(store, pinia)
         } catch {
           /* swallow */
         }

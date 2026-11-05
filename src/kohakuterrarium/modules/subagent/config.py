@@ -34,6 +34,7 @@ class SubAgentConfig:
     extra_prompt_file: str | None = None
     can_modify: bool = False
     stateless: bool = True
+    fork_context: bool = False
     interactive: bool = False
     context_mode: ContextUpdateMode = ContextUpdateMode.INTERRUPT_RESTART
     output_to: OutputTarget = OutputTarget.CONTROLLER
@@ -114,6 +115,7 @@ class SubAgentConfig:
             "extra_prompt_file",
             "can_modify",
             "stateless",
+            "fork_context",
             "interactive",
             "context_mode",
             "output_to",

@@ -12,7 +12,7 @@ override any file by placing a same-named file in their agent's
 | ---------------- | ------------------------------------------------------------------------------------------------- |
 | `__init__.py`    | Lookup functions: `get_builtin_tool_doc`, `get_builtin_subagent_doc`, listing and batch retrieval |
 | `tools/*.md`     | One markdown doc per builtin tool (bash, read, edit, write, glob, grep, etc.)                     |
-| `subagents/*.md` | One markdown doc per builtin sub-agent (explore, plan, worker, critic, etc.)                      |
+| `subagents/*.md` | One markdown doc per builtin sub-agent (explore, critic, and service presets)                      |
 
 ## Tool Docs (25)
 
@@ -21,10 +21,9 @@ mcp_call, mcp_connect, mcp_disconnect, mcp_list, multi_edit, python, read,
 scratchpad, search_memory, send_message, skill, stop_task, tree, web_fetch,
 web_search, write
 
-## Sub-agent Docs (10)
+## Sub-agent Docs (6)
 
-coordinator, critic, explore, memory_read, memory_write, plan, research,
-response, summarize, worker
+critic, explore, memory_read, memory_write, response, summarize
 
 ## Dependencies
 

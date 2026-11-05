@@ -7,8 +7,8 @@ retaining enough source and wiring metadata to construct valid config records.
 from fastapi import APIRouter, Depends, HTTPException
 
 from kohakuterrarium.api.routes.catalog._deps import get_workspace_optional
-from kohakuterrarium.llm.profiles import list_all as list_all_models
-from kohakuterrarium.session.embedding import (
+from kohakuterrarium.llm.profiles.resolve import list_all as list_all_models
+from kohakuterrarium.session.memory.embedding import (
     list_embedding_presets as _list_embedding_presets,
 )
 from kohakuterrarium.studio.catalog.builtins import (
@@ -24,7 +24,7 @@ from kohakuterrarium.studio.catalog.catalog_sources import (
     workspace_manifest_entries,
 )
 from kohakuterrarium.studio.editors.plugin_hooks import PLUGIN_HOOKS
-from kohakuterrarium.studio.editors.workspace_manifest import Workspace
+from kohakuterrarium.studio.editors.workspace.manifest import Workspace
 
 router = APIRouter()
 

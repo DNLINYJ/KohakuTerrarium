@@ -37,12 +37,12 @@ the Terrarium engine: `Terrarium(pwd=…)` plus `engine.add_creature(…)`
 `run_engine_with_rich_cli()` / `run_engine_with_tui()`. Programmatic
 embedders construct the agent directly with `await Agent.build(…)`.
 
-`Agent.__init__` (`src/kohakuterrarium/core/agent.py`) runs
+`Agent.__init__` (`src/kohakuterrarium/core/agent/assembly.py`) runs
 bootstrap in a fixed order: `_init_llm`, `_init_registry`,
 `_init_executor`, `_init_subagents`, `_init_output`, `_init_controller`,
 `_init_input`, `_init_user_commands`, `_init_triggers`. The mixin
 layout is `AgentInitMixin` (`bootstrap/agent_init.py`) + `AgentHandlersMixin`
-(`core/agent_handlers.py`) + `AgentToolsMixin` (`core/agent_tools.py`),
+(`core/agent/turn/handlers.py`) + `AgentToolsMixin` (`core/agent/tools/dispatch.py`),
 plus the post-2.0 mixins: `AgentConstructMixin` (`Agent.build` /
 `Agent.from_path`), `AgentTurnMixin` (typed `run` / `run_stream`),
 `AgentExtensionsMixin`, `AgentMessagesMixin`, `AgentModelMixin`,
@@ -82,7 +82,7 @@ Types include `user_input`, `idle`, `timer`, `context_update`,
 `tool_complete`, `subagent_output`, `channel_message`, `monitor`,
 `error`, `startup`, `shutdown`.
 
-The event queue is in `core/controller.py:push_event` /
+The event queue is in `core/controller/controller.py:push_event` /
 `_collect_events` (lines 252-299). Stackable events collected in the
 same tick are merged into one turn's user message; non-stackable events
 break a batch; anything past the batch is saved in `_pending_events`
@@ -110,7 +110,7 @@ or native (the LLM provider's own function-calling envelope). Each
 detected tool becomes an executor task via
 `executor.submit_from_event()`.
 
-The executor (`core/executor.py`) stores `{job_id: asyncio.Task}` and
+The executor (`core/jobs/executor.py`) stores `{job_id: asyncio.Task}` and
 builds a `ToolContext` for each invocation with `working_dir`,
 `session`, `environment`, file guards, a file-read-state map, the job
 store, and the agent name.
@@ -150,8 +150,8 @@ controller. If the sub-agent is configured with `output_to: external`,
 its output streams directly to a named output module instead of the
 parent.
 
-Interactive sub-agents (`modules/subagent/interactive.py` +
-`interactive_mgr.py`) stay alive across turns, absorb context updates,
+Interactive sub-agents (`modules/subagent/interactive/interactive.py` +
+`interactive/manager.py`) stay alive across turns, absorb context updates,
 and can be fed new prompts via `_feed_interactive()`. They persist in
 the session store like top-level conversations.
 
@@ -207,14 +207,15 @@ See [impl-notes/prompt-aggregation.md](../concepts/impl-notes/prompt-aggregation
 
 ### 1.7 Plugin systems
 
-Two independent systems:
+One plugin class, `BasePlugin` (`modules/plugin/base.py`), loaded by
+`bootstrap/plugins.py` and run by the manager in `modules/plugin/`.
 
-**Prompt plugins** (`prompt/plugins.py`) contribute content into the
-system prompt at aggregate time. They are sorted by priority. Built-ins
-include `ToolList`, `FrameworkHints`, `EnvInfo`, `ProjectInstructions`.
+**Prompt contributions** (`get_prompt_content`, `presentation_contribution`)
+are collected by the manager in priority order and placed by the
+aggregator at aggregate time. The tool inventory, tool guidance, skills and
+group blocks are framework sections, not plugins.
 
-**Lifecycle plugins** (`bootstrap/plugins.py` + manager in
-`modules/plugin/`) hook into agent events. The manager evaluates
+**Lifecycle hooks** hook into agent events. The manager evaluates
 `should_apply` / `applies_to` before every hook call, supports
 plugin-contributed controller commands and plugin-contributed termination
 checkers, and treats `PluginBlockError` from a `pre_*` hook as a veto.
@@ -239,7 +240,7 @@ Sessions live in a single `.kohakutr` file backed by KohakuVault
 (append-only), `channels` (message history), `subagents` (snapshots
 before destruction), `jobs`, `conversation` (latest snapshot per
 agent), `fts` (full-text index). Binary artifacts live beside the DB in
-`<session>.artifacts/` and are managed by `session/artifacts.py`.
+`<session>.artifacts/` and are managed by `session/store/records/artifacts.py`.
 
 Writes happen on:
 
@@ -249,13 +250,13 @@ Writes happen on:
 - scratchpad write,
 - channel send.
 
-Resume (`session/resume.py`): load `meta`, load the conversation
+Resume (`session/resume/resume.py`): load `meta`, load the conversation
 snapshot per agent, restore scratchpad/state, restore triggers, replay
 events to the output module (for scrollback), reattach sub-agent
 conversations. Non-resumable state (open files, LLM connections, TUI,
 asyncio tasks) is rebuilt from config.
 
-`session/memory.py` + `session/embedding.py` provide FTS5 and vector
+`session/memory/index.py` + `session/memory/embedding.py` provide FTS5 and vector
 search over the event log. Embedding providers: `model2vec`,
 `sentence-transformer`, `api`. Vectors are stored alongside event blocks
 for hybrid search.
@@ -264,7 +265,7 @@ See [impl-notes/session-persistence.md](../concepts/impl-notes/session-persisten
 
 ### 2.2 Context compaction
 
-`core/compact.py:CompactManager` runs after every turn.
+`core/compact/manager.py:CompactManager` runs after every turn.
 `should_compact(prompt_tokens)` checks whether prompt tokens exceed
 80% of `max_context` (configurable via `compact.threshold` and
 `compact.max_tokens`). On trigger it emits a `compact_start` activity
@@ -284,14 +285,14 @@ for the full reasoning.
 
 ### 3.1 Terrarium engine
 
-`terrarium/engine.py:Terrarium` is the runtime engine, one per
+`terrarium/engine/engine.py:Terrarium` is the runtime engine, one per
 process, hosting every creature. The engine owns:
 
 - `_topology: TopologyState`: pure-data graph model
-  (`terrarium/topology.py`) tracking which creatures share which
+  (`terrarium/graph/topology.py`) tracking which creatures share which
   graphs, which channels exist, who listens / sends.
 - `_creatures: dict[str, Creature]`: live wrappers
-  (`terrarium/creature_host.py`).
+  (`terrarium/creature/host.py`).
 - `_environments: dict[str, Environment]`: one per graph; holds
   `shared_channels`.
 - `_session_stores: dict[str, SessionStore]`: one per attached graph.
@@ -300,14 +301,14 @@ process, hosting every creature. The engine owns:
 A standalone agent is a 1-creature graph; a recipe is a connected
 graph with channels. `Terrarium.with_creature(config)` is the solo
 shortcut; `Terrarium.from_recipe(recipe)` walks a `TerrariumConfig`
-via `terrarium/recipe.py:apply_recipe` (declare channels, add direct
+via `terrarium/recipe/loader.py:apply_recipe` (declare channels, add direct
 channels per creature, add `report_to_root` when a root is declared,
 wire listen / send edges, start everything). Creatures never learn
 they are in a terrarium except through their channels and (optionally)
 the topology hint baked into their system prompt.
 
 **Channel injection.** When a creature joins a graph that has channels
-it listens to, `terrarium/channels.py:inject_channel_trigger` adds a
+it listens to, `terrarium/channels/channels.py:inject_channel_trigger` adds a
 `ChannelTrigger` to its `trigger_manager`. This is the one sanctioned
 downward injection in the layer model: a creature in a graph does
 know it has peers (it has to), but only via the handles the engine
@@ -316,15 +317,15 @@ gave it. Solo creatures get no injection.
 **Hot-plug.** Topology can change at runtime. `Terrarium.connect(a, b,
 channel=...)` may merge two graphs (environments union, channels
 pool, attached session stores merge into one via
-`terrarium/session_coord.py:apply_merge`). `Terrarium.disconnect` may
+`terrarium/session/coord.py:apply_merge`). `Terrarium.disconnect` may
 split a graph (parent session is duplicated to each side via
 `apply_split`). The pure-data topology mutators in
-`terrarium/topology.py` return a `TopologyDelta` whose
+`terrarium/graph/topology.py` return a `TopologyDelta` whose
 `kind in {"nothing", "merge", "split"}` drives the live updates.
 
 **Session merge / split.** The unit of session is the connected
 component of the graph. Topology changes that don't affect graph
-membership reuse the existing store. `terrarium/session_coord.py`
+membership reuse the existing store. `terrarium/session/coord.py`
 implements both branches and emits `SESSION_FORKED` / `TOPOLOGY_CHANGED`
 events.
 

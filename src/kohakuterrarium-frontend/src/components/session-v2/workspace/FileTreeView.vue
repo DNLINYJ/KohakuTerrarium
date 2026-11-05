@@ -8,7 +8,7 @@
     <div v-else-if="!rows.length" class="px-3 py-4 text-warm-400 text-center">{{ t("ws.empty") }}</div>
     <div v-else :style="{ height: `${rows.length * ROW}px`, position: 'relative' }">
       <div :style="{ transform: `translateY(${range[0] * ROW}px)` }">
-        <button v-for="row in slice" :key="row.node.path" class="w-full flex items-center gap-1 pr-2 text-left select-none transition-colors" :class="row.node.path === editor.activeFilePath ? 'bg-iolite/10 text-iolite dark:text-iolite-light' : 'text-warm-600 dark:text-warm-300 hover:bg-warm-100 dark:hover:bg-warm-800'" :style="{ height: `${ROW}px`, paddingLeft: `${row.depth * 14 + 8}px` }" :title="row.node.path" @click="onRow(row.node)">
+        <button v-for="row in slice" :key="row.node.path" class="w-full flex items-center gap-1 pr-2 text-left select-none transition-colors" :class="row.node.path === editor.activeFilePath ? 'bg-iolite/10 text-iolite dark:text-iolite-light' : 'text-warm-600 dark:text-warm-300 hover:bg-warm-100 dark:hover:bg-warm-800'" :style="{ height: `${ROW}px`, paddingLeft: `${row.depth * 14 + 8}px` }" :title="row.node.path" :draggable="dragsOut && row.node.type !== 'directory'" @click="onRow(row.node)" @contextmenu="onRowMenu($event, row.node)" @dragstart="onRowDrag($event, row.node)">
           <template v-if="row.node.type === 'directory'">
             <span class="w-3 shrink-0 text-[10px] text-warm-400" :class="loading.has(row.node.path) ? 'i-carbon-circle-dash animate-spin' : canExpand(row.node) ? (expanded.has(row.node.path) ? 'i-carbon-chevron-down' : 'i-carbon-chevron-right') : ''" />
             <span class="shrink-0" :class="expanded.has(row.node.path) ? 'i-carbon-folder-open text-amber' : 'i-carbon-folder text-amber/70'" />
@@ -18,6 +18,7 @@
         </button>
       </div>
     </div>
+    <GraphContextMenu v-if="menu" :x="menu.x" :y="menu.y" :title="menu.node.name" :items="menu.items" @pick="onMenuPick" @close="menu = null" />
   </div>
 </template>
 
@@ -29,9 +30,13 @@ const EXPANDED_BY_ROOT = new Map()
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue"
 
+import GraphContextMenu from "@/components/graph/canvas/GraphContextMenu.vue"
 import { canExpand, flattenTree, visibleRange } from "@/components/session-v2/model/workspace/treeRows"
+import { actionMenuItems, runActionMenuId } from "@/ext/actions"
 import { useV2T } from "@/components/session-v2/model/v2Strings"
 import { useEditorStore } from "@/stores/editor"
+import { useHostsStore } from "@/stores/hosts"
+import { fileDragOutSupported, startFileDrag } from "@/utils/hostBridge"
 
 /** The workspace file tree: lazy-expanding directories, only the rows in view rendered; expanded folders persist per root for the page's life. */
 const props = defineProps({ root: { type: String, default: "" } })
@@ -40,6 +45,7 @@ const emit = defineEmits(["select"])
 const ROW = 24
 const t = useV2T()
 const editor = useEditorStore()
+const hosts = useHostsStore()
 const scrollEl = ref(null)
 const scrollTop = ref(0)
 const viewport = ref(480)
@@ -74,6 +80,31 @@ function onScroll() {
     frame = null
     scrollTop.value = scrollEl.value?.scrollTop || 0
   })
+}
+
+const menu = ref(null)
+
+// Right-click opens a menu only when extensions contribute file actions.
+function onRowMenu(event, node) {
+  const items = actionMenuItems("file")
+  if (!items.length) return
+  event.preventDefault()
+  menu.value = { x: event.clientX, y: event.clientY, node, items }
+}
+
+function onMenuPick(id) {
+  const node = menu.value?.node
+  menu.value = null
+  if (node) runActionMenuId(id, { target: "file", path: node.path, name: node.name, isDirectory: node.type === "directory" })
+}
+
+// A file row can be dragged to the desktop only when the tree lists this machine's own files.
+const dragsOut = computed(() => fileDragOutSupported() && !hosts.activeHost)
+
+function onRowDrag(event, node) {
+  if (!dragsOut.value || node.type === "directory") return
+  event.preventDefault()
+  void startFileDrag([node.path])
 }
 
 function setOpen(path, open) {

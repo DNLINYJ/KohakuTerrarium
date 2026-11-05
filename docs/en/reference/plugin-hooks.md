@@ -66,22 +66,33 @@ When a `post_llm_call` rewrite changes the final assistant text, the runtime emi
 
 ## Tool visibility contributions
 
-Plugins can restrict the catalog exposed to the model on each native
-request without touching the registry. `PluginManager` intersects
-multiple contributions per category, so each plugin can only narrow the
-catalog.
+Plugins can restrict the catalog exposed to the model without touching
+the registry. `PluginManager` intersects multiple contributions per
+category, so each plugin can only narrow the catalog.
 
 | Hook | Signature | Fired when | Return semantics |
 |---|---|---|---|
-| `get_tool_visibility` | `def get_tool_visibility(context: PluginContext) -> ToolVisibility \| None` | Before each native request's tool schemas and provider-native tools are built. | `None` keeps the catalog unrestricted. A `ToolVisibility(allowed_tools=..., allowed_subagents=...)` keeps only the named members; an empty `frozenset` hides the whole category. |
+| `get_tool_visibility` | `def get_tool_visibility(context: PluginContext) -> ToolVisibility \| None` | Before each native request's tool schemas and provider-native tools are built, and whenever the system prompt is assembled. | `None` keeps the catalog unrestricted. A `ToolVisibility(allowed_tools=..., allowed_subagents=...)` keeps only the named members; an empty `frozenset` hides the whole category. |
 
 `ToolVisibility` fields:
 
 - `allowed_tools: frozenset[str] | None` — `None` means unrestricted.
 - `allowed_subagents: frozenset[str] | None` — `None` means unrestricted.
 
-This contribution only affects native tool schemas; text-mode prompt
-filtering is left to prompt contributions.
+The resulting catalog is intersected with renderer availability (tools
+declaring `requires_renderers` are hidden while no attached output reports
+those renderers). It governs the native schemas and every prompt section
+that names tools: `## Available Functions`, `## Function Documentation`,
+`## Tool guidance`, call examples and the `{{ tools }}` template variable.
+The prompt is assembled at construction and on refresh, so a contribution
+that changes from request to request only reaches the prompt on the next
+refresh.
+
+## Tool contributions
+
+| Hook | Signature | Fired when | Return semantics |
+|---|---|---|---|
+| `contribute_tools` | `def contribute_tools() -> list[BaseTool]` | Once per plugin instance, when the agent is built or the plugin is added, enabled or loaded. | The tools are registered while the plugin is enabled and removed when it is disabled or unregistered. A name already taken raises `PluginToolConflictError`. |
 
 ---
 
@@ -92,6 +103,34 @@ filtering is left to prompt contributions.
 | `pre_tool_dispatch` | `async pre_tool_dispatch(call: ToolCallEvent, context: PluginContext) -> ToolCallEvent \| None` | After parsing, before executor submission. | `None` keeps the call; a returned event rewrites tool name/args. May raise `PluginBlockError`. |
 | `pre_tool_execute` | `async pre_tool_execute(args: dict, **kwargs) -> dict \| None` | Just before tool execution. | `None` keeps `args`; a new dict replaces them. May raise `PluginBlockError`. `kwargs` include `tool_name`, `job_id`. |
 | `post_tool_execute` | `async post_tool_execute(result: ToolResult, **kwargs) -> ToolResult \| None` | After a tool completes (including error results). | `None` keeps the result; a new `ToolResult` replaces it. `kwargs` include `tool_name`, `job_id`, `args`. |
+
+---
+
+### Fork authorization policies
+
+Parent plugins do not automatically become child plugins. A plugin may set
+`inherit_fork_policy = True` (default: `False`) to contribute a pre-tool
+authorization guard to context forks. `fork_tool_policy() -> Callable[..., Any]`
+returns the guard for one child; the default implementation returns
+`self.pre_tool_execute`. Stateful policies should override this factory to
+allocate child-private state rather than mutate the parent.
+
+The runtime checks the parent's live enabled/applicable plugin set for every
+child tool call, after the child's argument transformations. The guard receives
+`args`, `tool_name`, and execution keyword arguments and may be sync or async.
+Return `None` or unchanged arguments to allow execution; raise `PluginBlockError`
+to deny it. Argument mutations, rewritten return values, and unexpected guard
+exceptions block the call. These inherited guards authorize, not transform.
+If the applicable parent policy identities or options change while an async
+approval is pending, the invocation is blocked with a retry error rather than
+executed under stale approval. Parent budget accounting, context hooks, and
+lifecycle hooks are not inherited.
+
+The builtin `sandbox` and `permgate` opt in. `permgate` honors live parent policy
+and existing parent approvals, but new approvals granted within a fork stay
+private to that child; they do not approve tools for the parent or sibling forks.
+This is an authorization contract for tools the guards understand, not an
+OS-level sandbox or automatic containment of arbitrary custom tool code.
 
 ---
 
@@ -120,31 +159,29 @@ All callbacks are fire-and-forget. Their return value is ignored.
 
 ---
 
-## Prompt plugins (separate category)
+## Prompt contributions
 
-Prompt plugins run during system prompt assembly in
-`prompt/aggregator.py`. They are loaded independently from lifecycle
-plugins.
-
-`BasePlugin` (in `kohakuterrarium.prompt.plugins`) has:
+`BasePlugin` (in `kohakuterrarium.modules.plugin.base`) can also add prose
+to the system prompt that `prompt/aggregator.py` assembles:
 
 ```python
 priority: int       # lower = earlier
 name: str
-async def get_content(self, context: PromptContext) -> str | None
+prompt_renderers: frozenset[str]   # renderer ids whose attach/detach changes the text
+def get_prompt_content(self, context: PluginContext) -> str | None
+def presentation_contribution(self, context: PluginContext) -> str | None
 ```
 
-- `get_content(context) -> str | None`: Return the text block to
+- `get_prompt_content(context) -> str | None`: Return the text block to
   insert, or `None` to contribute nothing.
-- `priority`: ordering key. Built-ins sit at 50/45/40/30.
+- `presentation_contribution(context) -> str | None`: Return this plugin's
+  part of `## Presenting your answer`, or `None`.
+- `priority`: ordering key among plugin contributions.
 
-Built-in prompt plugins are listed in
-[Prompt plugins in builtins.md](builtins.md#prompt-plugins).
-
-Register custom prompt plugins via the `plugins` field of a creature
-config (same as lifecycle plugins); the framework dispatches based on
-whether a plugin class subclasses the lifecycle `Plugin` protocol or
-the prompt `BasePlugin`.
+The framework's own sections are listed in
+[Prompt sections in builtins.md](builtins.md#prompt-sections). Custom
+plugins register via the `plugins` field of a creature config, the same as
+any other plugin.
 
 ---
 

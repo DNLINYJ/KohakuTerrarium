@@ -44,6 +44,34 @@ describe("turn rollup store", () => {
     expect(store.loading).toBe(false)
   })
 
+  it("keeps a new same-agent older-page spinner when the previous generation settles", async () => {
+    const store = useTurnRollupStore("older-generation")
+    sessionAPI.getTurns.mockResolvedValue({
+      agent: "alice",
+      turns: [{ turn_index: 1001 }],
+      total: 2000,
+      offset: 1000,
+    })
+    await store.load("session", "alice")
+    const old = deferred(),
+      current = deferred()
+    sessionAPI.getTurns.mockReturnValueOnce(old.promise)
+    const oldLoad = store.loadOlder()
+    await store.load("session", "alice")
+    expect(store.loadingOlder).toBe(false)
+    sessionAPI.getTurns.mockReturnValueOnce(current.promise)
+    const newLoad = store.loadOlder()
+    expect(store.loadingOlder).toBe(true)
+    old.resolve({ turns: [{ turn_index: 1 }], offset: 0 })
+    await oldLoad
+    expect(store.loadingOlder).toBe(true)
+    expect(store.turns).toEqual([{ turn_index: 1001 }])
+    current.resolve({ turns: [{ turn_index: 2 }], offset: 0 })
+    await newLoad
+    expect(store.loadingOlder).toBe(false)
+    expect(store.turns.map((t) => t.turn_index)).toEqual([2, 1001])
+  })
+
   it("invalidates an in-flight response when cleared", async () => {
     const request = deferred()
     sessionAPI.getTurns.mockReturnValueOnce(request.promise)

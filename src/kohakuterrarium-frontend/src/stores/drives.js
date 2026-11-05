@@ -26,7 +26,7 @@
 import { defineStore } from "pinia"
 import { getCurrentInstance } from "vue"
 
-import { injectScope, registerScopeDisposer } from "@/composables/useScope"
+import { injectScope, disposeScopeStore, registerScopeDisposer } from "@/composables/useScope"
 import { drivesAPI } from "@/utils/drivesApi"
 
 /** Terminal statuses never re-enter active scheduling. */
@@ -697,9 +697,9 @@ function _factoryFor(scope) {
     useFn = defineStore(`drives:${key}`, _drivesOptions)
     _factories.set(key, useFn)
     if (scope) {
-      registerScopeDisposer(scope, () => {
+      registerScopeDisposer(scope, (pinia) => {
         try {
-          useFn().$dispose?.()
+          disposeScopeStore(useFn(pinia), pinia)
         } catch {
           /* swallow */
         }

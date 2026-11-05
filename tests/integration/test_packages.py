@@ -14,12 +14,12 @@ writer, the real ``kohaku.yaml`` manifest loader, the real
 
 The workflows mirror how the codebase actually drives ``packages/``:
 
-- ``cli/packages.py`` → ``studio/catalog/packages.py`` runs the
+- ``cli/packages.py`` → ``studio/catalog/packages/packages.py`` runs the
   ``kt install`` / ``kt list`` / ``kt info`` / ``kt uninstall``
   lifecycle: ``install_package_op`` → ``list_installed_packages`` →
   ``load_agent_info`` / ``get_package_modules`` → ``uninstall_package_op``.
-- ``core/config.py`` (``_resolve_base_config``) and
-  ``terrarium/tools_group_lifecycle.py`` resolve ``@pkg/creatures/<name>``
+- ``core/config/load.py`` (``_resolve_base_config``) and
+  ``terrarium/tools/lifecycle.py`` resolve ``@pkg/creatures/<name>``
   references in recipes via ``is_package_ref`` + ``resolve_package_path``.
 - ``packages/resolve.py`` scanners (``resolve_package_tool`` etc.) are
   what ``bootstrap`` uses to find package-declared tools / io / triggers.
@@ -37,7 +37,13 @@ import yaml
 
 from kohakuterrarium import Terrarium
 from kohakuterrarium.errors import PackageNotInstalledError
+from kohakuterrarium.llm.profiles.backends import (
+    load_backends,
+    load_yaml_store,
+    validate_backend_type,
+)
 from kohakuterrarium.testing.llm import ScriptedLLM
+from kohakuterrarium.testing.llm_seam import real_llm_providers
 from kohakuterrarium.packages import locations
 from kohakuterrarium.packages.install import install_package, uninstall_package
 from kohakuterrarium.packages.locations import (
@@ -58,7 +64,7 @@ from kohakuterrarium.packages.resolve import (
     resolve_package_tool,
     resolve_package_trigger,
 )
-from kohakuterrarium.packages.slots import (
+from kohakuterrarium.packages.slots.slots import (
     list_package_commands,
     list_package_drive_registrations,
     list_package_prompts,
@@ -70,11 +76,19 @@ from kohakuterrarium.packages.slots import (
     resolve_package_skills,
     resolve_package_user_command,
 )
+from kohakuterrarium.packages.slots.ui import (
+    get_package_ui,
+    list_package_ui,
+    resolve_ui_asset,
+)
 from kohakuterrarium.packages.walk import get_package_modules, list_packages
 from kohakuterrarium.studio.catalog import drive_registrations as drive_catalog
-from kohakuterrarium.studio.catalog import packages as studio_packages
+from kohakuterrarium.studio.catalog.packages import packages as studio_packages
+from kohakuterrarium.studio.identity.llm.backends import save_backend_record
 from kohakuterrarium.terrarium.drive.errors import DriveValidationError
-from kohakuterrarium.terrarium.drive.registration import resolve_registration
+from kohakuterrarium.terrarium.drive.registration.registration import (
+    resolve_registration,
+)
 
 pytestmark = pytest.mark.timeout(60)
 
@@ -261,7 +275,7 @@ def _make_drive_registration_bundle(
     _write(src / "kohaku.yaml", yaml.safe_dump(manifest, sort_keys=False))
     _write(
         src / "kt_watch_reg.py",
-        "from kohakuterrarium.terrarium.drive.registration import (\n"
+        "from kohakuterrarium.terrarium.drive.registration.registration import (\n"
         "    DriveRegistrationDescriptor,\n)\n\n\n"
         "class WatchDriveRegistration:\n"
         f"    name = {reg_name!r}\n"
@@ -271,6 +285,44 @@ def _make_drive_registration_bundle(
         "        return DriveRegistrationDescriptor(\n"
         f"            name={reg_name!r}, kind={reg_name!r}, schema_version=1\n"
         "        )\n",
+    )
+    return src
+
+
+def _make_llm_backend_bundle(root: Path, pkg_name: str) -> Path:
+    """Build a bundle declaring an ``llm_backends:`` type plus two presets on it."""
+    src = root / f"{pkg_name}-src"
+    manifest = {
+        "name": pkg_name,
+        "version": "0.1.0",
+        "llm_backends": [
+            {
+                "name": "echo",
+                "module": "kt_echo_backend",
+                "class": "EchoProvider",
+                "credentials": "external",
+            }
+        ],
+        "llm_presets": [
+            {"name": "echo-small", "provider": "echo", "model": "small-1"},
+            {"name": "echo-large", "provider": "echo", "model": "large-1"},
+        ],
+    }
+    _write(src / "kohaku.yaml", yaml.safe_dump(manifest, sort_keys=False))
+    _write(
+        src / "kt_echo_backend.py",
+        "from kohakuterrarium.llm.base import BaseLLMProvider, ChatResponse, LLMConfig\n\n\n"
+        "class EchoProvider(BaseLLMProvider):\n"
+        "    @classmethod\n"
+        "    def from_profile(cls, profile):\n"
+        "        return cls(LLMConfig(model=profile.model))\n\n"
+        "    async def _stream_chat(self, messages, *, tools=None, **kwargs):\n"
+        "        text = messages[-1].get('content')\n"
+        "        if isinstance(text, list):\n"
+        "            text = ' '.join(p.get('text', '') for p in text)\n"
+        "        yield f'{self.config.model} heard {text}'\n\n"
+        "    async def _complete_chat(self, messages, **kwargs):\n"
+        "        return ChatResponse('ok', 'stop', {}, self.config.model)\n",
     )
     return src
 
@@ -332,7 +384,7 @@ class TestPackagesIntegration:
         install-2nd → ``uninstall`` → ``list`` lifecycle.
 
         This is the exact path a user takes with the ``kt`` CLI, driven
-        through the same ``studio/catalog/packages.py`` ops the CLI
+        through the same ``studio/catalog/packages/packages.py`` ops the CLI
         calls, cross-checked against the low-tier library.
         """
         # ---- before any install: the packages dir does not exist yet,
@@ -688,6 +740,47 @@ class TestPackagesIntegration:
         uninstall_package("drivepkg2")
         assert list_package_drive_registrations() == {}
 
+        # ---- llm_backends: slot (package-provided LLM backend type) ----
+        import sys as _sys
+
+        before_path = list(_sys.path)
+        try:
+            llm_src = _make_llm_backend_bundle(bundle_root, "echopkg")
+            assert install_package(str(llm_src)) == "echopkg"
+            assert validate_backend_type("echo") == "echo"
+            assert load_backends()["echo"].backend_type == "echo"
+            # Discovery alone imports nothing from the package.
+            assert "kt_echo_backend" not in _sys.modules
+            engine = Terrarium()
+            try:
+                with real_llm_providers():
+                    creature = await engine.add_creature(
+                        "@alpha/creatures/swe", llm="echo/echo-small"
+                    )
+                agent = creature.agent
+                assert type(agent.llm).__name__ == "EchoProvider"
+                assert agent.llm.config.model == "small-1"
+                result = await agent.run("ping")
+                assert "small-1 heard ping" in result.text
+                # Model switch goes through the same package dispatch.
+                with real_llm_providers():
+                    assert agent.switch_model("echo/echo-large") == "echo/echo-large"
+                assert agent.llm.config.model == "large-1"
+                result = await agent.run("again")
+                assert "large-1 heard again" in result.text
+            finally:
+                await engine.shutdown()
+            # Saving an unrelated backend never freezes the package record.
+            save_backend_record("mine", "openai", base_url="https://x")
+            assert "echo" not in (load_yaml_store().get("backends") or {})
+            uninstall_package("echopkg")
+            with pytest.raises(ValueError, match="Unsupported"):
+                validate_backend_type("echo")
+            assert "echo" not in load_backends()
+        finally:
+            _sys.path[:] = before_path
+            _sys.modules.pop("kt_echo_backend", None)
+
         # ---- a bare bundle (no creatures/terrariums/extensions) ----
         # Install still succeeds (validation only WARNS); the manifest is
         # read from the alternate ``kohaku.yml`` filename.
@@ -703,6 +796,104 @@ class TestPackagesIntegration:
         assert _load_manifest(nomanifest_dir) == {"name": "no_manifest_pkg"}
         uninstall_package("bare1")
         nomanifest_dir.rmdir()
+
+        # ---- ui: slot (dashboard contributions with owners) ----
+        # Install → listed with normalized owners → served path stays in
+        # the UI root → uninstall removes it from the listing.
+        ui_src = bundle_root / "uipkg"
+        (ui_src / "ui" / "parts").mkdir(parents=True)
+        (ui_src / "ui" / "index.js").write_text("export default () => {}\n")
+        (ui_src / "ui" / "parts" / "panel.js").write_text("export {}\n")
+        (ui_src / "private.py").write_text("SECRET = 1\n")
+        (ui_src / "kohaku.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "name": "uipkg",
+                    "version": "0.2.0",
+                    "plugins": [{"name": "qq", "module": "uipkg_ui", "class": "P"}],
+                    "tools": [{"name": "qq_send", "module": "uipkg_ui", "class": "T"}],
+                    "ui": {
+                        "entry": "ui/index.js",
+                        "handler": "uipkg_ui:Handler",
+                        "contributes": [
+                            {"kind": "settings", "id": "login", "label": "Login"},
+                            {"kind": "panel", "id": "feed", "owner": "plugin:qq"},
+                            {
+                                "kind": "tool-renderer",
+                                "id": "s",
+                                "owner": "tool:qq_send",
+                            },
+                        ],
+                    },
+                }
+            )
+        )
+        bad_src = bundle_root / "uibad"
+        (bad_src / "ui").mkdir(parents=True)
+        (bad_src / "kohaku.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "name": "uibad",
+                    "ui": {
+                        "entry": "ui/x.js",
+                        "contributes": [
+                            {"kind": "panel", "id": "p", "owner": "package"}
+                        ],
+                    },
+                }
+            )
+        )
+        assert install_package(str(ui_src)) == "uipkg"
+        assert install_package(str(bad_src)) == "uibad"
+        ui_slots = {s.package: s for s in list_package_ui()}
+        assert ui_slots["uibad"].error and not ui_slots["uibad"].contributions
+        ui_slot = ui_slots["uipkg"]
+        assert ui_slot.error == "" and ui_slot.handler == "uipkg_ui:Handler"
+        assert [(c.kind, c.owner) for c in ui_slot.contributions] == [
+            ("settings", "package:uipkg"),
+            ("panel", "plugin:qq"),
+            ("tool-renderer", "tool:qq_send"),
+        ]
+        assert (
+            resolve_ui_asset(ui_slot, "parts/panel.js")
+            == (get_package_root("uipkg") / "ui" / "parts" / "panel.js").resolve()
+        )
+        assert resolve_ui_asset(ui_slot, "../private.py") is None
+        assert [p["ui"]["entry"] for p in list_packages() if p["name"] == "uipkg"] == [
+            "ui/index.js"
+        ]
+        uninstall_package("uipkg")
+        uninstall_package("uibad")
+        assert get_package_ui("uipkg") is None and list_package_ui() == []
+
+        pet_source = Path(__file__).parents[2] / "examples/packages/virtual_pet"
+        assert install_package(str(pet_source)) == "virtual-pet"
+        pet_slot = get_package_ui("virtual-pet")
+        assert pet_slot.error == ""
+        overlay = next(c for c in pet_slot.contributions if c.kind == "overlay")
+        assert overlay.owner == "package:virtual-pet"
+        assert overlay.overlay == {
+            "anchor": "bottom-right",
+            "surface": "app",
+            "width": 224,
+            "height": 280,
+            "draggable": True,
+            "resizable": False,
+            "clickThrough": True,
+            "defaultVisible": True,
+            "alwaysOnTop": True,
+        }
+        assert not _load_manifest(get_package_root("virtual-pet")).get("plugins")
+        uninstall_package("virtual-pet")
+        assert (
+            install_package(str(pet_source), name_override="pet-alias") == "pet-alias"
+        )
+        renamed_pet = get_package_ui("pet-alias")
+        assert renamed_pet.error == ""
+        assert [c.owner for c in renamed_pet.contributions] == ["package:pet-alias"] * 2
+        assert resolve_ui_asset(renamed_pet, "index.js").is_file()
+        assert uninstall_package("pet-alias") is True
+        assert get_package_ui("pet-alias") is None
 
         # ---- kt uninstall alpha ----
         assert studio_packages.uninstall_package_op("alpha") is True

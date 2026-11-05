@@ -14,7 +14,7 @@ async def store_attach_hook(engine, creature, *, config_path="", config_type="ag
 
 
 def name_apply_hook(creature, name: str) -> None:
-    from kohakuterrarium.terrarium.creature_host import apply_creature_name
+    from kohakuterrarium.terrarium.creature.host import apply_creature_name
 
     apply_creature_name(creature, name)
 
@@ -26,7 +26,7 @@ def spawnable_hook(workspace):
 
 
 def resolve_workspace_hook(engine, creature):
-    from kohakuterrarium.studio.editors.workspace_fs import LocalWorkspace
+    from kohakuterrarium.studio.editors.workspace.fs import LocalWorkspace
 
     pwd = ""
     executor = getattr(creature.agent, "executor", None)
@@ -41,7 +41,7 @@ def resolve_workspace_hook(engine, creature):
 
 
 def register_group_hooks() -> None:
-    group_hooks = importlib.import_module("kohakuterrarium.terrarium.group_hooks")
+    group_hooks = importlib.import_module("kohakuterrarium.terrarium.tools.hooks")
     group_hooks.register_store_attach(store_attach_hook)
     group_hooks.register_name_apply(name_apply_hook)
     group_hooks.register_spawnable(spawnable_hook)

@@ -1356,6 +1356,8 @@ async def test_subprocess_worker_spawn_and_chat_round_trip(tmp_path, monkeypatch
     install_scripted_llm(monkeypatch, script=["sub-scout reporting in"])
     cfg_dir = _write_creature_config(tmp_path, "sub_scout", "You are sub_scout.")
 
+    config_file = cfg_dir / "config.yaml"
+    config_file.write_text(config_file.read_text() + "tools:\n  - name: web_search\n")
     async with RealLabHost(tmp_path) as host:
         async with RealLabSubprocessWorker(
             "sub-worker-1",
@@ -1365,6 +1367,12 @@ async def test_subprocess_worker_spawn_and_chat_round_trip(tmp_path, monkeypatch
         ) as worker:
             await worker.wait_for_join(host, timeout=OP_TIMEOUT * 4)
 
+            default_url = "/api/settings/module-defaults/tool/web_search"
+            saved = await host.http.put(
+                default_url,
+                json={"values": {"fallback": "duckduckgo", "need_content": True}},
+            )
+            assert saved.status_code == 200, saved.text
             resp = await asyncio.wait_for(
                 host.http.post(
                     "/api/sessions/active/creature",
@@ -1383,6 +1391,19 @@ async def test_subprocess_worker_spawn_and_chat_round_trip(tmp_path, monkeypatch
             creature_id = creature_entry["creature_id"]
             assert creature_entry.get("home_node") == "sub-worker-1"
 
+            module_url = f"/api/sessions/{session_id}/creatures/{creature_id}/modules/tool/web_search/options"
+            current = await host.http.get(module_url)
+            assert current.json()["options"]["fallback"] == "duckduckgo"
+            assert current.json()["options"]["need_content"] is True
+            await host.http.put(default_url, json={"values": {"need_content": False}})
+            assert (await host.http.get(module_url)).json()["options"][
+                "need_content"
+            ] is True
+            changed = await host.http.put(
+                module_url, json={"values": {"need_content": False}}
+            )
+            assert changed.status_code == 200, changed.text
+            assert changed.json()["options"]["fallback"] == "duckduckgo"
             chat_path = f"/ws/sessions/{session_id}/creatures/{creature_id}/chat"
             async with host.api_ws(chat_path) as ws:
                 reply = await asyncio.wait_for(
@@ -1578,7 +1599,7 @@ async def test_spawn_chat_model_stop_creature_on_worker(tmp_path, monkeypatch):
                 host.http.delete(f"/api/sessions/active/agents/{creature_id}"),
                 timeout=OP_TIMEOUT,
             )
-            assert stop_resp.status_code in (200, 204), f"stop failed: {stop_resp.text}"
+            assert stop_resp.status_code == 200, f"stop failed: {stop_resp.text}"
             await RealLabHost._wait_for(
                 lambda: creature_id
                 not in {c.creature_id for c in worker.engine.list_creatures()},
@@ -1672,9 +1693,9 @@ async def test_worker_disconnect_drops_creature_and_keeps_api_responsive(
                 host.http.delete(f"/api/sessions/active/agents/{creature_id}"),
                 timeout=OP_TIMEOUT,
             )
-            assert stop_resp.status_code in (200, 204, 404), (
+            assert stop_resp.status_code == 404, (
                 f"stop of a gone creature returned {stop_resp.status_code} "
-                f"(expected a clean 200/204/404): {stop_resp.text}"
+                f"(expected 404): {stop_resp.text}"
             )
         finally:
             if not worker_closed:
@@ -1813,7 +1834,7 @@ async def test_two_workers_stop_one_keeps_everything_responsive(tmp_path, monkey
                 host.http.delete(f"/api/sessions/active/agents/{cid_a}"),
                 timeout=OP_TIMEOUT,
             )
-            assert stop.status_code in (200, 204), f"stop a failed: {stop.text}"
+            assert stop.status_code == 200, f"stop a failed: {stop.text}"
 
             # --- the API stays responsive -----------------------------
             listed = await asyncio.wait_for(
@@ -1942,7 +1963,7 @@ async def test_worker_creature_does_not_self_start_config_io(tmp_path, monkeypat
                 agent, "input_module", None
             )
             input_type = type(input_mod).__name__ if input_mod is not None else None
-            assert input_type in (None, "NoneInput"), (
+            assert input_type == "NoneInput", (
                 f"worker creature booted its config IO ({input_type}) — "
                 "API-spawned creatures must have input suppressed for attach"
             )
@@ -2059,7 +2080,7 @@ async def test_interrupt_worker_creature_routes_to_home(tmp_path, monkeypatch):
             intr = await asyncio.wait_for(
                 host.http.post(f"{base}/interrupt"), timeout=OP_TIMEOUT
             )
-            assert intr.status_code in (200, 204), (
+            assert intr.status_code == 200, (
                 f"interrupt did not route to the worker creature: "
                 f"{intr.status_code} {intr.text}"
             )
@@ -2276,9 +2297,8 @@ async def test_channel_add_and_list_on_worker_session(tmp_path, monkeypatch):
                 ),
                 timeout=OP_TIMEOUT,
             )
-            assert add.status_code in (
-                200,
-                201,
+            assert (
+                add.status_code == 200
             ), f"add channel on worker session failed: {add.text}"
 
             # List it back — must route to the worker too, not the host
@@ -2693,7 +2713,7 @@ async def test_identity_sync_host_to_worker(tmp_path, monkeypatch):
         "provider": "openai",
     }
     monkeypatch.setattr(
-        "kohakuterrarium.laboratory.adapters.studio_identity.list_profiles_payload",
+        "kohakuterrarium.laboratory.adapters.studio.identity.list_profiles_payload",
         lambda: [synced_profile],
     )
 
@@ -2748,7 +2768,11 @@ async def test_resume_happy_path_on_worker(tmp_path, monkeypatch):
     """
     monkeypatch.setenv("KT_SESSION_DIR", str(tmp_path / "host-sessions"))
     install_scripted_llm(
-        monkeypatch, script=[ScriptEntry("remembered turn", match="remember this")]
+        monkeypatch,
+        script=[
+            ScriptEntry("remembered turn", match="remember this"),
+            ScriptEntry("resumed turn confirmed", match="continue after resume"),
+        ],
     )
     cfg_dir = _write_creature_config(tmp_path, "phoenix", "You rise again.")
 
@@ -2784,7 +2808,7 @@ async def test_resume_happy_path_on_worker(tmp_path, monkeypatch):
                 host.http.delete(f"/api/sessions/active/agents/{creature_id}"),
                 timeout=OP_TIMEOUT,
             )
-            assert stop.status_code in (200, 204), f"stop failed: {stop.text}"
+            assert stop.status_code == 200, f"stop failed: {stop.text}"
             await RealLabHost._wait_for(
                 lambda: not worker.engine.list_creatures(),
                 "creature removed from worker after stop",
@@ -2811,6 +2835,24 @@ async def test_resume_happy_path_on_worker(tmp_path, monkeypatch):
                 lambda: bool(worker.engine.list_creatures()),
                 "resumed creature back on worker engine",
             )
+            resumed_sid = resumed["instance_id"]
+            resumed_cid = resumed["session"]["creatures"][0]["creature_id"]
+            history = await asyncio.wait_for(
+                host.http.get(
+                    f"/api/sessions/{resumed_sid}/creatures/{resumed_cid}/history"
+                ),
+                timeout=OP_TIMEOUT,
+            )
+            assert history.status_code == 200, history.text
+            assert "remember this" in json.dumps(history.json())
+            assert "remembered turn" in json.dumps(history.json())
+            async with host.api_ws(
+                f"/ws/sessions/{resumed_sid}/creatures/{resumed_cid}/chat"
+            ) as ws:
+                reply = await asyncio.wait_for(
+                    _drain_chat_ws(ws, "continue after resume"), timeout=OP_TIMEOUT
+                )
+            assert "resumed turn confirmed" in reply
 
 
 # ===========================================================================

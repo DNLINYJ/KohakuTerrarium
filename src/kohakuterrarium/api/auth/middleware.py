@@ -11,6 +11,7 @@ from urllib.parse import unquote
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from kohakuterrarium.api.auth.asset_token import scope_has_valid_asset_token
 from kohakuterrarium.api.auth.config import AuthConfig, load_auth_config
 from kohakuterrarium.utils.logging import get_logger
 
@@ -73,6 +74,11 @@ class HostTokenMiddleware:
         # Trust only the ASGI peer address for loopback; forwarded headers are spoofable
         # unless a reverse proxy and its trust boundary are configured separately.
         if cfg.loopback_bypass and _is_loopback_client(scope):
+            await self._app(scope, receive, send)
+            return
+
+        # Package UI files are loaded by ``import()``, which cannot send headers.
+        if scope_has_valid_asset_token(scope):
             await self._app(scope, receive, send)
             return
 

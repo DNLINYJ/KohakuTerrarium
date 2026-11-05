@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any, Callable, Coroutine
 from uuid import uuid4
 
-from kohakuterrarium.modules.trigger.base import BaseTrigger
+from kohakuterrarium.modules.trigger.base import BaseTrigger, weak_reference
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -48,6 +48,57 @@ class TriggerManager:
         # The agent attaches persistence after session initialization.
         self._session_store: Any = None
         self._agent_name: str = ""
+        self._host_agent_ref: Any = None
+        # The engine sets this when a Terrarium hosts the agent.
+        self._creature_id: str = ""
+
+    @property
+    def host_agent(self) -> Any:
+        """The agent that owns this manager, or ``None`` when unset."""
+        ref = self._host_agent_ref
+        return ref() if ref is not None else None
+
+    @property
+    def host_agent_name(self) -> str:
+        """The owning agent's name, preferring the session-attached name."""
+        if self._agent_name:
+            return self._agent_name
+        config = getattr(self.host_agent, "config", None)
+        return str(getattr(config, "name", "") or "")
+
+    @property
+    def host_creature_id(self) -> str:
+        """The engine creature id, or the agent name for a solo agent."""
+        return self._creature_id or self.host_agent_name
+
+    def set_host_agent(self, agent: Any) -> None:
+        """Record the owning agent and rebind every registered trigger."""
+        self._host_agent_ref = weak_reference(agent)
+        self.bind_hosts()
+
+    def set_host_creature_id(self, creature_id: str) -> None:
+        """Record the engine creature id and rebind every registered trigger."""
+        self._creature_id = creature_id
+        self.bind_hosts()
+
+    def bind_hosts(self) -> None:
+        """Tell every registered trigger its current host identity."""
+        for trigger in self._triggers.values():
+            self._bind_host(trigger)
+
+    def _bind_host(self, trigger: Any) -> None:
+        bind = getattr(trigger, "bind_host", None)
+        if not callable(bind):
+            return
+        try:
+            bind(self.host_creature_id, self.host_agent_name, self.host_agent)
+        except Exception as e:
+            logger.warning(
+                "Trigger bind_host failed",
+                trigger_type=type(trigger).__name__,
+                error=str(e),
+                exc_info=True,
+            )
 
     async def add(
         self,
@@ -64,6 +115,7 @@ class TriggerManager:
 
         self._triggers[trigger_id] = trigger
         self._created_at[trigger_id] = datetime.now()
+        self._bind_host(trigger)
 
         if autostart:
             await trigger.start()
@@ -178,10 +230,15 @@ class TriggerManager:
         """Get the raw trigger instance."""
         return self._triggers.get(trigger_id)
 
+    def iter_triggers(self) -> tuple[BaseTrigger, ...]:
+        """Every registered trigger instance, in registration order."""
+        return tuple(self._triggers.values())
+
     async def start_all(self) -> None:
         """Start every registered trigger that lacks a run-loop task."""
         for trigger_id, trigger in self._triggers.items():
             if trigger_id not in self._tasks:
+                self._bind_host(trigger)
                 await trigger.start()
                 task = asyncio.create_task(
                     self._run_loop(trigger_id, trigger),

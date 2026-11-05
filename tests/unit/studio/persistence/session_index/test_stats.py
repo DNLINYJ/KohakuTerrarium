@@ -290,20 +290,19 @@ class TestIterEntries:
         assert entry_mod._max_mtime_with_wal(main) == main.stat().st_mtime
 
     def test_missing_entry_is_skipped(self, idx, monkeypatch):
-        # Defensive race-condition branch: ``all_filenames`` yields a
-        # key but ``_entries.get`` returns ``None`` because the row
-        # was deleted between the two calls.  The iterator must skip
-        # rather than yield ``None``.
+        # A key listed but deleted before its value is read is skipped.
         idx.upsert(_row(name="a"))
         idx.upsert(_row(name="b"))
 
-        real_get = idx._entries.get
+        real_get_many = idx._entries.get_many
 
-        def _ghost_get(key, default=None):
-            if key == "a.kohakutr":
-                return None
-            return real_get(key)
+        def _ghost_get_many(keys, default=None):
+            values = real_get_many(keys, default)
+            return [
+                default if key in ("a.kohakutr", b"a.kohakutr") else value
+                for key, value in zip(keys, values)
+            ]
 
-        monkeypatch.setattr(idx._entries, "get", _ghost_get)
+        monkeypatch.setattr(idx._entries, "get_many", _ghost_get_many)
         names = [e["name"] for e in idx.iter_entries()]
         assert names == ["b"]

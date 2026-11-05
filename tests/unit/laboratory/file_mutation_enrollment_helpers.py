@@ -1,15 +1,13 @@
 """Shared helpers for laboratory exact-path mutation occupancy tests."""
 
-from __future__ import annotations
-
 import base64
 import hashlib
 import time
 from pathlib import Path
 
-from kohakuterrarium.laboratory._internal.app import AppMessage
-from kohakuterrarium.laboratory.adapters.terrarium_files import TerrariumFilesAdapter
-from kohakuterrarium.session.resource_gate import GATE, REASON_OK, try_fast
+from kohakuterrarium.laboratory._internal.app.app import AppMessage
+from kohakuterrarium.laboratory.adapters.terrarium.files import TerrariumFilesAdapter
+from kohakuterrarium.session.occupancy.gate import GATE, REASON_OK, try_fast
 
 
 def sha(data: bytes) -> str:

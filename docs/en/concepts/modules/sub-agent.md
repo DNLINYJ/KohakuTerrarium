@@ -31,9 +31,10 @@ just the summary.
 But that budget is now configurable. Sub-agents can have their own
 multi-axis runtime budget (turns, tool calls, and optionally walltime),
 let them run unbounded, or make them share the same legacy iteration
-budget as the parent. Builtin sub-agents ship with a conservative minimum
-runtime budget: soft/hard turns `40/60`, soft/hard tool calls `75/100`,
-and no walltime limit.
+budget as the parent. The builtin inspection helpers use soft/hard model calls
+`8/12`, tool calls `24/40`, an absolute 14-call cap, and a 600-second whole-run
+timeout. They do not opt into automatic compaction. Service presets retain their
+separate defaults. Limits are ceilings, not goals; partial reports name gaps.
 
 A second reason: **specialisation**. A `critic` sub-agent prompted
 specifically for review decisions will outperform a general agent
@@ -81,23 +82,22 @@ to `compact.auto`). Shared legacy iteration budgets are resolved at spawn time:
 `budget_allocation` wins, otherwise `budget_inherit: true` reuses the parent's
 budget object if one exists.
 
-Built-in sub-agents (in `kt-biome` + framework): `worker`, `plan`,
-`explore`, `critic`, `response`, `research`, `summarize`,
-`memory_read`, `memory_write`, `coordinator`.
+Builtin task helpers: `explore` and `critic`. Service presets: `response`,
+`summarize`, `memory_read`, and `memory_write`. kt-biome creatures expose the two
+task helpers. Unavailable builtin names in older configs produce warnings and
+are skipped rather than preventing startup.
 
 ## What you can therefore do
 
-- **Plan / implement / review.** A parent with three sub-agents. The
-  parent orchestrates; each sub-agent stays focused on one phase.
+- **Investigate / review.** Lightweight helpers answer bounded questions or
+  assess supplied artifacts. The parent owns planning and decisions; graph
+  creatures own substantial implementation or research assignments.
 - **Silent controller.** Parent uses `output_to: external` on a
   `response` sub-agent. The controller does not emit text; only the
   sub-agent's reply reaches the user. This is how most kt-biome
   chat-style creatures work.
 - **Persistent specialist.** An `interactive: true` reviewer that sees
   every turn and speaks only when it has something to say.
-- **Nested terrariums.** A sub-agent can spawn additional creatures
-  into a graph via `group_add_node` (if it's a privileged node).
-  The substrate does not care.
 - **Vertical-inside-horizontal.** A terrarium creature that itself
   uses sub-agents, mixing axes of multi-agent.
 

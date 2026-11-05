@@ -1,0 +1,206 @@
+"""
+Store provider API keys and resolve them from worker or standalone sources.
+"""
+
+import os
+from collections.abc import Callable
+from pathlib import Path
+
+import yaml
+
+from kohakuterrarium.llm.profiles import secret_store
+from kohakuterrarium.utils.config_dir import config_dir
+from kohakuterrarium.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+# Preserve display constants while live I/O resolves the current config root.
+KT_DIR = Path.home() / ".kohakuterrarium"
+KEYS_PATH = KT_DIR / "api_keys.yaml"
+
+
+def _keys_path() -> Path:
+    """Resolve the API key store against the current configuration root."""
+    return config_dir() / "api_keys.yaml"
+
+
+# Standalone fallback environment variables for built-in providers.
+PROVIDER_KEY_MAP: dict[str, str] = {
+    "openrouter": "OPENROUTER_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "mimo": "MIMO_API_KEY",
+    "kimi-code": "KIMI_CODE_API_KEY",
+    "glm-coding": "GLM_CODING_API_KEY",
+}
+
+# Workers install one synchronous resolver for local and host identity caches.
+_resolver: Callable[[str], str] | None = None
+
+
+def register_api_key_resolver(resolver: Callable[[str], str]) -> None:
+    """Install the authoritative synchronous credential resolver used by workers."""
+    global _resolver
+    _resolver = resolver
+
+
+def clear_api_key_resolver() -> None:
+    """Remove the installed credential resolver if present."""
+    global _resolver
+    _resolver = None
+
+
+def save_api_key(provider: str, key: str) -> None:
+    """Save an API key for a provider; an empty key removes it.
+
+    With the keychain active the key goes there and never into the key file.
+    """
+    if secret_store.active():
+        if key:
+            secret_store.put(provider, key)
+        else:
+            secret_store.drop(provider)
+        file_keys = _load_file_keys()
+        if provider in file_keys:
+            del file_keys[provider]
+            _write_file_keys(file_keys)
+        logger.info(
+            "API key saved", provider=provider, store=secret_store.MODE_KEYCHAIN
+        )
+        return
+    keys = _load_file_keys()
+    keys[provider] = key
+    _write_file_keys(keys)
+    logger.info("API key saved", provider=provider)
+
+
+def switch_secret_store(mode: str) -> int:
+    """Move every stored key to ``mode`` (``file`` or ``keychain``); returns how many moved.
+
+    Keys are written and read back at the destination before the source is
+    emptied, so a failure part-way leaves every key where it was readable.
+    """
+    if mode == secret_store.MODE_KEYCHAIN:
+        if not secret_store.keychain_available():
+            raise secret_store.SecretStoreError("no system keychain is available")
+        file_keys = _load_file_keys()
+        moving = {name: key for name, key in file_keys.items() if key}
+        for name, key in moving.items():
+            secret_store.put(name, key)
+            if secret_store.get(name) != key:
+                raise secret_store.SecretStoreError(
+                    f"the {name} key did not store correctly"
+                )
+        secret_store.set_configured_mode(mode)
+        _write_file_keys({name: key for name, key in file_keys.items() if not key})
+        return len(moving)
+    if mode != secret_store.MODE_FILE:
+        raise secret_store.SecretStoreError(f"unknown secret store {mode!r}")
+    stored = secret_store.all_keys() if secret_store.keychain_available() else {}
+    _write_file_keys({**_load_file_keys(), **stored})
+    secret_store.set_configured_mode(mode)
+    for name in stored:
+        secret_store.drop(name)
+    return len(stored)
+
+
+def get_api_key(provider_or_env: str) -> str:
+    """Resolve a provider key from the worker resolver or standalone file and env."""
+
+    provider = provider_or_env
+    for prov, env in PROVIDER_KEY_MAP.items():
+        if provider_or_env == env:
+            provider = prov
+            break
+
+    # Worker mode delegates the complete local/host resolution policy to the resolver.
+    if _resolver is not None:
+        try:
+            key = _resolver(provider)
+        except Exception:  # pragma: no cover - resolver failures are external
+            logger.exception("api-key resolver raised; treating as miss")
+            key = ""
+        if key:
+            return key
+        # Resolver misses are terminal so credentials never leak from another source.
+        logger.warning(
+            "api-key resolver returned empty; set the key on this "
+            "worker (KT_CONFIG_DIR/api_keys.yaml) OR on the host "
+            "identity store (POST /api/settings/keys)",
+            provider=provider,
+        )
+        return ""
+
+    # Standalone resolution prefers the persisted key over environment fallbacks.
+    keys = _load_api_keys()
+    if provider in keys and keys[provider]:
+        return keys[provider]
+    env_var = PROVIDER_KEY_MAP.get(provider, provider_or_env)
+    key = os.environ.get(env_var, "")
+    if key:
+        return key
+    if provider_or_env != env_var:
+        key = os.environ.get(provider_or_env, "")
+    return key
+
+
+def has_api_key(provider_or_env: str) -> bool:
+    """Check credential availability without logging resolver misses."""
+    provider = provider_or_env
+    for prov, env in PROVIDER_KEY_MAP.items():
+        if provider_or_env == env:
+            provider = prov
+            break
+    if _resolver is not None:
+        try:
+            return bool(_resolver(provider))
+        except Exception:  # pragma: no cover - resolver failures are external
+            return False
+    keys = _load_api_keys()
+    if keys.get(provider):
+        return True
+    env_var = PROVIDER_KEY_MAP.get(provider, provider_or_env)
+    return bool(os.environ.get(env_var, ""))
+
+
+def list_api_keys() -> dict[str, str]:
+    """List stored API keys (masked)."""
+    keys = _load_api_keys()
+    masked = {}
+    for provider, key in keys.items():
+        if key and len(key) > 8:
+            masked[provider] = f"{key[:4]}...{key[-4:]}"
+        elif key:
+            masked[provider] = "****"
+    return masked
+
+
+def _load_api_keys() -> dict[str, str]:
+    """Every stored key: the key file's, plus the keychain's when it is active."""
+    keys = _load_file_keys()
+    if secret_store.active():
+        keys.update(secret_store.all_keys())
+    return keys
+
+
+def _write_file_keys(keys: dict[str, str]) -> None:
+    path = _keys_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.dump(keys, f, default_flow_style=False)
+
+
+def _load_file_keys() -> dict[str, str]:
+    """Load API keys from file."""
+    path = _keys_path()
+    if not path.exists():
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.warning("Failed to load API keys file", error=str(e), exc_info=True)
+        return {}

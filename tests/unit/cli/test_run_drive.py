@@ -8,8 +8,8 @@ need a real creature/LLM.
 import pytest
 
 from kohakuterrarium.cli import run as run_mod
-from kohakuterrarium.studio.identity import drive_settings as ds
-from kohakuterrarium.studio.identity.drive_settings import (
+from kohakuterrarium.studio.identity.drive_settings import settings as ds
+from kohakuterrarium.studio.identity.drive_settings.settings import (
     DriveSettings,
     RegistrationSetting,
 )
@@ -34,7 +34,7 @@ class _CapturingTerrarium:
 
 
 async def _drive_run(monkeypatch):
-    from kohakuterrarium.terrarium import engine as engine_module
+    from kohakuterrarium.terrarium.engine import engine as engine_module
 
     monkeypatch.setattr(engine_module, "Terrarium", _CapturingTerrarium)
     _CapturingTerrarium.last_kwargs = None

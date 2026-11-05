@@ -11,15 +11,15 @@ from pydantic import BaseModel
 
 from kohakuterrarium.api._io_executor import run_in_io_executor
 from kohakuterrarium.api.auth import verify_admin_token
-from kohakuterrarium.packages import marketplace
-from kohakuterrarium.packages.marketplace_types import (
+from kohakuterrarium.packages.marketplace import marketplace
+from kohakuterrarium.packages.marketplace.types import (
     IncompatibleFrameworkError,
     InvalidSpecError,
     MarketplaceEntry,
     MarketplaceNotFoundError,
     MarketplaceUnavailableError,
 )
-from kohakuterrarium.studio.catalog.packages import install_package_op
+from kohakuterrarium.studio.catalog.packages.packages import install_package_op
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)

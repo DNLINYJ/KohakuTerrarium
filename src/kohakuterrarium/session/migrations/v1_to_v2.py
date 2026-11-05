@@ -11,8 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from kohakuterrarium.session.artifacts import artifacts_dir_for
+from kohakuterrarium.session.store.records.artifacts import artifacts_dir_for
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.session.vault.io import copy_rows, key_text, read_prefix
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -346,61 +347,19 @@ def _highest_synthetic_event_id(dest: SessionStore, agent: str) -> int:
 
 def _copy_state(source: SessionStore, dest: SessionStore) -> None:
     """Copy every key in the ``state`` table verbatim."""
-    for key_bytes in source.state.keys(limit=2**31 - 1):
-        key = (
-            key_bytes.decode("utf-8", errors="replace")
-            if isinstance(key_bytes, bytes)
-            else key_bytes
-        )
-        try:
-            dest.state[key] = source.state[key_bytes]
-        except Exception as e:
-            logger.warning(
-                "Migrator failed to copy state key",
-                key=key,
-                error=str(e),
-                exc_info=True,
-            )
+    copy_rows(source.state, dest.state, what="state key")
 
 
 def _copy_kvault_table(source_table: Any, dest_table: Any, label: str) -> None:
     """Copy every key from a KohakuVault table to its destination twin."""
-    for key_bytes in source_table.keys(limit=2**31 - 1):
-        key = (
-            key_bytes.decode("utf-8", errors="replace")
-            if isinstance(key_bytes, bytes)
-            else key_bytes
-        )
-        try:
-            dest_table[key] = source_table[key_bytes]
-        except Exception as e:
-            logger.warning(
-                f"Migrator failed to copy {label} key",
-                key=key,
-                error=str(e),
-                exc_info=True,
-            )
+    copy_rows(source_table, dest_table, what=f"{label} key")
 
 
 def _copy_meta_fields(source: SessionStore, dest: SessionStore) -> dict[str, Any]:
     """Copy every meta key from source to dest; return the loaded source meta."""
     source_meta: dict[str, Any] = {}
-    for key_bytes in source.meta.keys(limit=2**31 - 1):
-        key = (
-            key_bytes.decode("utf-8", errors="replace")
-            if isinstance(key_bytes, bytes)
-            else key_bytes
-        )
-        try:
-            value = source.meta[key_bytes]
-        except Exception as e:
-            logger.warning(
-                "Migrator failed to read meta key",
-                key=key,
-                error=str(e),
-                exc_info=True,
-            )
-            continue
+    for key_bytes, value in read_prefix(source.meta, what="meta key"):
+        key = key_text(key_bytes)
         source_meta[key] = value
         if key == "format_version":
             continue

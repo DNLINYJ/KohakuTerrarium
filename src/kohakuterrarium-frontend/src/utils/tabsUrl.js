@@ -73,6 +73,10 @@ export function parseTabId(id) {
   if (id.startsWith("studio:")) {
     return parseStudioId(id)
   }
+  // Package UI tab: ``ext:<package>/<id>`` is both the id and the tab kind.
+  if (/^ext:[^/]+\/[^/]+$/.test(id)) {
+    return { kind: id, id }
+  }
   return null
 }
 

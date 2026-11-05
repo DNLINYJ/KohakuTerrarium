@@ -1,0 +1,23 @@
+/** Inject key carrying a contribution's owning ``kt`` package handle. */
+export const EXTENSION_INJECT_KEY = "kt:extension"
+
+/** Inject key carrying the key of the overlay the component is drawn in. */
+export const OVERLAY_INJECT_KEY = "kt:overlay"
+
+/** Inject key carrying where an overlay is drawn: ``"app"`` or ``"window"``. */
+export const OVERLAY_MODE_INJECT_KEY = "kt:overlay-mode"
+
+/** Inject key carrying the read-only file a file view is showing. */
+export const FILE_VIEW_INJECT_KEY = "kt:file-view"
+
+/** Inject key carrying the read-only graph node a badge or panel belongs to. */
+export const GRAPH_NODE_INJECT_KEY = "kt:graph-node"
+
+/** Inject key carrying the read-only message a decorator is drawn beside. */
+export const MESSAGE_CONTEXT_INJECT_KEY = "kt:message-context"
+
+/** Inject key carrying the fenced block a message renderer draws. */
+export const MESSAGE_BLOCK_INJECT_KEY = "kt:message-block"
+
+/** Inject key carrying a contribution's owner RPC client. */
+export const OWNER_INJECT_KEY = "kt:owner"

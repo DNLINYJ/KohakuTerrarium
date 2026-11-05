@@ -3,6 +3,7 @@
 import asyncio
 import json
 import threading
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -25,6 +26,32 @@ def client(tmp_path, monkeypatch):
 
 
 class TestSettingsRoundTrip:
+    @pytest.mark.parametrize(
+        "method,path,body",
+        [
+            ("GET", "/settings", None),
+            ("PUT", "/settings", {}),
+            ("GET", "/state", None),
+            ("GET", "/runtime", None),
+            ("POST", "/feeds/probe", {}),
+            ("POST", "/update", {}),
+            ("POST", "/rollback", {}),
+            ("POST", "/check", {}),
+        ],
+    )
+    def test_source_mode_rejects_runtime_operations(self, client, method, path, body):
+        client.app.state.desktop_source = True
+        response = client.request(method, "/api/app" + path, json=body)
+        assert response.status_code == 409
+        assert "source" in response.json()["detail"].lower()
+
+    def test_source_mode_closes_update_websocket(self, client):
+        client.app.state.desktop_source = True
+        with pytest.raises(WebSocketDisconnect) as error:
+            with client.websocket_connect(_r._WS_PATH):
+                pass
+        assert error.value.code == 4404
+
     def test_get_returns_defaults_on_fresh_install(self, client):
         resp = client.get("/api/app/settings")
         assert resp.status_code == 200
@@ -69,6 +96,53 @@ class TestSettingsRoundTrip:
         body = resp.json()
         assert body["channel"] == "stable"
         assert body["update"]["mode"] == "notify-on-launch"
+
+
+class TestUpdateAvailable:
+    @pytest.fixture
+    def active(self, monkeypatch):
+        def _set(version):
+            pointer = None if version is None else SimpleNamespace(version=version)
+            monkeypatch.setattr(_r, "read_active_pointer", lambda: pointer)
+
+        return _set
+
+    @pytest.mark.parametrize(
+        ("active_version", "pinned", "latest", "expected"),
+        [
+            ("2.2.1.dev1", None, "2.2.0", False),
+            ("2.2.1.dev1", None, "2.2.1.dev1", False),
+            ("2.2.0", None, "2.2.1.dev1", True),
+            ("2.2.1.dev1", "2.2.0", "2.3.0", True),
+            ("2.2.0", "2.2.0", "2.3.0", False),
+            (None, None, "2.2.0", True),
+            ("2.2.0", None, None, False),
+        ],
+    )
+    def test_only_a_newer_or_pinned_target_counts(
+        self, active, active_version, pinned, latest, expected
+    ):
+        active(active_version)
+        cfg = SimpleNamespace(pinned_version=pinned)
+        assert _r._update_available(cfg, latest) is expected
+
+
+class TestRuntime:
+    def test_a_fresh_install_has_no_active_release(self, client, monkeypatch):
+        monkeypatch.setattr(
+            "kohakuterrarium.launcher.paths._candidate_bundled_release_dirs",
+            lambda: [],
+        )
+        resp = client.get("/api/app/runtime")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["active"] is None
+        assert body["installed"] == []
+        assert body["bundled_newer"] is False
+
+    def test_it_is_not_offered_to_lab_clients(self, client):
+        client.app.state.lab_mode = "lab-client"
+        assert client.get("/api/app/runtime").status_code == 404
 
 
 class TestState:

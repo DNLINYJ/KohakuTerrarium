@@ -32,8 +32,8 @@ from kohakuterrarium.terrarium.events import EventKind
 from kohakuterrarium.utils.logging import get_logger
 
 if TYPE_CHECKING:
-    from kohakuterrarium.terrarium.creature_host import Creature
-    from kohakuterrarium.terrarium.engine import Terrarium
+    from kohakuterrarium.terrarium.creature.host import Creature
+    from kohakuterrarium.terrarium.engine.engine import Terrarium
 
 logger = get_logger(__name__)
 
@@ -256,7 +256,7 @@ def build_runtime_graph_section(engine: "Terrarium", creature: "Creature") -> st
         lines.append("")
     lines.append(
         "For channels above use `send_channel`. For one-shot point-to-point "
-        "messaging use `group_send`. Do not use `send_message` for graph traffic."
+        "messaging use `group_send`."
     )
     lines.append(
         "Output-wire arrivals are tagged `[output-wire from <source>]`; "

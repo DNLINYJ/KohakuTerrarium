@@ -194,6 +194,33 @@ describe("ChatPanel disconnected sends", () => {
     wrapper.unmount()
   })
 
+  it("shows a tool call's arguments growing until the call starts", async () => {
+    const { chat, wrapper } = mountPanel({ wsOpen: true })
+    const at = { source: "kohaku", turn_index: 1, branch_id: 2 }
+    chat._onMessage({ type: "processing_start", ...at })
+    chat._onMessage({
+      type: "tool_args_progress",
+      name: "show_app",
+      index: 0,
+      chars: 12_800,
+      ...at,
+    })
+    await flushPromises()
+    const label = () => wrapper.find(".kt-transcript-processing").text()
+    expect(label()).toContain("Writing app… 12.5 KB")
+    chat._onMessage({ type: "tool_args_progress", name: "write", index: 1, chars: 300, ...at })
+    await flushPromises()
+    expect(label()).toContain("Writing write arguments… 300 B")
+    chat._onMessage({ type: "tool_args_progress", name: "", chars: 5, ...at })
+    await flushPromises()
+    expect(label()).toContain("Writing write arguments… 300 B")
+    chat._onMessage({ type: "activity", activity_type: "tool_start", name: "write", ...at })
+    await flushPromises()
+    expect(label()).not.toContain("Writing")
+    expect(chat.toolArgsProgressByTab.kohaku).toBeUndefined()
+    wrapper.unmount()
+  })
+
   it("shows exactly one reconnecting banner while the socket is down", async () => {
     const label = "Disconnected — reconnecting…"
     const down = mountPanel({ wsOpen: false })
@@ -914,6 +941,43 @@ describe("ChatPanel command results", () => {
       content: "Goals: drive_1",
       data: { type: "list", title: "Goals" },
     })
+    let completeBtw
+    command.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          completeBtw = resolve
+        }),
+    )
+    vi.spyOn(terrariumAPI, "getSubagentConversation").mockResolvedValue({
+      meta: { audience: "user", inherited_message_count: 0 },
+      can_receive: true,
+      messages: [{ role: "assistant", content: "side answer" }],
+    })
+    chat.processingByTab.kohaku = true
+    await wrapper.find("textarea").setValue("/btw separate question")
+    await wrapper.find('button[aria-label="Send message"]').trigger("click")
+    await flushPromises()
+    expect(command).toHaveBeenLastCalledWith("graph_1", "kohaku", "btw", "separate question")
+    chat.tabs.push("other")
+    chat.activeTab = "other"
+    const sideResult = { data: { type: "side_conversation", job_id: "side-job", name: "fork" } }
+    completeBtw(sideResult)
+    await flushPromises()
+    expect(wrapper.find('[data-test="side-conversation-modal"]').exists()).toBe(false)
+    expect(chat.messagesByTab.kohaku).toHaveLength(1)
+    expect(chat.processingByTab.kohaku).toBe(true)
+    chat.activeTab = "kohaku"
+    await flushPromises()
+    expect(wrapper.find('[data-test="side-conversation-modal"]').exists()).toBe(true)
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", cancelable: true }))
+    await flushPromises()
+    expect(wrapper.find('[data-test="side-conversation-modal"]').exists()).toBe(false)
+    command.mockResolvedValueOnce(sideResult)
+    await wrapper.get('button[title="/btw --open side-job"]').trigger("click")
+    await flushPromises()
+    expect(command).toHaveBeenLastCalledWith("graph_1", "kohaku", "btw", "--open side-job")
+    expect(wrapper.find('[data-test="side-conversation-modal"]').exists()).toBe(true)
+    expect(chat.messagesByTab.kohaku).toHaveLength(1)
     command.mockRestore()
   })
 

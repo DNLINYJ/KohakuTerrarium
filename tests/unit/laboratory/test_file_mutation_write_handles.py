@@ -1,16 +1,14 @@
 """Write-handle close proof and handle-free replace/unlink occupancy."""
 
-from __future__ import annotations
-
 import pytest
 
-from kohakuterrarium.laboratory.adapters import terrarium_file_mutations as mut
-from kohakuterrarium.laboratory.adapters.terrarium_file_mutations import (
+from kohakuterrarium.laboratory.adapters.terrarium import file_mutations as mut
+from kohakuterrarium.laboratory.adapters.terrarium.file_mutations import (
     replace_enrolled,
     unlink_enrolled,
     write_bytes_enrolled,
 )
-from kohakuterrarium.session.resource_gate import (
+from kohakuterrarium.session.occupancy.gate import (
     GATE,
     REASON_LEGACY_RELEASE_UNCERTAIN,
     try_fast,

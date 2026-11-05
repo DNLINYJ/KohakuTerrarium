@@ -1,6 +1,6 @@
 {
   "name": "kohakuterrarium-web",
-  "version": "2.1.6",
+  "version": "2.2.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,6 +8,7 @@
     "build": "vite build && node scripts/fix-surrogate-escapes.mjs",
     "preview": "vite preview --host 0.0.0.0",
     "test": "vitest run",
+    "test:desktop-dev": "node --test scripts/vite-desktop.test.mjs scripts/desktop-shell.test.mjs",
     "test:watch": "vitest",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
@@ -32,8 +33,10 @@
     "element-plus": "^2.13.7",
     "elkjs": "^0.11.1",
     "highlight.js": "^11.11.0",
-    "katex": "^0.16.45",
+    "katex": "^0.19.1",
     "markdown-it": "^14.0.0",
+    "markdown-it-cjk-friendly": "^3.0.0",
+    "mermaid": "^12.2.0",
     "monaco-editor": "^0.53.0",
     "pinia": "^3.0.0",
     "splitpanes": "^4.0.4",
@@ -44,6 +47,7 @@
   "devDependencies": {
     "@iconify-json/carbon": "^1.2.0",
     "@iconify-json/ep": "^1.2.0",
+    "@tauri-apps/cli": "2.12.4",
     "@unocss/preset-attributify": "^66.6.8",
     "@unocss/preset-icons": "^66.6.8",
     "@unocss/preset-wind": "^66.6.8",
@@ -60,10 +64,16 @@
     "unplugin-auto-import": "^21.0.0",
     "unplugin-vue-components": "^32.0.0",
     "unplugin-vue-router": "^0.19.0",
-    "vitest": "^4.1.4"
+    "vitest": "^4.1.4",
+    "ws": "^8.22.1"
   },
   "allowScripts": {
     "vue-demi@0.14.10": true,
     "fsevents@2.3.3": true
+  },
+  "overrides": {
+    "@vscode/markdown-it-katex": {
+      "katex": "0.19.1"
+    }
   }
 }

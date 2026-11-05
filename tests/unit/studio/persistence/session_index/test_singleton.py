@@ -7,6 +7,7 @@ import threading
 import pytest
 
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.session.vault.handles import dispose
 from kohakuterrarium.studio.persistence import session_index as pkg
 from kohakuterrarium.studio.persistence.session_index import reconcile as reconcile_mod
 from kohakuterrarium.studio.sessions import index_hooks
@@ -420,21 +421,14 @@ class TestSingleton:
         old_meta = KVault(str(side), table="meta")
         old_meta.put("schema_version", SCHEMA_VERSION)
         old_meta.put("bootstrap_completed", "1")
-        old_meta.close()
-        try:
-            del old_meta._inner
-        except AttributeError:
-            pass
+        dispose(old_meta)
         del old_meta
         old_search = TextVault(
             str(side),
             table="search",
             columns=["name", "preview", "config_path", "agents", "pwd"],
         )
-        try:
-            del old_search._vault
-        except AttributeError:
-            pass
+        dispose(old_search)
         del old_search
         gc.collect()
 

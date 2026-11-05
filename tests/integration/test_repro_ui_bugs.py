@@ -10,9 +10,11 @@ import asyncio
 import contextlib
 from typing import Any
 
+import pytest
+
 from kohakuterrarium.builtins.tui.output import TUIOutput
 from kohakuterrarium.core.agent import Agent
-from kohakuterrarium.core.config_types import (
+from kohakuterrarium.core.config.types import (
     AgentConfig,
     InputConfig,
     OutputConfig,
@@ -63,7 +65,7 @@ class TestRichCliCancelOnSecondInput:
 
     def _wire_cli(self, agent):
         """Build a RichCLIApp over ``agent`` with terminal-free stubs."""
-        from kohakuterrarium.builtins.cli_rich.app import RichCLIApp
+        from kohakuterrarium.builtins.cli_rich.app.app import RichCLIApp
 
         cli_app = RichCLIApp(agent)
 
@@ -82,7 +84,7 @@ class TestRichCliCancelOnSecondInput:
 
         cli_app.committer = _FakeCommitter()
         cli_app._invalidate = lambda: None
-        cli_app._handle_slash = lambda text: asyncio.sleep(0)  # type: ignore[assignment]
+        cli_app._handle_slash = lambda text, **kwargs: asyncio.sleep(0)  # type: ignore[assignment]
         return cli_app
 
     async def _stream_agent(self, tmp_path, monkeypatch):
@@ -219,7 +221,7 @@ class TestRichCliMidTurnInjectionFix:
         ``_mid_turn_inject`` and DOES NOT touch ``_pending_task``."""
         from kohakuterrarium.bootstrap import agent_init as _ainit
         from kohakuterrarium.bootstrap import llm as _bllm
-        from kohakuterrarium.builtins.cli_rich.app import RichCLIApp
+        from kohakuterrarium.builtins.cli_rich.app.app import RichCLIApp
         from kohakuterrarium.testing.llm import ScriptEntry
 
         scripted = ScriptedLLM(
@@ -318,7 +320,7 @@ class TestRichCliMidTurnInjectionFix:
         """
         from kohakuterrarium.bootstrap import agent_init as _ainit
         from kohakuterrarium.bootstrap import llm as _bllm
-        from kohakuterrarium.builtins.cli_rich.app import RichCLIApp
+        from kohakuterrarium.builtins.cli_rich.app.app import RichCLIApp
         from kohakuterrarium.builtins.cli_rich.output import RichCLIOutput
 
         scripted = ScriptedLLM(["ok"])
@@ -383,7 +385,7 @@ class TestRichCliMidTurnInjectionFix:
         and shouldn't have to wait for the LLM to finish streaming."""
         from kohakuterrarium.bootstrap import agent_init as _ainit
         from kohakuterrarium.bootstrap import llm as _bllm
-        from kohakuterrarium.builtins.cli_rich.app import RichCLIApp
+        from kohakuterrarium.builtins.cli_rich.app.app import RichCLIApp
 
         scripted = ScriptedLLM(["ok"])
 
@@ -423,7 +425,7 @@ class TestRichCliMidTurnInjectionFix:
         cli_app.committer = _FakeCommitter()
         cli_app._invalidate = lambda: None
         # Stub the slash dispatcher so we don't actually run /help.
-        cli_app._handle_slash = lambda text: asyncio.sleep(0)  # type: ignore[assignment]
+        cli_app._handle_slash = lambda text, **kwargs: asyncio.sleep(0)  # type: ignore[assignment]
 
         try:
             cli_app._handle_submit("/help")
@@ -605,7 +607,7 @@ class TestTuiStdinStealFix:
         )
         from kohakuterrarium.builtins.inputs.none import NoneInput
         from kohakuterrarium.builtins.tui.input import TUIInput
-        from kohakuterrarium.terrarium.engine_cli import _input_steals_stdin
+        from kohakuterrarium.terrarium.engine.cli.tui import _input_steals_stdin
 
         # Stdin-stealing inputs that would race Textual.
         assert _input_steals_stdin(CLIInput()) is True
@@ -615,31 +617,37 @@ class TestTuiStdinStealFix:
         # Non-terminal inputs are fine.
         assert _input_steals_stdin(NoneInput()) is False
 
-    def test_cli_run_defers_creature_start_for_tui_mode(self):
-        # Pin the deferred-start: cli/run.py:159 passes
-        # ``start=(io_mode not in ("cli", "tui"))`` so the focus
-        # creature is NOT started during ``engine.add_creature(...)``
-        # in TUI mode. Without this, the creature's CLIInput task
-        # spawns a blocking ``sys.stdin.readline`` BEFORE Textual
-        # can claim stdin — the TUI then renders but never receives
-        # input, the canonical symptom of the bug.
-        from pathlib import Path
+    async def test_cli_run_defers_creature_start_for_terminal_surfaces(
+        self, tmp_path, monkeypatch
+    ):
+        # A creature started inside add_creature reads stdin before the
+        # terminal surface can claim it, so cli and tui defer the start.
+        from kohakuterrarium.cli.run import _run
+        from kohakuterrarium.terrarium.engine.engine import Terrarium
 
-        run_py = (
-            Path(__file__).resolve().parents[2]
-            / "src"
-            / "kohakuterrarium"
-            / "cli"
-            / "run.py"
-        )
-        text = run_py.read_text(encoding="utf-8")
-        # The condition MUST defer for BOTH cli and tui. A regression
-        # to ``start=(io_mode != "cli")`` reintroduces the freeze.
-        assert 'start=(io_mode not in ("cli", "tui"))' in text, (
-            "cli/run.py must defer creature.start() for BOTH cli and tui "
-            "modes — otherwise the agent's CLIInput grabs stdin before "
-            "Textual can, and the TUI is born inert."
-        )
+        class _Stop(Exception):
+            pass
+
+        started_with: dict[str | None, bool] = {}
+
+        for io_mode in ("cli", "tui", None):
+
+            async def record_add(self, *args, _mode=io_mode, **kwargs):
+                started_with[_mode] = kwargs["start"]
+                raise _Stop
+
+            monkeypatch.setattr(Terrarium, "add_creature", record_add)
+            with pytest.raises(_Stop):
+                await _run(
+                    str(tmp_path),
+                    session=None,
+                    llm=None,
+                    io_mode=io_mode,
+                    extra_creatures=[],
+                    extra_channels=[],
+                )
+
+        assert started_with == {"cli": False, "tui": False, None: True}
 
     def test_tui_output_on_start_preserves_external_tui_wiring(self):
         # Regression: when ``engine_cli.run_engine_with_tui`` direct-
@@ -753,7 +761,7 @@ class TestTuiStdinStealFix:
         # ``cli_rich/app.py:RichCLIApp._handle_slash`` does it).
         import asyncio as _asyncio
 
-        from kohakuterrarium.terrarium.engine_cli import _handle_tui_slash
+        from kohakuterrarium.terrarium.engine.cli.tui import _handle_tui_slash
 
         modal_calls: list[tuple[str, Any]] = []
 
@@ -781,7 +789,7 @@ class TestTuiStdinStealFix:
         # ``/module`` and ``/modules`` open the modules modal.
         import asyncio as _asyncio
 
-        from kohakuterrarium.terrarium.engine_cli import _handle_tui_slash
+        from kohakuterrarium.terrarium.engine.cli.tui import _handle_tui_slash
 
         for variant in ("/module", "/modules", "/mod"):
             modal_calls: list[str] = []
@@ -808,7 +816,7 @@ class TestTuiStdinStealFix:
         # ``/drives`` and ``/drive`` open the Drive record + settings panel.
         import asyncio as _asyncio
 
-        from kohakuterrarium.terrarium.engine_cli import _handle_tui_slash
+        from kohakuterrarium.terrarium.engine.cli.tui import _handle_tui_slash
 
         for variant in ("/drives", "/drive"):
             calls: list[str] = []
@@ -845,7 +853,9 @@ class TestTuiStdinStealFix:
             / "src"
             / "kohakuterrarium"
             / "terrarium"
-            / "engine_cli.py"
+            / "engine"
+            / "cli"
+            / "tui.py"
         )
         text = engine_cli_py.read_text(encoding="utf-8")
         start_idx = text.index("await tui.start()")
@@ -872,7 +882,9 @@ class TestTuiStdinStealFix:
             / "src"
             / "kohakuterrarium"
             / "terrarium"
-            / "engine_cli.py"
+            / "engine"
+            / "cli"
+            / "tui.py"
         )
         text = engine_cli_py.read_text(encoding="utf-8")
         assert "tui.host_agent = focus" in text, (
@@ -897,7 +909,9 @@ class TestTuiStdinStealFix:
             / "src"
             / "kohakuterrarium"
             / "terrarium"
-            / "engine_cli.py"
+            / "engine"
+            / "cli"
+            / "tui.py"
         )
         text = engine_cli_py.read_text(encoding="utf-8")
         # The submit path must use ``_spawn_inject(...)`` (or
@@ -951,7 +965,7 @@ class TestTuiStdinStealFix:
         # False, so the engine's main loop runs ``focus.inject_input``.
         import asyncio as _asyncio
 
-        from kohakuterrarium.terrarium.engine_cli import _handle_tui_slash
+        from kohakuterrarium.terrarium.engine.cli.tui import _handle_tui_slash
 
         class _NoModalTUI:
             async def show_model_picker_modal(self, agent: Any) -> None:
@@ -994,7 +1008,7 @@ class TestTuiStdinStealFix:
         # root's model.
         import asyncio as _asyncio
 
-        from kohakuterrarium.terrarium.engine_cli import _handle_tui_slash
+        from kohakuterrarium.terrarium.engine.cli.tui import _handle_tui_slash
 
         focus_agent = object()
         bob_agent = object()
@@ -1092,7 +1106,9 @@ class TestTuiStdinStealFix:
             / "src"
             / "kohakuterrarium"
             / "terrarium"
-            / "engine_cli.py"
+            / "engine"
+            / "cli"
+            / "tui.py"
         )
         text = engine_cli_py.read_text(encoding="utf-8")
         try_idx = text.index(
@@ -1118,7 +1134,9 @@ class TestTuiStdinStealFix:
             / "src"
             / "kohakuterrarium"
             / "terrarium"
-            / "engine_cli.py"
+            / "engine"
+            / "cli"
+            / "tui.py"
         )
         text = engine_cli_py.read_text(encoding="utf-8")
         # The pre-publish loop must exist and run BEFORE the

@@ -1,6 +1,8 @@
 """Convert external input to events and dispatch commands before skill fallbacks."""
 
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from typing import Any, Protocol, runtime_checkable
 
 from kohakuterrarium.core.events import TriggerEvent
@@ -9,6 +11,8 @@ from kohakuterrarium.modules.user_command.base import (
     parse_slash_command,
 )
 from kohakuterrarium.skills.user_slash import build_user_skill_turn
+
+_deferred_command = ContextVar("deferred_input_command", default=False)
 
 
 @runtime_checkable
@@ -31,7 +35,10 @@ class InputModule(Protocol):
 class BaseInputModule(ABC):
     """Provide lifecycle and slash-command dispatch for input adapters."""
 
+    supports_busy_commands = False
+
     def __init__(self):
+        self.command_idle_waiter: Callable[[], Awaitable[None]] | None = None
         self._running = False
         self._user_commands: dict[str, Any] = {}
         self._user_command_context: Any = None
@@ -46,11 +53,47 @@ class BaseInputModule(ABC):
             for alias in getattr(cmd, "aliases", []):
                 self._command_alias_map[alias] = name
 
+    def defer_command(self, text: str) -> bool:
+        """Identify commands that must retain foreground input ordering."""
+        name, _ = parse_slash_command(text)
+        canonical = self._command_alias_map.get(name, name)
+        command = self._user_commands.get(canonical)
+        return self.command_idle_waiter is not None and not getattr(
+            command, "safe_while_busy", False
+        )
+
+    async def run_deferred_command(self, text: str) -> UserCommandResult | None:
+        """Execute a command already admitted by the serial input worker."""
+        token = _deferred_command.set(True)
+        try:
+            result = await self.try_user_command(text)
+            if result is not None and result.consumed:
+                await self.present_command_result(result, parse_slash_command(text)[0])
+            return result
+        finally:
+            _deferred_command.reset(token)
+
+    async def present_command_result(
+        self, result: UserCommandResult, name: str
+    ) -> None:
+        """Present a consumed command result on the input surface."""
+
+    async def wait_for_command_slot(self, text: str) -> None:
+        """Wait for foreground work unless this registered command is busy-safe."""
+        if self.command_idle_waiter is None or _deferred_command.get():
+            return
+        name, _ = parse_slash_command(text)
+        canonical = self._command_alias_map.get(name, name)
+        command = self._user_commands.get(canonical)
+        if not getattr(command, "safe_while_busy", False):
+            await self.command_idle_waiter()
+
     async def try_user_command(self, text: str) -> UserCommandResult | None:
         """Execute a registered slash command or fall back to an enabled skill."""
         if not text.startswith("/"):
             return None
 
+        await self.wait_for_command_slot(text)
         name, args = parse_slash_command(text)
 
         if self._user_commands:

@@ -19,13 +19,13 @@ from kohakuterrarium.api.routes.identity.node_routing import (
     call_node_identity,
     is_host_target,
 )
-from kohakuterrarium.studio.identity.codex_oauth import (
+from kohakuterrarium.studio.identity.codex.oauth import (
     consume_reset_credit_async,
     get_status,
     get_usage_async,
     login_async,
 )
-from kohakuterrarium.terrarium.service import TerrariumService
+from kohakuterrarium.terrarium.service.service import TerrariumService
 
 router = APIRouter()
 

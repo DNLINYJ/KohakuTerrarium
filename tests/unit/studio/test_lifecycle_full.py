@@ -18,8 +18,11 @@ from kohakuterrarium.bootstrap import llm as _bootstrap_llm
 from kohakuterrarium.builtins.inputs.none import NoneInput
 from kohakuterrarium.studio.sessions import lifecycle
 from kohakuterrarium.testing.llm import ScriptedLLM
-from kohakuterrarium.terrarium.engine import Terrarium
-from kohakuterrarium.terrarium.service import CreatureInfo, LocalTerrariumService
+from kohakuterrarium.terrarium.engine.engine import Terrarium
+from kohakuterrarium.terrarium.service.service import (
+    CreatureInfo,
+    LocalTerrariumService,
+)
 from kohakuterrarium.testing.terrarium import (
     TestTerrariumBuilder,
     _FakeAgent,
@@ -37,8 +40,8 @@ class TestStartCreatureLocal:
     async def test_with_in_memory_config(self, monkeypatch, tmp_path):
         engine = Terrarium()
         svc = LocalTerrariumService(engine)
-        from kohakuterrarium.core.config_types import AgentConfig
-        from kohakuterrarium.terrarium.creature_host import Creature
+        from kohakuterrarium.core.config.types import AgentConfig
+        from kohakuterrarium.terrarium.creature.host import Creature
 
         # Stub engine.add_creature to return a fake creature.
         agent = _FakeAgent(name="alice")
@@ -254,7 +257,7 @@ class TestStartTerrarium:
         cfg = TerrariumConfig(name="test-terra", creatures=[], channels=[])
         seen_apply_kwargs: dict = {}
 
-        async def _apply(c, pwd=None, llm=None, strict=True, session=None):
+        async def _apply(c, pwd=None, llm=None, strict=True, session=None, start=True):
             seen_apply_kwargs.update(strict=strict, session=session)
             return SimpleNamespace(graph_id="g-new", creature_ids=set())
 
@@ -435,7 +438,7 @@ class TestRename:
             await t.shutdown()
 
     async def test_rename_creature_rejects_duplicate_name_in_graph(self):
-        from kohakuterrarium.terrarium.graph_identity import GraphNameConflictError
+        from kohakuterrarium.terrarium.graph.identity import GraphNameConflictError
 
         t = await (
             TestTerrariumBuilder().with_creature("alice").with_creature("bob").build()

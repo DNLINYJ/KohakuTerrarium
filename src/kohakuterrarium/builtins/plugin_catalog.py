@@ -27,7 +27,19 @@ _PLUGINS: dict[str, dict[str, str]] = {
         "module": "kohakuterrarium.builtins.plugins.sandbox.plugin",
         "class": "SandboxPlugin",
     },
+    "ui.apps": {
+        "module": "kohakuterrarium.builtins.plugins.apps.plugin",
+        "class": "AppsPlugin",
+    },
+    "ui.declarative": {
+        "module": "kohakuterrarium.builtins.plugins.ui_declarative.plugin",
+        "class": "UiDeclarativePlugin",
+    },
 }
+
+# Catalog plugins discovered enabled. Both gate themselves on the attached
+# clients' renderers, so a headless creature gets no prompt or tool from them.
+_DEFAULT_ON: frozenset[str] = frozenset({"ui.apps", "ui.declarative"})
 
 # Plugin packs are syntactic sugar for opting into multiple plugins by
 # name. Budget is intentionally NOT bundled into any default pack — it
@@ -44,12 +56,17 @@ def lookup_plugin(name: str) -> dict[str, str] | None:
     return dict(spec) if spec else None
 
 
+def is_default_on(name: str) -> bool:
+    """Whether catalog discovery registers ``name`` enabled."""
+    return name in _DEFAULT_ON
+
+
 def list_catalog_plugins() -> list[dict[str, Any]]:
     """Return all built-in plugins from the catalog as load-spec dicts.
 
     Used by ``bootstrap.plugins`` to register catalog-listed plugins
-    as disabled-but-available so they appear in the frontend's plugin
-    list (Plugins tab → Enable button) without requiring an explicit
+    as available (disabled, except ``is_default_on`` ones) so they appear in
+    the frontend's plugin list (Plugins tab) without requiring an explicit
     entry in the agent's YAML config.
     """
     return [

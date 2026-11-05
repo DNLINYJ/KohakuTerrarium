@@ -1,7 +1,7 @@
 """Integration suite for ``kohakuterrarium.mcp`` — the MCP client layer.
 
 Each test method here drives a *complete* MCP workflow end-to-end the
-way the framework's real consumer (``core/agent_mcp.py``) does it:
+way the framework's real consumer (``core/agent/mcp.py``) does it:
 
 * ``MCPClientManager`` connects to a **real in-process stdio MCP
   server** — a tiny ``FastMCP`` script written to ``tmp_path`` and
@@ -42,7 +42,7 @@ from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
 from kohakuterrarium.builtins.tool_catalog import get_builtin_tool
 from kohakuterrarium.core.agent import Agent
-from kohakuterrarium.core.config_types import (
+from kohakuterrarium.core.config.types import (
     AgentConfig,
     InputConfig,
     OutputConfig,
@@ -55,8 +55,8 @@ from kohakuterrarium.mcp.client import (
     normalize_mcp_transport,
 )
 from kohakuterrarium.modules.tool.base import ToolContext
-from kohakuterrarium.terrarium.creature_host import Creature
-from kohakuterrarium.terrarium.engine import Terrarium
+from kohakuterrarium.terrarium.creature.host import Creature
+from kohakuterrarium.terrarium.engine.engine import Terrarium
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
 from kohakuterrarium.testing.output import OutputRecorder
 
@@ -170,7 +170,7 @@ class TestMcpIntegration:
     async def test_manager_lifecycle_with_cross_task_disconnect(
         self, greeter_script, math_script
     ):
-        """The full ``MCPClientManager`` lifecycle as ``core/agent_mcp.py``
+        """The full ``MCPClientManager`` lifecycle as ``core/agent/mcp.py``
         and the meta-tools drive it:
 
         connect a real stdio server (on THIS task — the agent-build task)
@@ -188,7 +188,7 @@ class TestMcpIntegration:
         ``mcp_disconnect`` run in the ``Executor``'s tool task.
         """
         # --- transport-name normalization: the exact mapping
-        # ``core/agent_mcp.py`` relies on before building a config.
+        # ``core/agent/mcp.py`` relies on before building a config.
         assert normalize_mcp_transport("stdio") == "stdio"
         assert normalize_mcp_transport("STDIO") == "stdio"
         assert normalize_mcp_transport("http") == "sse"

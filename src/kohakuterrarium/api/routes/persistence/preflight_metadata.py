@@ -7,17 +7,17 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from kohakuterrarium.session.metadata_candidate import (
+from kohakuterrarium.session.readonly.candidate import (
     MetadataReadError,
     read_metadata_candidate,
 )
-from kohakuterrarium.session.resource_gate import ResourceReleaseError
+from kohakuterrarium.session.occupancy.gate import ResourceReleaseError
 
 MetadataReader = Callable[[str | Path], dict[str, Any]]
 
 
 def _read_metadata(path: str | Path) -> dict[str, Any]:
-    """Read local metadata with admission-controlled copy fallback."""
+    """Read local metadata through admitted or enrolled native handles."""
     return read_metadata_candidate(path, eligible=True).meta
 
 

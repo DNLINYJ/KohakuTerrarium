@@ -1,5 +1,5 @@
 """Unit tests for the typed turn API (E3) —
-:mod:`kohakuterrarium.core.turn` + :mod:`kohakuterrarium.core.agent_turn`.
+:mod:`kohakuterrarium.core.turn` + :mod:`kohakuterrarium.core.agent.turn.run`.
 
 Pins the headline contracts:
 
@@ -27,7 +27,7 @@ from kohakuterrarium.errors import (
     TurnTimeoutError,
 )
 from kohakuterrarium.core.agent import Agent
-from kohakuterrarium.core.config_types import AgentConfig, InputConfig, OutputConfig
+from kohakuterrarium.core.config.types import AgentConfig, InputConfig, OutputConfig
 from kohakuterrarium.core.events import TriggerEvent
 from kohakuterrarium.core.turn import (
     Activity,
@@ -36,11 +36,11 @@ from kohakuterrarium.core.turn import (
     TurnEnded,
 )
 from kohakuterrarium.llm.message import ImagePart, TextPart
-from kohakuterrarium.llm.openai import OpenAIProvider
+from kohakuterrarium.llm.openai.provider import OpenAIProvider
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
-from kohakuterrarium.terrarium.service import _completed_branch_result
-from kohakuterrarium.terrarium.remote_service import _branch_mutation_result
+from kohakuterrarium.terrarium.service.service import _completed_branch_result
+from kohakuterrarium.terrarium.service.remote import _branch_mutation_result
 
 
 def _drive_event(delivery_id="d-1", *, corr_key="delivery_id"):
@@ -79,6 +79,7 @@ async def _build(tmp_path, llm, **kw):
 
 
 class TestRun:
+    @pytest.mark.real_llm_provider
     async def test_accepted_missing_media_records_failed_turn_without_transport(
         self, tmp_path
     ):
@@ -199,7 +200,7 @@ class TestRun:
                 await agent.run("hello", timeout=0.3)
             # The turn was actually unwound — the agent is usable again.
             follow_up = await agent.run("again", raise_on_error=False)
-            assert follow_up.status in ("ok", "error")
+            assert follow_up.status == "ok"
         finally:
             await agent.stop()
 

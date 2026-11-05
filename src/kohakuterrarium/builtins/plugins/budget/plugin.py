@@ -129,6 +129,17 @@ class BudgetPlugin(BasePlugin):
         """Internal :class:`BudgetSet`; ``None`` when no axis is configured."""
         return self._budgets
 
+    def ui_state(self) -> dict[str, Any]:
+        """Per-axis usage for the dashboard's budget panel."""
+        budgets = self._budgets
+        if budgets is None:
+            return {"configured": False, "axes": {}, "hard_walled": False}
+        return {
+            "configured": True,
+            "axes": budgets.snapshot(),
+            "hard_walled": budgets.is_hard_walled(),
+        }
+
     async def on_load(self, context: PluginContext) -> None:  # noqa: ARG002
         return None
 
@@ -192,6 +203,7 @@ class BudgetPlugin(BasePlugin):
         started = self._turn_started_at or time.monotonic()
         self._budgets.tick(turns=1, seconds=max(time.monotonic() - started, 0.0))
         self._pending.extend(self._budgets.drain_alarms())
+        self.ui_emit("state", self.ui_state())
         return None
 
     async def pre_tool_execute(self, args: dict, **kwargs: Any) -> None:
@@ -206,6 +218,7 @@ class BudgetPlugin(BasePlugin):
     async def post_tool_execute(self, result: Any, **kwargs: Any) -> None:
         if self._budgets is not None:
             self._budgets.tick(tool_calls=1)
+            self.ui_emit("state", self.ui_state())
         return None
 
     async def pre_subagent_run(self, task: str, **kwargs: Any) -> str | None:

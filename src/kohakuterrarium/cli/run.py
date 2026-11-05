@@ -22,7 +22,7 @@ from kohakuterrarium.packages.resolve import resolve_any_path
 from kohakuterrarium.studio.hooks import register_group_hooks
 from kohakuterrarium.utils.config_dir import config_dir
 from kohakuterrarium.utils.fd_limit import raise_fd_limit
-from kohakuterrarium.utils.fs_path import coerce_fs_path
+from kohakuterrarium.utils.file.path import coerce_fs_path
 from kohakuterrarium.utils.logging import (
     configure_utf8_stdio,
     enable_stderr_logging,
@@ -35,7 +35,7 @@ logger = get_logger(__name__)
 
 if TYPE_CHECKING:
     from kohakuterrarium.session.store import SessionStore
-    from kohakuterrarium.terrarium.engine import Terrarium
+    from kohakuterrarium.terrarium.engine.engine import Terrarium
 
 _SESSION_DIR = Path.home() / ".kohakuterrarium" / "sessions"
 _IMPORT_SESSION_DIR = _SESSION_DIR
@@ -190,9 +190,11 @@ async def _run(
     extra_channels: list[str],
 ) -> int:
     from kohakuterrarium.session.store import SessionStore
-    from kohakuterrarium.studio.identity import drive_settings
+    from kohakuterrarium.studio.identity.drive_settings import (
+        settings as drive_settings,
+    )
     from kohakuterrarium.terrarium.config import load_terrarium_config
-    from kohakuterrarium.terrarium.engine import Terrarium
+    from kohakuterrarium.terrarium.engine.engine import Terrarium
 
     register_group_hooks()
     pwd = str(Path.cwd())
@@ -264,7 +266,7 @@ async def _run(
 
         try:
             if io_mode == "cli":
-                from kohakuterrarium.terrarium.engine_rich_cli import (
+                from kohakuterrarium.terrarium.engine.cli.rich import (
                     run_engine_with_rich_cli,
                 )
 
@@ -275,7 +277,7 @@ async def _run(
                 )
                 await run_engine_with_rich_cli(engine, focus_creature_id, store)
             elif io_mode == "tui":
-                from kohakuterrarium.terrarium.engine_cli import run_engine_with_tui
+                from kohakuterrarium.terrarium.engine.cli.tui import run_engine_with_tui
 
                 mark_startup(
                     "surface_run_begin",
@@ -323,8 +325,8 @@ async def _apply_cli_topology(
     """
     if not extra_creatures and not extra_channels:
         return
-    import kohakuterrarium.terrarium.channels as channels
-    import kohakuterrarium.terrarium.topology as topology
+    import kohakuterrarium.terrarium.channels.channels as channels
+    import kohakuterrarium.terrarium.graph.topology as topology
 
     for cfg_path in extra_creatures:
         try:

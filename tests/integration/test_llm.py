@@ -47,25 +47,26 @@ from websockets import serve
 
 from kohakuterrarium import Terrarium
 from kohakuterrarium.errors import MediaReferenceError
-from kohakuterrarium.core.agent_budget_recovery import apply_context_repair
-from kohakuterrarium.core.controller import Controller, ControllerConfig
-from kohakuterrarium.core.conversation import Conversation
+from kohakuterrarium.core.agent.turn.budget_recovery import apply_context_repair
+from kohakuterrarium.core.config.types import AgentConfig, ToolConfigItem
+from kohakuterrarium.core.controller.controller import Controller, ControllerConfig
+from kohakuterrarium.core.conversation.conversation import Conversation
 from kohakuterrarium.core.events import create_user_input_event
-from kohakuterrarium.llm import antigravity_auth as agy_auth
-from kohakuterrarium.session.history import (
+from kohakuterrarium.llm.antigravity import auth as agy_auth
+from kohakuterrarium.session.history.replay import (
     replay_conversation,
     normalize_resumable_events,
 )
 from kohakuterrarium.bootstrap.llm import _create_from_profile
-from kohakuterrarium.builtins.tools.grok_image_gen import GrokImageGenTool
-from kohakuterrarium.builtins.tools.read import ReadTool
+from kohakuterrarium.builtins.tools.media.grok_image_gen import GrokImageGenTool
+from kohakuterrarium.builtins.tools.files.read import ReadTool
 from kohakuterrarium.core.registry import Registry
-from kohakuterrarium.core.tool_output import normalize_tool_result
-from kohakuterrarium.llm import api_keys as ak
-from kohakuterrarium.llm import artifact_resolve
-from kohakuterrarium.llm import backends as backends_mod
-from kohakuterrarium.llm import presets as presets_mod
-from kohakuterrarium.llm.backends import (
+from kohakuterrarium.core.tools.output import normalize_tool_result
+from kohakuterrarium.llm.profiles import api_keys as ak
+from kohakuterrarium.llm.media import artifacts as artifact_resolve
+from kohakuterrarium.llm.profiles import backends as backends_mod
+from kohakuterrarium.llm.presets import catalog as presets_mod
+from kohakuterrarium.llm.profiles.backends import (
     _normalize_backend_type,
     legacy_provider_from_data,
     validate_backend_type,
@@ -77,11 +78,11 @@ from kohakuterrarium.llm.base import (
     NativeToolCall,
     ToolSchema,
 )
-from kohakuterrarium.llm.codex_auth import CodexTokens
-from kohakuterrarium.llm.codex_provider import CodexOAuthProvider
-from kohakuterrarium.llm.grok_auth import GROK_CLI_BASE_URL, GrokToken, GrokTokens
-from kohakuterrarium.llm.grok_image_gen import GrokImageClient
-from kohakuterrarium.llm.grok_media import GrokMediaClient
+from kohakuterrarium.llm.codex.auth import CodexTokens
+from kohakuterrarium.llm.codex.provider import CodexOAuthProvider
+from kohakuterrarium.llm.grok.auth import GROK_CLI_BASE_URL, GrokToken, GrokTokens
+from kohakuterrarium.llm.grok.image_gen import GrokImageClient
+from kohakuterrarium.llm.grok.media import GrokMediaClient
 from kohakuterrarium.llm.message import (
     AssistantMessage,
     FilePart,
@@ -96,11 +97,11 @@ from kohakuterrarium.llm.message import (
     make_multimodal_content,
     messages_to_dicts,
 )
-from kohakuterrarium.llm.openai import OpenAIProvider
+from kohakuterrarium.llm.openai.provider import OpenAIProvider
 from kohakuterrarium.studio.attach._event_stream import StreamOutput
-from kohakuterrarium.llm.presets import iter_all_presets, resolve_alias
-from kohakuterrarium.llm.profile_types import LLMBackend, LLMPreset, LLMProfile
-from kohakuterrarium.llm.profiles import (
+from kohakuterrarium.llm.presets.catalog import iter_all_presets, resolve_alias
+from kohakuterrarium.llm.profiles.types import LLMBackend, LLMPreset, LLMProfile
+from kohakuterrarium.llm.profiles.resolve import (
     delete_backend,
     delete_profile,
     get_api_key,
@@ -114,9 +115,12 @@ from kohakuterrarium.llm.profiles import (
     save_profile,
     set_default_model,
 )
-from kohakuterrarium.llm.recovery import RetryPolicy
-from kohakuterrarium.llm.tools import build_provider_native_tools, build_tool_schemas
-from kohakuterrarium.llm.variations import (
+from kohakuterrarium.llm.recovery.errors import RetryPolicy
+from kohakuterrarium.llm.tools.build import (
+    build_provider_native_tools,
+    build_tool_schemas,
+)
+from kohakuterrarium.llm.profiles.variations import (
     apply_patch_map,
     apply_variation_groups,
     deep_merge_dicts,
@@ -129,10 +133,11 @@ from kohakuterrarium.modules.tool.base import (
     ToolContext,
     ToolResult,
 )
-from kohakuterrarium.llm.turn_segments import KT_ASSISTANT_SEGMENTS
+from kohakuterrarium.llm.stream.segments import KT_ASSISTANT_SEGMENTS
 from kohakuterrarium.session.store import SessionStore
 from tests.helpers.anthropic_stream import ANSWER as ANTHROPIC_ANSWER
 from tests.helpers.anthropic_stream import anthropic_provider
+from tests.helpers.parallel_tool_stream import RECORDED_CALLS, parallel_tool_provider
 from tests.helpers.reasoning_stream import (
     ANSWER,
     REASONING_PIECES,
@@ -140,7 +145,7 @@ from tests.helpers.reasoning_stream import (
     reasoning_segments,
 )
 
-pytestmark = pytest.mark.timeout(60)
+pytestmark = [pytest.mark.timeout(60), pytest.mark.real_llm_provider]
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +157,7 @@ pytestmark = pytest.mark.timeout(60)
 def isolated_llm_store(tmp_path, monkeypatch):
     """Isolate ``llm_profiles.yaml`` + ``api_keys.yaml`` via ``KT_CONFIG_DIR``.
 
-    Both ``llm/backends.py`` and ``llm/api_keys.py`` resolve their file
+    Both ``llm/profiles/backends.py`` and ``llm/profiles/api_keys.py`` resolve their file
     paths through ``utils.config_dir.config_dir`` — ``KT_CONFIG_DIR``
     is the single isolation seam (and keeps the suite from writing the
     operator's real ``~/.kohakuterrarium/``).  Tests that write the
@@ -168,7 +173,7 @@ def isolated_llm_store(tmp_path, monkeypatch):
     monkeypatch.setenv("KT_CONFIG_DIR", str(tmp_path))
 
     presets_mod._all_presets_cache = None
-    presets_mod._package_presets_merged = False
+    presets_mod._all_presets_key = None
     monkeypatch.setattr(presets_mod, "list_packages", lambda: [])
     monkeypatch.setattr(CodexTokens, "load", classmethod(lambda cls, path=None: None))
 
@@ -179,7 +184,7 @@ def isolated_llm_store(tmp_path, monkeypatch):
     yield
 
     presets_mod._all_presets_cache = None
-    presets_mod._package_presets_merged = False
+    presets_mod._all_presets_key = None
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +195,7 @@ def isolated_llm_store(tmp_path, monkeypatch):
 class _TranslateTool(BaseTool):
     """A real ``BaseTool`` with no builtin-schema entry.
 
-    Because ``translate`` is not in ``llm/tool_schemas.py:_BUILTIN_SCHEMAS``,
+    Because ``translate`` is not in ``llm/tools/schemas.py:_BUILTIN_SCHEMAS``,
     ``build_tool_schemas`` falls through to the tool's own
     ``get_parameters_schema()`` — the path custom / package tools take.
     """
@@ -485,6 +490,10 @@ class TestLlmIntegration:
             if e["provider"] in ("acme", "acme2")
         }
         assert acme_entries == {("acme", "acme-fast"), ("acme2", "acme-fast")}
+        ak.save_api_key("acme", "catalog-key")
+        assert next(e for e in list_all() if e["provider"] == "acme")["available"]
+        ak.save_api_key("acme", "")
+        assert not next(e for e in list_all() if e["provider"] == "acme")["available"]
 
         # 11. ``delete_backend`` refuses while a preset still binds to it,
         #     and refuses to drop a built-in provider entirely.
@@ -496,6 +505,7 @@ class TestLlmIntegration:
         assert delete_profile("acme-fast", provider="acme2") is True
         assert delete_backend("acme2") is True
         assert "acme2" not in backends_mod.load_backends()
+        assert not any(e["provider"] == "acme2" for e in list_all())
         # A bare-name delete with the name now unique under one provider.
         assert delete_profile("acme-fast") is True
         assert ("acme", "acme-fast") not in load_profiles()
@@ -917,13 +927,13 @@ class TestLlmIntegration:
         # ...and a non-alias name resolves to None (treat as canonical).
         assert resolve_alias("definitely-not-an-alias") is None
 
-        # 11. Package-declared ``llm_presets`` — ``presets._merge_package_presets``
+        # 11. Package-declared ``llm_presets`` — ``preset_packages.merge_package_presets``
         #     scans installed packages and folds NEW (provider, name)
         #     entries into the catalogue without overriding builtins.
         #     The autouse fixture stubbed ``list_packages`` empty; here
         #     we hand it a real package manifest and re-prime the cache.
         presets_mod._all_presets_cache = None
-        presets_mod._package_presets_merged = False
+        presets_mod._all_presets_key = None
         monkeypatch.setattr(
             presets_mod,
             "list_packages",
@@ -961,11 +971,11 @@ class TestLlmIntegration:
         assert not any(n == "no-provider" for (_p, n) in by_key)
         # The builtin codex/gpt-5.4 was NOT overridden by the package.
         assert by_key[("codex", "gpt-5.4")]["model"] != "hijacked"
-        # A second call is served from the cache (merge flag latched).
-        assert presets_mod._package_presets_merged is True
+        # Same installed-package set -> the cached catalogue is reused.
+        assert presets_mod.get_all_presets() is presets_mod.get_all_presets()
         # Reset so the autouse-fixture teardown leaves a clean slate.
         presets_mod._all_presets_cache = None
-        presets_mod._package_presets_merged = False
+        presets_mod._all_presets_key = None
 
     def test_build_tool_schemas_from_registry_workflow(self):
         """Drive the native tool-schema builder over a real registry.
@@ -980,7 +990,7 @@ class TestLlmIntegration:
         registry = Registry()
 
         # ``read`` is a real builtin tool with an entry in _BUILTIN_SCHEMAS.
-        from kohakuterrarium.builtins.tools.read import ReadTool
+        from kohakuterrarium.builtins.tools.files.read import ReadTool
 
         registry.register_tool(ReadTool())
         registry.register_tool(_TranslateTool())
@@ -1211,7 +1221,9 @@ class TestLlmIntegration:
             ),
         )
         assert jpeg_result.success
-        assert jpeg_result.output[1].url == mislabeled.resolve().as_uri()
+        assert jpeg_result.output[1].url == (
+            "data:image/jpeg;base64," + base64.b64encode(expected_jpeg).decode("ascii")
+        )
         mime_wire = messages_to_dicts(
             [
                 UserMessage(
@@ -1674,8 +1686,9 @@ class TestLlmIntegration:
         context = ToolContext(agent_name="vision", session=None, working_dir=tmp_path)
         read_result = await ReadTool().execute({"path": source.name}, context=context)
         assert read_result.success
-        file_reference = read_result.output[1].url
-        assert file_reference == source.resolve().as_uri()
+        read_snapshot = read_result.output[1].url
+        assert read_snapshot == f"data:image/png;base64,{encoded}"
+        file_reference = source.resolve().as_uri()
 
         requests = []
 
@@ -1839,7 +1852,7 @@ class TestLlmIntegration:
             )
             artifact_reference = normalized.output[0].url
             assert artifact_reference.startswith("/api/sessions/media/artifacts/")
-            for reference in (file_reference, artifact_reference):
+            for reference in (read_snapshot, file_reference, artifact_reference):
                 edited = await tool.execute(
                     {"prompt": "add a border", "action": "edit", "image_url": reference}
                 )
@@ -1936,7 +1949,7 @@ class TestLlmIntegration:
                 assert messages_to_dicts(chat_messages) == original_wire
         finally:
             store.close()
-        assert len(requests) == 3
+        assert len(requests) == 4
 
         responses_requests = []
         reasoning_item = {
@@ -2685,11 +2698,10 @@ class TestLlmIntegration:
                         )
                         assert creature.agent.scratchpad.get("discarded") is None
                         assert creature.agent.scratchpad.get("once") == "kept"
-                        if provider_type is CodexOAuthProvider:
-                            assert any(
-                                tool["type"] == "image_generation"
-                                for tool in submissions[0]["tools"]
-                            )
+                        assert not any(
+                            tool["type"] == "image_generation"
+                            for tool in submissions[0].get("tools", [])
+                        )
                         assert all(
                             "request_replay" not in tool
                             for tool in submissions[0].get("tools", [])
@@ -2907,7 +2919,7 @@ class TestLlmIntegration:
                 assert len(submissions) == 5
 
     @pytest.mark.timeout(60)
-    async def test_dual_form_reasoning_stream_workflow(self):
+    async def test_dual_form_reasoning_stream_workflow(self, tmp_path):
         """A provider streaming reasoning in two forms per delta, end to end.
 
         Real ``OpenAIProvider`` over an in-memory HTTP stream: the displayed
@@ -2939,6 +2951,40 @@ class TestLlmIntegration:
             {"type": "reasoning.text", "index": 0, "text": full_text}
         ]
         assert KT_ASSISTANT_SEGMENTS not in echoed
+        await provider.close()
+
+        (tmp_path / "TASK.txt").write_text("PARALLEL_OK", encoding="utf-8")
+        (tmp_path / "notes.md").write_text("notes", encoding="utf-8")
+        parallel_requests = []
+        config = AgentConfig(
+            name="parallel",
+            tools=[ToolConfigItem(name="glob"), ToolConfigItem(name="read")],
+            fork_enabled=False,
+        )
+        async with Terrarium() as engine:
+            worker = await engine.add_creature(
+                config,
+                llm=await parallel_tool_provider(parallel_requests),
+                pwd=tmp_path,
+                io="headless",
+                session=False,
+            )
+            assert (await worker.run("inspect files", timeout=10)).text == "PARALLEL_OK"
+            serialized = worker.agent.controller.conversation.to_json()
+            snapshot = worker.agent.controller.conversation.snapshot_messages()
+            assistant = next(m for m in snapshot if m.get("tool_calls"))
+            assert [c["id"] for c in assistant["tool_calls"]] == [
+                c["id"] for c in RECORDED_CALLS
+            ]
+            assert assistant["_kt_tool_call_extra"] == {
+                RECORDED_CALLS[0]["id"]: RECORDED_CALLS[0]["extra_content"]
+            }
+            assert (await worker.run("continue", timeout=10)).text == "PARALLEL_OK"
+            worker.agent.controller.conversation.clear()
+            for message in Conversation.from_json(serialized).get_messages():
+                worker.agent.controller.conversation.append_message(message)
+            assert (await worker.run("restored", timeout=10)).text == "PARALLEL_OK"
+        assert len(parallel_requests) == 4
 
     @pytest.mark.timeout(60)
     async def test_anthropic_sampling_parameters_workflow(self):

@@ -24,6 +24,12 @@
       <div v-if="selectorAvailable" class="shrink-0">
         <button data-test="subagent-back-to-runs" class="text-[11px] text-iolite hover:underline" @click.stop="backToRuns">← {{ t("chat.subagent.backToRuns") }}</button>
       </div>
+      <div v-if="isSideThread && meta.source" data-test="side-provenance" class="text-xs text-warm-500">Captured turn {{ meta.source.turn_index ?? "—" }} · branch {{ meta.source.branch_id ?? "—" }}</div>
+      <div v-if="isSideThread" class="shrink-0 flex items-center gap-2 text-xs text-warm-500">
+        <button v-if="inheritedCount > 0" data-test="side-context" class="text-iolite dark:text-iolite-light hover:underline" :aria-expanded="showInherited" @click="showInherited = !showInherited">{{ showInherited ? "Hide inherited context" : "Show inherited context" }} ({{ inheritedCount }})</button>
+        <button v-if="live" data-test="side-stop" class="ml-auto rounded px-3 py-2 text-coral bg-coral/10 disabled:opacity-50" :disabled="sending" @click="stopSideThread">Stop side conversation</button>
+      </div>
+      <div v-if="actionError" role="alert" class="text-xs text-coral">{{ actionError }}</div>
       <div data-test="subagent-messages" :class="['flex flex-col gap-2 min-w-0', fill ? 'flex-1 min-h-0 overflow-y-auto' : 'max-h-72 overflow-y-auto']">
         <div v-for="(item, i) in blocks" :key="i" class="min-w-0">
           <template v-if="item.kind === 'system'">
@@ -48,11 +54,15 @@
         <div v-if="!blocks.length" class="text-[11px] text-warm-400 italic">{{ t("chat.subagent.empty") }}</div>
       </div>
       <div v-if="canReceive" class="flex items-end gap-2 pt-1 border-t border-taaffeite/15 dark:border-taaffeite/20">
-        <textarea v-model="sendText" rows="1" :placeholder="t('chat.subagent.placeholder')" class="flex-1 min-w-0 resize-none rounded border border-warm-200 dark:border-warm-700 bg-warm-50 dark:bg-warm-950 px-2 py-1 text-[11px] text-warm-800 dark:text-warm-200 placeholder-warm-400 dark:placeholder-warm-500 focus:outline-none focus:border-taaffeite" @keydown.enter.exact.prevent="submitSend" />
+        <textarea v-model="sendText" rows="1" :placeholder="isSideThread ? 'Ask a follow-up…' : t('chat.subagent.placeholder')" class="flex-1 min-w-0 resize-none rounded border border-warm-200 dark:border-warm-700 bg-warm-50 dark:bg-warm-950 px-2 py-1 text-[11px] text-warm-800 dark:text-warm-200 placeholder-warm-400 dark:placeholder-warm-500 focus:outline-none focus:border-taaffeite" @keydown.enter.exact.prevent="submitSend" />
         <button class="text-[11px] px-2 py-1 rounded bg-taaffeite/20 text-taaffeite-shadow dark:text-taaffeite-light hover:bg-taaffeite/30 disabled:opacity-50 shrink-0" :disabled="sending || !sendText.trim()" @click.stop="submitSend">{{ t("chat.subagent.send") }}</button>
       </div>
       <div v-else class="text-[10px] text-warm-400 italic">{{ t("chat.subagent.readOnly") }}</div>
     </template>
+    <div v-if="sideProcessing" data-test="side-processing" class="kt-transcript-processing shrink-0" role="status" aria-live="polite">
+      <span class="kt-transcript-processing__dot" aria-hidden="true" />
+      <span class="kt-transcript-processing__label">{{ t("chat.processing") }}</span>
+    </div>
   </div>
 </template>
 
@@ -66,7 +76,9 @@ import { useI18n } from "@/utils/i18n"
 
 import MarkdownRenderer from "../../public/chat/MarkdownRenderer.vue"
 import { usePlatformOrigin } from "../../public/chat/platformOrigin.js"
+import AssistantText from "../chat/shared/AssistantText.vue"
 import ConversationMessage from "../chat/shared/ConversationMessage.js"
+import "../chat/shared/chat-transcript-section.css"
 
 const props = defineProps({
   sessionId: { type: String, required: true },
@@ -79,9 +91,10 @@ const props = defineProps({
   depth: { type: Number, default: 0 },
   fill: { type: Boolean, default: false },
   showBack: { type: Boolean, default: false },
+  sideConversation: { type: Boolean, default: false },
 })
 
-defineEmits(["back"])
+const emit = defineEmits(["back", "metadata"])
 
 const { t } = useI18n()
 // The shared platform-origin seam (installed by the host) owns the origin the
@@ -90,13 +103,33 @@ const { t } = useI18n()
 const platformOrigin = usePlatformOrigin()
 const markdownOrigin = computed(() => (platformOrigin !== undefined ? platformOrigin : typeof window !== "undefined" ? window.location.origin : null))
 
-function renderText(content, breaks = false) {
+function renderText(content, breaks = false, options = null) {
+  if (options?.assistant) {
+    return h(AssistantText, { content, breaks, origin: markdownOrigin.value, streaming: options.streaming === true, sayBlocked: t("chat.inlineUi.sendMainChatOnly") })
+  }
   return h(MarkdownRenderer, { content, breaks, origin: markdownOrigin.value })
 }
 
 const loading = ref(false)
 const error = ref("")
 const messages = ref([])
+const meta = ref({})
+const showInherited = ref(false)
+const actionError = ref("")
+const isSideThread = computed(() => props.sideConversation || meta.value.audience === "user")
+const followupPhase = ref("")
+const sideProcessing = computed(() => isSideThread.value && props.live && !error.value && (!!followupPhase.value || (meta.value.status || props.status) === "running"))
+let sideActionRevision = 0
+const inheritedCount = computed(() => {
+  const count = meta.value.inherited_message_count
+  return Number.isInteger(count) && count >= 0 ? count : null
+})
+const visibleMessages = computed(() => {
+  if (!isSideThread.value) return messages.value
+  if (inheritedCount.value == null) return []
+  const visible = showInherited.value ? messages.value : messages.value.slice(inheritedCount.value)
+  return visible.filter((message) => !messageText(message).startsWith("[Private context fork instructions]\n"))
+})
 const candidates = ref([])
 const canReceive = ref(false)
 const sendText = ref("")
@@ -220,13 +253,13 @@ function assistantRenderMessage(message, resultById, index) {
 
 const blocks = computed(() => {
   const resultById = {}
-  for (const message of messages.value) {
+  for (const message of visibleMessages.value) {
     if (message?.role === "tool" && message.tool_call_id != null) {
       resultById[message.tool_call_id] = messageText(message)
     }
   }
   const items = []
-  messages.value.forEach((message, messageIndex) => {
+  visibleMessages.value.forEach((message, messageIndex) => {
     if (message?.role === "tool") return
     if (message?.role === "system") {
       items.push({ kind: "system", text: messageText(message) })
@@ -301,6 +334,7 @@ async function selectCandidate(candidate) {
       run: candidate.run,
     })
     if (disposed || generation !== requestGeneration) return
+    meta.value = data.meta || {}
     messages.value = data.messages || []
     canReceive.value = false
     stage.value = "conversation"
@@ -394,8 +428,10 @@ async function doLoadConversation({ silent = false } = {}) {
     return
   }
   const generation = requestGeneration
+  const actionRevision = sideActionRevision
+  const settlesFollowup = followupPhase.value !== "sending"
   if (!silent) loading.value = true
-  error.value = ""
+  if (!silent || !isSideThread.value) error.value = ""
   candidates.value = []
   selectorAvailable.value = false
   try {
@@ -407,11 +443,21 @@ async function doLoadConversation({ silent = false } = {}) {
           ...ident,
         })
     if (disposed || generation !== requestGeneration) return
+    error.value = ""
+    const nextMeta = data.meta || {}
+    if (isSideThread.value && (actionRevision !== sideActionRevision || !settlesFollowup)) {
+      meta.value = { ...nextMeta, status: meta.value.status }
+    } else {
+      meta.value = nextMeta
+      followupPhase.value = ""
+    }
+    if (isSideThread.value) emit("metadata", { sessionId: props.sessionId, parent: props.parent, jobId: props.jobId, meta: meta.value })
     messages.value = data.messages || []
     canReceive.value = props.live && !!data.can_receive
     stage.value = "conversation"
   } catch (err) {
     if (silent || disposed || generation !== requestGeneration) return
+    followupPhase.value = ""
     messages.value = []
     canReceive.value = false
     if (!props.live && err?.response?.status === 409) {
@@ -429,24 +475,60 @@ async function doLoadConversation({ silent = false } = {}) {
   }
 }
 
+async function runSideCommand(args) {
+  const result = await terrariumAPI.executeCreatureCommand(props.sessionId, props.parent, "btw", args)
+  if (result?.error) throw new Error(result.error)
+}
+
 async function submitSend() {
   const content = sendText.value.trim()
-  if (!content || sending.value || !props.live) return
+  if (!content || sending.value || !props.live || !canReceive.value) return
+  const generation = requestGeneration
   sending.value = true
-  error.value = ""
+  actionError.value = ""
+  if (isSideThread.value) {
+    sideActionRevision += 1
+    followupPhase.value = "sending"
+  }
   try {
-    await terrariumAPI.sendSubagentMessage(props.sessionId, props.parent, props.name, content, props.jobId)
+    if (isSideThread.value) await runSideCommand(`--continue ${props.jobId} ${content}`)
+    else await terrariumAPI.sendSubagentMessage(props.sessionId, props.parent, props.name, content, props.jobId)
+    if (disposed || generation !== requestGeneration) return
     sendText.value = ""
+    if (isSideThread.value) followupPhase.value = "refreshing"
     await loadConversation()
   } catch (err) {
-    error.value = err?.response?.data?.detail || t("chat.subagent.sendFailed")
+    if (!disposed && generation === requestGeneration) {
+      followupPhase.value = ""
+      actionError.value = err?.response?.data?.detail || err?.message || t("chat.subagent.sendFailed")
+    }
   } finally {
-    sending.value = false
+    if (!disposed && generation === requestGeneration) sending.value = false
+  }
+}
+
+async function stopSideThread() {
+  if (sending.value || !props.live || !props.jobId) return
+  const generation = requestGeneration
+  sending.value = true
+  actionError.value = ""
+  try {
+    await runSideCommand(`--stop ${props.jobId}`)
+    if (!disposed && generation === requestGeneration) {
+      sideActionRevision += 1
+      followupPhase.value = ""
+      meta.value = { ...meta.value, status: "cancelled" }
+      await loadConversation()
+    }
+  } catch (err) {
+    if (!disposed && generation === requestGeneration) actionError.value = err?.response?.data?.detail || err?.message || String(err)
+  } finally {
+    if (!disposed && generation === requestGeneration) sending.value = false
   }
 }
 
 function isLive() {
-  return props.status === "running" || canReceive.value
+  return isSideThread.value || props.status === "running" || canReceive.value
 }
 
 function stopPolling() {
@@ -481,6 +563,13 @@ watch([() => props.sessionId, () => props.parent, () => props.jobId, () => props
   stopPolling()
   requestGeneration += 1
   messages.value = []
+  meta.value = {}
+  followupPhase.value = ""
+  sideActionRevision += 1
+  showInherited.value = false
+  actionError.value = ""
+  sending.value = false
+  canReceive.value = false
   candidates.value = []
   error.value = ""
   sendText.value = ""

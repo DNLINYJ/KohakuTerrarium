@@ -664,7 +664,8 @@ def _kohakuvault_version_from_pyproject() -> str | None:
     """Read the kohakuvault dep spec from ``pyproject.toml`` and
     extract a concrete version string for the URL build.
 
-    The spec is ``kohakuvault>=X.Y.Z`` — we use ``X.Y.Z`` as the
+    The spec is ``kohakuvault>=X.Y.Z`` with optional further clauses
+    (``,<2``) — we use ``X.Y.Z`` as the
     version-to-fetch.  Avoids pinning the URL version in two
     places (pyproject + postcreate); operator bumps the floor and
     this script follows.
@@ -677,7 +678,7 @@ def _kohakuvault_version_from_pyproject() -> str | None:
     # by indentation + followed by a comma).  Regex avoids needing
     # a full TOML parser since we only want one value.
     m = re.search(
-        r'"kohakuvault>=([0-9]+\.[0-9]+\.[0-9]+)"',
+        r'"kohakuvault>=([0-9]+\.[0-9]+\.[0-9]+)(?:,[^"]*)?"',
         text,
     )
     return m.group(1) if m else None

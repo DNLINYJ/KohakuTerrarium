@@ -30,25 +30,26 @@ import pytest
 from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
 from kohakuterrarium.builtins.tools import search_memory as _search_memory_mod
-from kohakuterrarium.core import agent_model as _agent_model_mod
+from kohakuterrarium.core.agent import model as _agent_model_mod
 from kohakuterrarium.core.agent import Agent
-from kohakuterrarium.core.conversation import Conversation
+from kohakuterrarium.core.conversation.conversation import Conversation
 from kohakuterrarium.core.events import (
     EventType,
     TriggerEvent,
     create_user_input_event,
 )
-from kohakuterrarium.llm.profile_types import LLMProfile
+from kohakuterrarium.llm.profiles.types import LLMProfile
 from kohakuterrarium.modules.subagent.config import SubAgentConfig
 from kohakuterrarium.modules.tool.base import BaseTool, ExecutionMode, ToolResult
 from kohakuterrarium.modules.trigger.base import BaseTrigger
-from kohakuterrarium.session.embedding import BaseEmbedder
-from kohakuterrarium.session.memory import SessionMemory
-from kohakuterrarium.session.resume import resume_agent
+from kohakuterrarium.session.resume import branch as _resume_branch_mod
+from kohakuterrarium.session.memory.embedding import BaseEmbedder
+from kohakuterrarium.session.memory.index import SessionMemory
+from kohakuterrarium.session.resume.resume import resume_agent
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.studio.studio import Studio
-from kohakuterrarium.terrarium.creature_host import Creature
-from kohakuterrarium.terrarium.engine import Terrarium
+from kohakuterrarium.terrarium.creature.host import Creature
+from kohakuterrarium.terrarium.engine.engine import Terrarium
 from kohakuterrarium.mcp_server.config import MCPToolsConfig
 from kohakuterrarium.mcp_server.runtime import ToolRuntime
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
@@ -57,6 +58,17 @@ pytestmark = pytest.mark.timeout(60)
 
 
 # ── deterministic collaborators ──────────────────────────────────
+
+
+class _CloseTrackedLLM(ScriptedLLM):
+    """Record cleanup of deterministic providers across model switches."""
+
+    def __init__(self, script):
+        super().__init__(script)
+        self.close_calls = 0
+
+    async def close(self):
+        self.close_calls += 1
 
 
 class _HashEmbedder(BaseEmbedder):
@@ -177,7 +189,7 @@ def patched_llm(monkeypatch):
     holder: dict[str, list] = {"script": ["OK"]}
 
     def _fake_create(config, llm=None):
-        return ScriptedLLM(holder["script"])
+        return _CloseTrackedLLM(holder["script"])
 
     monkeypatch.setattr(_bootstrap_llm_mod, "create_llm_provider", _fake_create)
     monkeypatch.setattr(_agent_init_mod, "create_llm_provider", _fake_create)
@@ -429,6 +441,7 @@ class TestProgCreatureJourney:
             assert "switched-model reply" in out5
             assert agent.llm.call_count == 1  # fresh provider, first call
             assert original_llm.call_count == 6  # original untouched after switch
+            assert original_llm.close_calls == 0
 
             # ---- milestone 6: toggle a plugin ------------------------
             # ``budget`` is a catalog plugin — registered-but-disabled
@@ -622,6 +635,7 @@ class TestProgCreatureJourney:
 
         # Engine __aexit__ stopped the creature cleanly.
         assert creature.is_running is False
+        assert original_llm.close_calls == 1
 
         # ---- milestone 9: resume from the .kohakutr store ------------
         # Attach a real store and replay the recorded session into a
@@ -671,9 +685,29 @@ class TestProgCreatureJourney:
             "first recorded question",
             "second recorded question",
         ]
+        recorded_snapshot = record_store.load_conversation("pilot")
+        record_store.save_conversation("pilot", recorded_snapshot)
+        record_store.save_branch_snapshot(
+            "pilot",
+            recorded_snapshot,
+            branch={"turn_index": 2, "branch_id": 2, "parent_branch_path": [(1, 1)]},
+            watermark=record_store.max_event_id("pilot"),
+        )
         record_store.close()
 
-        resumed_agent, resumed_store = resume_agent(session_path)
+        replayed_histories = []
+        replay = _resume_branch_mod.replay_with_settled_tools
+
+        def observe_replay(events, **kwargs):
+            replayed_histories.append(len(events))
+            return replay(events, **kwargs)
+
+        with monkeypatch.context() as tracing:
+            tracing.setattr(
+                _resume_branch_mod, "replay_with_settled_tools", observe_replay
+            )
+            resumed_agent, resumed_store = resume_agent(session_path)
+        assert replayed_histories == [len(resumed_store.get_events("pilot"))]
         await resumed_agent.start()
         try:
             # The resumed conversation, rebuilt from the event log,
@@ -751,7 +785,58 @@ class TestProgCreatureJourney:
             if event["type"] == "user_input"
             and str(event["content"]).startswith("owned input")
         ] == ["owned input one", "owned input two"]
+        checkpoint_messages = [
+            dict(message.to_dict(), metadata=message.metadata)
+            for message in resumed_agent.controller.conversation.get_messages()
+        ]
         resumed_store.close()
+
+        patched_llm["script"] = ["continued regenerated lineage"]
+        continued_agent, continued_store = resume_agent(session_path)
+        try:
+            assert [
+                dict(message.to_dict(), metadata=message.metadata)
+                for message in continued_agent.controller.conversation.get_messages()
+            ] == checkpoint_messages
+            assert (continued_agent._turn_index, continued_agent._branch_id) == (4, 1)
+            assert continued_agent._parent_branch_path == [(1, 1), (2, 2), (3, 1)]
+            assert (
+                continued_agent._pending_resume_events
+                == continued_store.get_resumable_events("pilot")
+            )
+            await continued_agent.start()
+            result = await continued_agent.run("continue regenerated lineage")
+            assert result.text == "continued regenerated lineage"
+            assert (continued_agent._turn_index, continued_agent._branch_id) == (5, 1)
+            assert continued_agent._parent_branch_path == [
+                (1, 1),
+                (2, 2),
+                (3, 1),
+                (4, 1),
+            ]
+        finally:
+            await continued_agent.stop()
+            continued_store.close()
+        verified = SessionStore.open_readonly(session_path)
+        try:
+            continued_users = [
+                event
+                for event in verified.get_events("pilot")
+                if event["type"] == "user_message"
+            ]
+            assert continued_users[-1]["content"] == "continue regenerated lineage"
+            assert (
+                continued_users[-1]["turn_index"],
+                continued_users[-1]["branch_id"],
+            ) == (5, 1)
+            assert continued_users[-1]["parent_branch_path"] == [
+                [1, 1],
+                [2, 2],
+                [3, 1],
+                [4, 1],
+            ]
+        finally:
+            verified.close(update_status=False)
 
         # FTS keyword search finds the EXACT recorded user turn.
         fts_memory = SessionMemory(str(session_path), embedder=None)

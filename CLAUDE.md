@@ -15,8 +15,8 @@ KohakuTerrarium is a Python framework that enables building any kind of agent sy
 - Terrarium templates: `terrariums/`
 - Examples: `examples/` (agent-apps, terrariums, plugins, code)
 - Documentation: `docs/` (en, zh-CN, zh-TW)
-- Max lines per file: 600 (hard max: 1000, enforced by `tests/unit/test_file_sizes.py`)
-- Highly modularized - one responsibility per module
+- File size is capped by AST statements (imports and docstrings excluded): over 500 warns, keep it only for one large coherent unit; over 1000 fails (`tests/unit/test_file_sizes.py`)
+- Highly modularized - one responsibility per module; a family of files sharing a prefix is a sub-package with the prefix dropped, and a class too large for one file is a pseudo-class package (mixins per concern, each owning its state via `_init_<part>_state()`, assembled in one module; see `session/store/README.md` and `core/agent/README.md`)
 
 ### Coding style rules
 
@@ -141,9 +141,14 @@ different size. `tests/README.md` is the full spec; the summary:
 
 Tier discipline: **behavior asserts, not shape asserts** (every mutation
 test observes the side effect); **real collaborators, not mocks** (the
-only seam is the LLM: `kohakuterrarium.testing.llm.ScriptedLLM`,
-monkeypatched at BOTH `bootstrap.llm.create_llm_provider` and
-`bootstrap.agent_init.create_llm_provider`); **to raise integration/e2e
+only seam is the LLM: `kohakuterrarium.testing.llm.ScriptedLLM`, wired by
+`kohakuterrarium.testing.llm_seam`. `tests/conftest.py` applies it to every
+test: all provider factories in `LLM_FACTORY_TARGETS` return `ScriptedLLM`,
+constructing a real provider raises, non-loopback network is blocked, and
+HOME / CODEX_HOME / KT_CONFIG_DIR are tmp. Inject `llm=` where you can;
+tests that build provider classes against fake transports opt out with
+`@pytest.mark.real_llm_provider` or a scoped `with real_llm_providers():`);
+**to raise integration/e2e
 coverage, fatten the existing workflow functions; do NOT add more test
 functions.** Carve-out files (3rd-party providers, platform PTY,
 end-user CLI/UI, the pywebview boot path) are listed in
@@ -184,7 +189,7 @@ engine. Six namespaces: `catalog`, `identity`, `sessions`, `persistence`,
 adapters over Studio. Studio is *not* a UI; it's the shared Python surface UIs
 delegate to.
 
-**Terrarium** (`src/kohakuterrarium/terrarium/engine.py`): the runtime engine
+**Terrarium** (`src/kohakuterrarium/terrarium/engine/engine.py`): the runtime engine
 that hosts every running creature in the process. It runs no LLM and has no
 reasoning loop; those live in the creatures it hosts. What it owns is
 *structure*: which creatures share a connected component, which channels
@@ -195,7 +200,7 @@ multiple disconnected graphs may coexist inside it.
 
 **Creature**: dual concept. (1) Config: a folder with `agent.yaml` +
 `system.md` defining an agent. (2) Runtime: a `Creature` handle
-(`terrarium/creature_host.py`) wrapping a live `Agent` with engine-side
+(`terrarium/creature/host.py`) wrapping a live `Agent` with engine-side
 metadata (`graph_id`, `is_privileged`, `listen_channels`, `send_channels`,
 `parent_creature_id`). Same agent config can run privileged in one terrarium
 and unprivileged in another. Sub-agents inside a creature are VERTICAL
@@ -242,7 +247,7 @@ Tools registered ONLY on privileged nodes:
 
 These are the runtime "graph editor": an LLM-driven privileged node uses
 them to evolve the team mid-run. Mutations go through topology pure
-functions (`terrarium/topology.py`) → environment updates → session
+functions (`terrarium/graph/topology.py`) → environment updates → session
 coordination → emit `EngineEvent`.
 
 ### Channels are broadcast-only at the graph layer
@@ -344,39 +349,29 @@ Stackable events can be batched when occurring simultaneously.
 ```
 src/kohakuterrarium/
 ├── core/                     # Runtime engine
-│   ├── agent.py              # Agent class: orchestrates everything (run_forever main loop)
-│   ├── agent_construct.py    # Agent.build / Agent.from_path constructors (AgentConstructMixin)
-│   ├── agent_turn.py         # Agent.run / Agent.run_stream: typed single-turn drivers
+│   ├── agent/                # Agent pseudo-class package (see agent/README.md):
+│   │                         #   assembly.py builds Agent from mixins; __init__ is a lazy
+│   │                         #   facade. construct, extensions, startup, session, lifecycle,
+│   │                         #   model, workspace, mcp + turn/ (run, drive, interrupt,
+│   │                         #   event_loop, handlers, mid_turn, input, pre_dispatch,
+│   │                         #   budget_recovery), tools/ (dispatch, gate, options, ...),
+│   │                         #   history/ (messages, message_history, selection, compact)
 │   ├── turn.py               # TurnResult / TextChunk / Activity / TurnEnded: typed turn events
-│   ├── agent_lifecycle.py    # Lifecycle helpers (AgentLifecycleMixin)
-│   ├── agent_extensions.py   # Runtime injection: add_tool / add_plugin (AgentExtensionsMixin)
-│   ├── agent_handlers.py     # Event handling, controller loop (AgentHandlersMixin)
-│   ├── agent_tools.py        # Tool/subagent dispatch + bg completion (AgentToolsMixin)
-│   ├── agent_messages.py     # Edit / regenerate / rewind past messages (AgentMessagesMixin)
-│   ├── agent_model.py        # LLM-profile switching (AgentModelMixin)
-│   ├── agent_mcp.py          # MCP init + prompt wiring for Agent
-│   ├── agent_mid_turn.py     # Mid-turn user-input injection + interrupt-buffer drain
-│   ├── agent_workspace.py    # Per-agent runtime working-directory controller
-│   ├── agent_*.py            # Smaller agent helpers: runtime tools, compact-model glue,
-│   │                         #   pre-dispatch plugin chain, native-tool / plugin option
-│   │                         #   overrides, observability + tool metrics, budget recovery
-│   ├── controller.py         # Controller: LLM conversation loop + event queue
-│   │                         #   (+ controller_metrics.py, controller_plugins.py)
-│   ├── conversation.py       # Context management (multimodal aware)
-│   ├── compact.py            # Non-blocking context compaction (+ compact_text.py)
-│   ├── config.py             # Config loading and parsing
-│   ├── config_merge.py       # Inheritance/override merging for agent configs
-│   ├── config_serde.py       # AgentConfig <-> primitive-dict (de)serialization
-│   ├── config_types.py       # Config dataclasses (AgentConfig, InputConfig, etc.)
+│   ├── controller/           # Controller: LLM conversation loop + event queue
+│   │                         #   (controller, context, messages, metrics, plugins, recovery)
+│   ├── conversation/         # Context management (multimodal aware): conversation, elide,
+│   │                         #   sanitize, snapshot, branch, continuation, pinned, ...
+│   ├── compact/              # Non-blocking context compaction (manager, branch, splice, text)
+│   ├── config/               # load (parsing), types (AgentConfig, ...), merge, serde, resolve
+│   ├── jobs/                 # Background job runner: executor, job, label, single_flight,
+│   │                         #   backgroundify (mid-flight direct→background promotion)
+│   ├── tools/                # Tool-call plumbing: dispatch, output (normalization),
+│   │                         #   gate, native_validation, provider_tools, execution_context
 │   ├── constants.py          # Shared constants
 │   ├── channel.py            # Channel primitives (SubAgentChannel, AgentChannel)
 │   ├── events.py             # TriggerEvent + related event types
-│   ├── executor.py           # Background job runner (+ job.py, single_flight.py,
-│   │                         #   backgroundify.py mid-flight direct→background promotion)
 │   ├── budget.py             # Shared budget primitives for agent / sub-agent loops
-│   ├── tool_output.py        # Tool-output normalization + rendering
 │   ├── metrics_hook.py       # Process-wide metrics observation hook
-│   ├── native_tool_validation.py # Provider-native tool option validation
 │   ├── loader.py             # Custom module loading from paths
 │   ├── output_wiring.py      # Turn-end output wiring hook (routes to creature sinks)
 │   ├── registry.py           # Per-agent module registration
@@ -423,31 +418,35 @@ src/kohakuterrarium/
 │   │                         #   function.py = @kohakuterrarium.tool function adapter
 │   │                         #   doc_mode.py = brief / standard / full tier resolution
 │   ├── output/               # State-machine router + output modules
+│   │                         #   router/ (router, state, parsing, multi, interactive, widgets),
+│   │                         #   widgets/ (service, legacy)
 │   ├── subagent/             # Sub-agent lifecycle management
 │   │   ├── base.py           # SubAgent class (conversation loop)
 │   │   ├── result.py         # SubAgentResult, SubAgentJob, framework hints
 │   │   ├── manager.py        # SubAgentManager (spawn, cancel, cleanup)
-│   │   ├── interactive.py    # InteractiveSubAgent (long-running)
-│   │   ├── interactive_mgr.py# InteractiveManagerMixin
+│   │   ├── interactive/      # interactive.py = InteractiveSubAgent (long-running),
+│   │   │                     #   manager.py = InteractiveManagerMixin
 │   │   └── config.py         # SubAgentConfig dataclass
 │   ├── user_command/         # User slash command protocol
 │   └── plugin/               # Plugin protocol: pre/post hooks + callbacks
 │       ├── base.py           # BasePlugin, PluginContext, PluginBlockError
-│       └── manager.py        # PluginManager: runs hooks linearly by priority
+│       └── manager/          # manager.py = PluginManager (hooks run linearly by priority),
+│                             #   commands.py = plugin command registration
 │
 ├── builtins/                 # Built-in implementations
 │   ├── tool_catalog.py       # Global builtin tool lookup (deferred loaders)
 │   ├── subagent_catalog.py   # Global builtin sub-agent lookup
 │   ├── plugin_catalog.py     # Global builtin plugin lookup
-│   ├── tools/                # ~30 general tool classes (read, write, edit, multi_edit,
-│   │                         # glob, grep, tree, bash, python, notebook_read/edit,
-│   │                         # web_search, web_fetch, info, ask_user,
-│   │                         # scratchpad_tool, send_message, stop_task, search_memory,
-│   │                         # skill, image_gen, canvas_preview, show_card, …)
-│   │                         #: group_* terrarium tools live in terrarium/tools_group*.py
+│   ├── tools/                # ~30 general tool classes, families as sub-packages:
+│   │                         # files/ (read, write, edit, multi_edit, glob, grep, tree),
+│   │                         # bash/, notebook/ (read, edit), web/ (fetch, search),
+│   │                         # media/ (image_gen, video_gen, canvas_*), app/ (show_app);
+│   │                         # singles: python, info, ask_user, scratchpad_tool,
+│   │                         # send_message, stop_task, search_memory, skill, show_card, …
+│   │                         #: group_* terrarium tools live in terrarium/tools/
 │   ├── subagents/            # Built-in sub-agent configs
-│   │                         # (coordinator, critic, explore, plan, research, response,
-│   │                         #  summarize, worker, memory_read, memory_write)
+│   │                         # (critic, explore, fork, response, summarize,
+│   │                         #  memory_read, memory_write)
 │   ├── plugins/              # Built-in plugins (sandbox, budget, permgate, compact)
 │   ├── inputs/               # cli, none
 │   ├── outputs/              # stdout, tts, none
@@ -455,8 +454,9 @@ src/kohakuterrarium/
 │   │                         # env, exit, fork, help, jobs, model, module, plugin,
 │   │                         # regen, registry, scratchpad, …)
 │   ├── cli_rich/             # Rich-based CLI UI (default `kt run` frontend)
-│   │                         #: app, runtime, input, output, composer, completer,
-│   │                         #   live_region, blocks/
+│   │                         #: app/ (RichCLIApp + output, multi, pickers, drive parts), runtime,
+│   │                         #   input, output, composer, completer, live_region, blocks/,
+│   │                         #   dialogs/ (settings/, drive/, module_picker/, ...)
 │   └── tui/                  # Textual-based alternative TUI
 │       ├── app.py            # AgentTUI Textual app
 │       ├── input.py          # TUIInput module
@@ -470,27 +470,30 @@ src/kohakuterrarium/
 │
 ├── llm/                      # LLM abstraction
 │   ├── base.py               # LLMProvider protocol
-│   ├── openai.py             # OpenAI-compatible provider (also OpenRouter)
-│   │                         #   (+ openai_helpers.py, openai_sanitize.py, openai_ws.py)
-│   ├── responses_ws.py       # Responses-API WebSocket session (incremental
-│   │                         #   previous_response_id continuation; openai + codex)
-│   ├── anthropic_provider.py # Native Anthropic Messages API provider (official SDK)
-│   │                         #   (+ anthropic_format.py, anthropic_pairing.py, anthropic_cache.py)
-│   ├── codex_provider.py     # Codex OAuth provider (ChatGPT-subscription)
-│   │                         #   (+ codex_auth.py, codex_format.py, codex_image_gen.py,
-│   │                         #      codex_rate_limits.py)
+│   ├── message.py            # Message types (multimodal-aware ContentPart, etc.)
 │   ├── litellm_provider.py   # LiteLLM provider (optional dep)
 │   ├── deferred_provider.py  # Placeholder provider for "no model configured yet"
-│   ├── message.py            # Message types (multimodal-aware ContentPart, etc.)
-│   ├── tools.py              # Native tool schema builders (+ tool_schemas.py)
-│   ├── presets.py            # 50+ model presets (pure data) (+ preset_aliases.py,
-│   │                         #   preset_store.py)
-│   ├── backends.py           # Backend (provider) persistence: YAML store shared with presets
-│   ├── profile_types.py      # LLMBackend / LLMPreset / LLMProfile dataclasses
-│   ├── profiles.py           # Profile resolution + management
-│   ├── variations.py         # `name@group=option` variation selectors
-│   ├── recovery.py           # Provider-boundary recovery helpers
-│   └── api_keys.py           # API key storage/retrieval
+│   ├── openai/               # OpenAI-compatible provider (also OpenRouter):
+│   │                         #   provider, helpers, sanitize, tool_calls, ws
+│   ├── anthropic/            # Native Anthropic Messages API provider (official SDK):
+│   │                         #   provider, format, pairing, cache, images
+│   ├── codex/                # Codex OAuth provider (ChatGPT-subscription):
+│   │                         #   provider, ws, stream, auth, format, rate_limits,
+│   │                         #   web_search, presets, claims, image/{budget,gen}
+│   ├── antigravity/          # Google Antigravity provider (agy credentials)
+│   ├── grok/                 # Grok subscription provider + xAI image/video clients
+│   ├── responses/            # Responses-API transport shared by openai + codex:
+│   │                         #   ws (previous_response_id continuation), ws_options,
+│   │                         #   ws_recovery, reasoning, tools
+│   ├── stream/               # Streaming-turn helpers: segments, tool_progress, replay
+│   ├── recovery/             # errors, context_repair, request_budget, status
+│   ├── media/                # Image preparation, media references, artifact resolution
+│   ├── tools/                # Native tool schema builders (build) + schemas
+│   ├── presets/              # 50+ model presets (catalog, pure data), aliases,
+│   │                         #   groups, packages, store
+│   └── profiles/             # resolve (profile resolution), types (LLMBackend /
+│                             #   LLMPreset / LLMProfile), variations, backends,
+│                             #   backend_registry, api_keys
 │
 ├── prompt/                   # Prompt assembly and templating
 │   ├── aggregator.py         # Gated composition of every framework section
@@ -509,59 +512,76 @@ src/kohakuterrarium/
 ├── commands/                 # Framework commands (##info##, ##read##)
 │
 ├── session/                  # Session persistence (KohakuVault-backed)
-│   ├── store.py              # SessionStore: meta/state/events/channels/subagents/jobs/conversation/fts
-│   │                         #   (+ store_counters.py, store_protocol.py, token_views.py,
-│   │                         #      version.py, errors.py, migrations/)
-│   ├── store_fork.py         # Fork / branch primitive for SessionStore
-│   ├── reader.py             # SessionReader: read a finished .kohakutr without spelunking
-│   ├── output.py             # SessionOutput: captures events via OutputModule
-│   ├── resume.py             # Resume agent/terrarium from .kohakutr file
-│   ├── attach.py             # Attach/detach a store to a live agent
-│   │                         #   (+ agent_attach.py, attachment_service.py)
-│   ├── artifacts.py          # Session-local artifact helpers
+│   ├── store/                # SessionStore pseudo-class package (see store/README.md):
+│   │                         #   assembly.py + lifecycle/ events/ records/ + meta, derived, fork,
+│   │                         #   identity, token_views (key/branch index, artifacts, rollup, snapshot)
+│   ├── vault/                # Native KohakuVault access: handles, io, read
+│   ├── occupancy/            # Session-file admission: gate, registry, family, mutation
+│   ├── readonly/             # metadata, view, reader (SessionReader), candidate
+│   ├── history/              # replay, paging, records, selection, raw, assistant, branch_paths
+│   ├── resume/               # Resume agent/terrarium from .kohakutr: resume, async_flow, build, ...
+│   ├── memory/               # SessionMemory FTS5 + vector search (index), embedding providers
+│   ├── output/               # SessionOutput: captures events via OutputModule (+ activity, widgets)
+│   ├── attach/               # Attach/detach a store to a live agent (agent, service, compat)
 │   ├── session.py            # Async wrapper around a running agent + SessionStore
-│   ├── rollup.py             # Per-turn rollup helpers
 │   ├── sync.py               # Event mirroring across the Laboratory layer
-│   ├── memory.py             # SessionMemory: FTS5 + vector search over events
-│   ├── embedding.py          # Embedding providers (model2vec, sentence-transformer, API)
-│   └── history.py            # Event-history normalization
+│   ├── run_state.py          # Crash-tolerant run records per process boot
+│   └── errors.py             # Session-level exceptions (+ migrations/)
 │
 ├── serving/                  # Web/desktop launch glue (no service manager: Studio/Terrarium
 │   │                         #   own lifecycle; AgentSession / KohakuManager are gone)
-│   ├── web.py                # Static web frontend serving + pywebview desktop app
+│   ├── web.py                # Static web frontend serving (`kt web`)
+│   ├── desktop/              # `kt app` pywebview shell: desktop (window + server child), server
+│   │                         #   (child entry), links (external links), webview_probe (Linux
+│   │                         #   backend check), chrome / titlebar / attention (native chrome)
 │   ├── events.py             # Legacy serving event dataclasses
 │   └── process_metrics.py    # Process-wide metrics aggregator (canonical subscriber)
 │
 ├── terrarium/                # Terrarium runtime engine (multi-agent graphs)
-│   ├── engine.py             # Terrarium engine: graph/session lifecycle, add/remove
+│   ├── engine/               # Terrarium engine: graph/session lifecycle, add/remove
 │   │                         #   creatures, connect/disconnect, subscribe, output wiring
-│   ├── creature_host.py      # Creature handle: chat(), inject_input(), graph metadata
-│   ├── creature.py           # CreatureHandle dataclass (config-level wrapper)
-│   ├── creature_ops.py       # Pure agent-touching helpers shared with studio.sessions
-│   ├── topology.py           # Pure-data graph/channel topology + merge/split deltas
-│   │                         #   (+ topology_snapshot.py runtime snapshot/replay)
+│   │                         #   (engine, creature_add, observability) + cli/ (tui, rich,
+│   │                         #   commands, tabs, output: engine launchers)
+│   ├── creature/             # host (Creature: chat(), inject_input(), graph metadata),
+│   │                         #   handle (CreatureHandle), ids, ops (agent-touching helpers
+│   │                         #   shared with studio.sessions), host_resources
+│   ├── graph/                # topology (pure-data graph/channel model + merge/split deltas),
+│   │                         #   snapshot (runtime snapshot/replay), leftovers, manifest,
+│   │                         #   checkpoint, identity, identity_engine
 │   ├── events.py             # EngineEvent / EventKind / EventFilter observable surface
-│   ├── channels.py           # Channel layer for the engine (+ channel_lifecycle.py)
-│   ├── autosession.py        # Engine-owned session persistence (session_dir autosession)
-│   ├── session_coord.py      # Session merge/split coordination across graphs
-│   ├── recipe.py             # Apply a TerrariumConfig recipe to an engine
-│   ├── resume.py             # Engine-level resume: adopt a saved session
+│   ├── channels/             # Channel layer for the engine (channels) + lifecycle
+│   ├── session/              # Engine-owned session persistence: autosession (session_dir),
+│   │                         #   coord (merge/split across graphs), event_copy, successor,
+│   │                         #   unload, observers
+│   ├── recipe/               # Apply a TerrariumConfig recipe to an engine: loader, apply,
+│   │                         #   discard, identity, transaction, remote
+│   ├── resume/               # Engine-level resume: adopt a saved session (resume, manifest,
+│   │                         #   workspace)
 │   ├── root.py               # assign_root: privileged-node promotion + root wiring
 │   ├── runtime_prompt.py     # Keeps creature system prompts in sync with the group
-│   ├── tools_group*.py       # group_* tool surface (lifecycle, channel, send, status,
-│   │                         #   wire + shared helpers, hooks, caller context)
-│   ├── multi_node_*.py       # Multi-node service: cluster fold, routing, replication,
-│   │                         #   channels (lab-host mode)
-│   ├── service.py            # TerrariumService: runtime abstraction Studio depends on
-│   ├── remote_service.py     # TerrariumService backed by Lab APP calls
-│   ├── wire.py               # Pack/unpack DTO helpers for Laboratory APP transport
-│   ├── wiring.py             # Output-wiring helpers (+ output_wiring.py resolver)
+│   ├── tools/                # group_* tool surface: group (registration), lifecycle,
+│   │                         #   channel, send, status, wire + common helpers, hooks, context
+│   ├── multi_node/           # Multi-node service: service, cluster fold, routing,
+│   │                         #   replication, channels, runtime_options (lab-host mode)
+│   ├── service/              # TerrariumService: runtime abstraction Studio depends on
+│   │                         #   (service, remote via Lab APP calls, dto, wire, history,
+│   │                         #   subagent, local_command, command_inventory)
+│   ├── wiring/               # Output-wiring helpers (wiring) + output resolver
+│   ├── drive/                # Drive runtime resource (see drive/README.md)
 │   ├── observer.py           # ChannelObserver for non-destructive monitoring
 │   ├── output_log.py         # Capture and log creature output
-│   ├── config.py             # Terrarium config loading + topology prompt
-│   ├── engine_cli.py         # Engine TUI launcher (kt run full-screen mode)
-│   ├── engine_rich_cli.py    # Engine rich inline-CLI launcher (--mode cli)
-│   └── cli_output.py         # CLIOutput for headless mode
+│   └── config.py             # Terrarium config loading + topology prompt
+│
+├── studio/                   # Management framework above the engine (see studio/README.md)
+│   ├── studio.py             # Studio facade: catalog / identity / sessions / persistence /
+│   │                         #   editors / attach namespaces
+│   ├── catalog/  identity/   # packages (+ packages/), creatures, modules; settings, API keys,
+│   │                         #   llm/, codex/, grok/, mcp/, drive_settings/
+│   ├── sessions/             # live sessions: creature/ (chat, command, ctl, model, ...),
+│   │                         #   drives/, memory/, cluster/, lifecycle, registry, topology
+│   ├── persistence/          # saved sessions: store, fork, history, resume, artifacts, viewer
+│   ├── editors/              # creature / module editing: codegen/, workspace/, yaml/, CRUD
+│   └── attach/               # attach policies, I/O streams, pty/, workspace/
 │
 ├── api/                      # FastAPI HTTP API (in-package)
 │   ├── app.py                # FastAPI factory + middleware + lifespan
@@ -599,7 +619,7 @@ src/kohakuterrarium/
 │   └── terrarium.py          # Engine test helpers (+ subprocess_seam.py)
 │
 ├── utils/                    # Shared utilities (logging, async helpers, config_dir,
-│                             #   file_guard, file_walk, mobile_sandbox)
+│                             #   mobile_sandbox) + file/ (guard, ignore, lock, walk, path)
 │
 ├── packages/                 # Package install / resolve / git-backend / marketplace
 │   ├── __init__.py           # Lazy public façade (PEP 562): packages.ensure(),
@@ -613,11 +633,12 @@ src/kohakuterrarium/
 │   ├── git_backend.py        # native git + dulwich fallback (Android)
 │   ├── marketplace.py        # TerrariumMarket resolver (fetch + cache + search)
 │   └── marketplace_types.py  # Frozen dataclasses + typed errors
-├── launcher/                 # Thin Briefcase wrapper: owns the managed venv +
-│                             # self-update flow.  STRICT BOUNDARY: launcher/*.py
-│                             # imports nothing from kohakuterrarium.<not launcher>
-│                             # (enforced by tests/unit/test_dep_graph_lint.py).
-│                             # See plans/1.5.0-roadmap/06-app-update/ for design.
+├── launcher/                 # Runtime manager for packaged apps: versioned release trees +
+│                             # self-update.  `sidecar.py` is the headless entry the Tauri
+│                             # shell runs; `interpreter_mode.py` lets the Briefcase stub act
+│                             # as `python`.  STRICT BOUNDARY: launcher/*.py imports nothing
+│                             # from kohakuterrarium.<not launcher> (android.py excepted).
+│                             # See plans/1.5.0-roadmap/06-app-update/ and plans/desktop-app/.
 ├── errors.py                 # Typed exception hierarchy: KTError base; bottom of the
 │                             #   dep graph (imports nothing from kohakuterrarium)
 ├── validate.py               # kt.validate.config/llm/creature/ping: pre-flight checks
@@ -632,13 +653,13 @@ src/kohakuterrarium/
 1. **Agent runtime** (`core/`): Turn-based LLM controller, async non-blocking tool execution, unified TriggerEvent queue, sub-agent dispatch.
 2. **Multi-agent orchestration** (`terrarium/`): The `Terrarium` runtime engine. Channels between creatures, hot-plug with auto merge/split, optional privileged node carrying the `group_*` management tools.
 3. **Session persistence** (`session/`): `.kohakutr` files via KohakuVault (SQLite). Append-only event log + conversation snapshots + sub-agent capture + channel history + scratchpad. Resume via `kt resume`. Listing + search are backed by a sidecar SQLite cache at `<session_dir>/.kt-index.kvault` (`studio/persistence/session_index/`): one file open + FTS5 BM25 query for the whole list endpoint regardless of session count; incremental reconcile via `(mtime,size)` fingerprint diff so unchanged files skip the per-session SQLite open.
-4. **Memory** (`session/memory.py` + `session/embedding.py`): FTS5 + vector search over recorded events. Embedding via model2vec / sentence-transformer / API providers.
+4. **Memory** (`session/memory/index.py` + `session/memory/embedding.py`): FTS5 + vector search over recorded events. Embedding via model2vec / sentence-transformer / API providers.
 5. **HTTP API + Web dashboard** (`api/` + `src/kohakuterrarium-frontend/`): FastAPI REST + WebSocket. Vue 3 frontend served from `web_dist/`. Multi-tab chat, tool accordion, session resume.
 6. **Plugin system** (`modules/plugin/`): Pre/post hooks around tool execution, LLM calls, sub-agent runs, plus fire-and-forget callbacks. `PluginBlockError` in a `pre_tool_execute` becomes the tool result. All plugins run linearly by priority.
 7. **MCP integration** (`mcp/`): Stdio + HTTP transport. Tools indirected through four meta-tools instead of mirrored, which keeps the agent's prompt small.
 8. **Compose algebra** (`compose/`): `>>` sequence, `&` parallel, `|` fallback, `*` retry. User-facing only; framework does not depend on it.
-9. **Package system** (`packages/` + `kt install` / `kt uninstall`): Sharing creature / terrarium / plugin bundles.  Marketplace integration (`packages/marketplace.py` + `kt marketplace …` + `/api/catalog/marketplace/*`) resolves `@<name>` install specs against [TerrariumMarket](https://github.com/Kohaku-Lab/TerrariumMarket) (default source; user-configurable list at `~/.kohakuterrarium/marketplace-sources.json`).  Cache at `~/.kohakuterrarium/marketplace/cache.json` (1h TTL, ETag-revalidated, `KT_MARKETPLACE_CACHE_TTL` overridable, `KT_MARKETPLACE_SOURCES` env override).  Frontend Settings → Extensions tab is now a two-pane Catalog view (Browse + Installed) backed by `stores/marketplace.js` + `utils/marketplaceApi.js`.
-10. **Desktop packaging** (`__briefcase__.py` + briefcase tooling): macOS / Windows / Linux native app builds.
+9. **Package system** (`packages/` + `kt install` / `kt uninstall`): Sharing creature / terrarium / plugin bundles.  Marketplace integration (`packages/marketplace/marketplace.py` + `kt marketplace …` + `/api/catalog/marketplace/*`) resolves `@<name>` install specs against [TerrariumMarket](https://github.com/Kohaku-Lab/TerrariumMarket) (default source; user-configurable list at `~/.kohakuterrarium/marketplace-sources.json`).  Cache at `~/.kohakuterrarium/marketplace/cache.json` (1h TTL, ETag-revalidated, `KT_MARKETPLACE_CACHE_TTL` overridable, `KT_MARKETPLACE_SOURCES` env override).  Frontend Settings → Extensions tab is now a two-pane Catalog view (Browse + Installed) backed by `stores/marketplace.js` + `utils/marketplaceApi.js`.
+10. **Desktop packaging** (`packaging/desktop/`, a Tauri 2 shell): Windows / macOS installers that bundle a real interpreter, the launcher and one release tree and run the Python backend as a sidecar behind a per-launch token (`api/auth/launch_token.py`). The page talks to either shell (pywebview or Tauri) only through `utils/hostBridge.js`. `__briefcase__.py` + Briefcase remain for Android; see `packaging/desktop/README.md`.
 11. **Auth** (`api/auth/`): four optional layers stacked at the API server: L1 host selection (frontend), L2 host token (middleware), L3 admin token (FastAPI Depends on config-mutating routes), L4 user accounts (sqlite + per-user `Terrarium` engine pool). Defaults to OFF; see `plans/1.5.0-roadmap/03-frontend-backend-connection/` + `docs/{en,zh-CN,zh-TW}/guides/authentication.md`.
 
 ## Auth invariant (CRITICAL)
@@ -664,7 +685,7 @@ the launcher's strict-isolation rule.
 
 Plugin context (`PluginContext`) exposes: `agent_name`, `working_dir`, `session_id`, `model`, `switch_model()`, `inject_event()`, plus plugin-scoped `get_state()` / `set_state()` persisted to the session store.
 
-Loaded by `bootstrap/plugins.py`. Manager calls live in `core/agent_handlers.py` (pre-LLM) and `core/agent_tools.py` (pre/post tool, pre/post sub-agent).
+Loaded by `bootstrap/plugins.py`. Manager calls live in `core/agent/turn/handlers.py` (pre-LLM) and `core/agent/tools/dispatch.py` (pre/post tool, pre/post sub-agent).
 
 ## MCP Integration
 
@@ -696,18 +717,22 @@ Pure async combinators with zero framework coupling beyond `terrarium/`. Nothing
 
 Two payloads reach the model each turn: the assembled system prompt and the
 native tool schemas. For a 20-callable creature the schemas are the larger half,
-so prompt-size work that ignores `llm/tools.py` is optimizing the smaller one.
+so prompt-size work that ignores `llm/tools/build.py` is optimizing the smaller one.
 
 `prompt/aggregator.py` composes the prompt from **gated** sections. The rule:
 **a block whose subject does not exist is not emitted.** An inapplicable block
 is worse than a missing one — it teaches the model something false.
 
 1. **Base prompt from system.md** — always. Personality and domain judgment only.
+1b. **`## Presenting your answer`** — only when a plugin returns a part from
+   `BasePlugin.presentation_contribution()` (inline UI while a client draws
+   `kt.ui`, full-page apps while `show_app` is visible). Framework opening
+   and closing lines around the parts; `prompt_renderers` refreshes it.
 2. **`## Available Functions`** — only when `tool_format != "native"` or
    `tool_doc_mode == "full"`. Native providers already carry the inventory.
 3. **`## Function Documentation`** — only for tools resolved to `full`.
 4. **`## Tool guidance`** — `BaseTool.prompt_contribution()`, cache-stable order.
-5. **Plugin contributions** — `modules/plugin/manager.py`.
+5. **Plugin contributions** — `modules/plugin/manager/manager.py`.
 6. **`## Skills`** — byte-budgeted procedural-skill index.
 7. **`## Working with the group`** / **`## Growing the group`** — injected by
    `terrarium/runtime_prompt.py` only when the creature is actually in a graph /
@@ -720,7 +745,9 @@ is worse than a missing one — it teaches the model something false.
 `tool_doc_mode` is `brief` | `standard` (default) | `full`, overridable per tool
 with `doc_mode` on a `tools:` entry. Files in `builtin_skills/` split at
 `## Reference`: above it is the **usage** tier that `full` inlines, below it is
-reachable only through `info`, in every mode.
+reachable only through `info`, in every mode. Plugins serve their own topics
+through `info("<doc_prefix>:<topic>")` (`BasePlugin.doc_prefix` / `doc_topic`);
+`ui.declarative` keeps its less common components there as `ui:<name>`.
 
 ### What Goes Where
 
@@ -728,7 +755,7 @@ reachable only through `info`, in every mode.
 |---------|----------|
 | Agent personality / role / domain judgment | `system.md` |
 | What is true about the runtime (dispatch, channels, graph) | framework blocks |
-| Tool name + one-line description (≤160 chars, with a "Not for" clause) | tool class, mirrored in the doc frontmatter |
+| Tool name + one-line description (≤160 chars): what it does, then a "Use it when/to …" trigger, then optionally "Not for X - use Y" | tool class, mirrored in the doc frontmatter |
 | Argument tables, behavior, limits | `builtin_skills/<tool>.md` above `## Reference` |
 | Output formats, edge cases, worked failures | below `## Reference` |
 | A procedure for a task | a skill, not a creature prompt |
@@ -745,6 +772,12 @@ reachable only through `info`, in every mode.
    `tests/unit/test_tool_doc_shape.py` enforces that.
 5. **NEVER add a framework section without asserting its gate in both
    directions** — present when true, absent when false.
+6. **NEVER introduce a tool by its prohibitions** — every description and
+   guidance block leads with a positive trigger ("Use it when …", "Dispatch it
+   to …"). A "Not for X - use Y" clause is optional, comes last, and names one
+   specific wrong use and the tool to use instead. Text that only says when a
+   tool is *allowed* ("only when", "sparingly", "do not use unless") teaches
+   the model that not calling it is safest.
 
 ### Budget
 
@@ -788,7 +821,7 @@ Sessions store everything in a `.kohakutr` file (SQLite via KohakuVault):
 
 Resume rebuilds the agent from config and injects the saved conversation.
 
-Key files: `session/store.py`, `session/output.py`, `session/resume.py`, `session/history.py`.
+Key files: `session/store/`, `session/output/output.py`, `session/resume/resume.py`, `session/history/replay.py`.
 
 ## CI Matrix
 

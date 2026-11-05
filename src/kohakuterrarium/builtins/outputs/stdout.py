@@ -5,7 +5,7 @@ from typing import TextIO
 
 from kohakuterrarium.llm.message import content_display_text
 from kohakuterrarium.modules.output.base import BaseOutputModule
-from kohakuterrarium.session.history import (
+from kohakuterrarium.session.history.replay import (
     dedupe_adjacent_duplicate_events,
     select_live_event_ids,
 )
@@ -144,6 +144,18 @@ class StdoutOutput(BaseOutputModule):
         """Reset prefix and streaming state for the next turn."""
         self._has_output = False
         self._streaming = False
+
+    def on_activity_with_metadata(
+        self, activity_type: str, detail: str, metadata: dict
+    ) -> None:
+        """Present side-conversation notices independently of assistant framing."""
+        if activity_type not in ("btw_started", "btw_result"):
+            return
+        job_id = metadata.get("job_id", "")
+        status = "error" if metadata.get("error") else "side conversation"
+        text = detail or str(metadata.get("error") or "")
+        _write_safe(sys.stdout, f"\n[btw {job_id} · {status}]\n{text}\n[/btw]\n")
+        sys.stdout.flush()
 
     async def on_resume(self, events: list[dict]) -> None:
         """Render a bounded summary of live session history after resume."""

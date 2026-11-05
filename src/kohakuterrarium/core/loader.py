@@ -6,7 +6,10 @@ import sys
 from pathlib import Path
 from typing import Any, TypeVar
 
-from kohakuterrarium.packages.resolve import resolve_package_path
+from kohakuterrarium.packages.resolve import (
+    ensure_module_importable,
+    resolve_package_path,
+)
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -175,7 +178,7 @@ class ModuleLoader:
     def _load_from_package(self, module_path: str, class_name: str) -> type:
         """Load class from installed package."""
         try:
-            module = importlib.import_module(module_path)
+            module = self._import_package_module(module_path)
         except ImportError as e:
             raise ModuleLoadError(
                 f"Cannot import package '{module_path}'. "
@@ -194,6 +197,18 @@ class ModuleLoader:
             package=module_path,
         )
         return cls
+
+    @staticmethod
+    def _import_package_module(module_path: str) -> Any:
+        """Import a dotted module, retrying once after locating its installed package."""
+        try:
+            return importlib.import_module(module_path)
+        except ModuleNotFoundError as e:
+            top = module_path.split(".", 1)[0]
+            if e.name != top or not ensure_module_importable(module_path):
+                raise
+            importlib.invalidate_caches()
+            return importlib.import_module(module_path)
 
     def clear_cache(self) -> None:
         """Clear loaded module cache."""

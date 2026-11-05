@@ -96,7 +96,39 @@ def _package_record(
         "prompts": manifest.get("prompts", []),
         "templates": manifest.get("templates", []),
         "drive_registrations": manifest.get("drive_registrations", []),
+        "llm_backends": manifest.get("llm_backends", []),
+        "ui": manifest.get("ui") or {},
     }
+
+
+def _manifest_mtime(root: Path | None) -> int:
+    if root is None:
+        return 0
+    for name in ("kohaku.yaml", "kohaku.yml"):
+        try:
+            return (root / name).stat().st_mtime_ns
+        except OSError:
+            continue
+    return 0
+
+
+def packages_fingerprint() -> tuple:
+    """Cheap identity of the installed-package set, for caches built from it.
+
+    Changes when a package is installed, removed, or its manifest is edited.
+    Uses ``stat`` only; no manifest is parsed.
+    """
+    root = _packages_dir()
+    entries: list[tuple] = [(str(root),)]
+    if root.is_dir():
+        for entry in sorted(root.iterdir()):
+            if entry.suffix == LINK_SUFFIX:
+                target = read_link(entry.stem)
+                entries.append((entry.name, _manifest_mtime(target), str(target)))
+            elif entry.is_dir():
+                entries.append((entry.name, _manifest_mtime(entry)))
+    entries.append(("", _manifest_mtime(get_package_root(LOCAL_PROJECT_NAME))))
+    return tuple(entries)
 
 
 def _list_packages_uncached() -> list[dict]:

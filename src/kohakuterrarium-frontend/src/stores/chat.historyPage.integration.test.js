@@ -1,7 +1,12 @@
+import { mount } from "@vue/test-utils"
 import { createPinia, setActivePinia } from "pinia"
+import { defineComponent, h, nextTick } from "vue"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { useChatStore } from "./chat"
 import { indexOfSemanticKey, semanticKey } from "@/components/chat/chatRenderWindow"
+import TabItem from "@/components/shell/TabItem.vue"
+import { useAttentionEffects } from "@/composables/useAttentionEffects"
+import { clearAttentionRegistry, subscribeAttention, workForScope } from "@/stores/attention"
 import api, { sessionAPI, terrariumAPI } from "@/utils/api"
 
 function event(id, type = "user_message", extra = {}) {
@@ -43,6 +48,7 @@ const content = (chat) =>
   )
 let chat
 beforeEach(() => {
+  clearAttentionRegistry()
   setActivePinia(createPinia())
   chat = useChatStore()
   chat._instanceId = "instance"
@@ -115,6 +121,68 @@ describe("paged history consumers", () => {
     vi.mocked(terrariumAPI.getHistoryPage).mockResolvedValueOnce(page([], { after: "a60" }))
     await chat._resyncHistory("root", { initialLoad: true })
     expect(chat.messagesByTab.root.length).toBe(merged)
+
+    const inline = [
+      { type: "text", text: "caption" },
+      {
+        type: "file",
+        file: { name: "a.bin", data_base64: "A".repeat(1024 * 1024) },
+        extension: { nested: [{ value: "original" }] },
+      },
+      { type: "vendor", extension: { value: [null, { keep: true }] } },
+    ]
+    const source = event(70, "user_message", { content: inline, pending_id: "inline-id" })
+    api.mockResolvedValueOnce(page([source], { older: false }))
+    await chat.initHistoryPage("root")
+    const row = chat.messagesByTab.root[0]
+    const echo = structuredClone(inline)
+    chat._onMessage({ type: "user_input", source: "root", pending_id: "inline-id", content: echo })
+    expect(chat.messagesByTab.root[0]).toBe(row)
+    expect(chat.messagesByTab.root).toHaveLength(1)
+    row.rawContent[2].extension.value[1].keep = false
+    echo[1].extension.nested[0].value = "echo changed"
+    expect(source.content[2].extension.value[1].keep).toBe(true)
+    expect(row.rawContent[1].extension.nested[0].value).toBe("original")
+    api.mockResolvedValueOnce(page([source], { older: false }))
+    await chat.initHistoryPage("root")
+    expect(chat.messagesByTab.root[0].rawContent[2].extension.value[1].keep).toBe(true)
+    expect(source.content[1].file.data_base64).toHaveLength(1024 * 1024)
+
+    chat.tabs = ["root", "bob"]
+    chat.messagesByTab.bob = []
+    chat.runningJobs = {}
+    api.mockImplementation(async (_session, target) => ({
+      ...page([event(80, "text", { content: target })], { older: false }),
+      live_job_ids: [`${target}-job`],
+    }))
+    for (const order of [
+      ["root", "bob"],
+      ["bob", "root"],
+    ]) {
+      for (const target of order) await chat.initHistoryPage(target)
+      expect(chat.runningJobs).toMatchObject({
+        "root-job": { tab: "root" },
+        "bob-job": { tab: "bob" },
+      })
+    }
+    chat._onMessage({
+      type: "activity",
+      activity_type: "tool_done",
+      source: "root",
+      job_id: "bob-job",
+    })
+    expect(chat.runningJobs["bob-job"].tab).toBe("bob")
+    for (const target of ["bob", "root"]) {
+      chat._onMessage({
+        type: "activity",
+        activity_type: "tool_done",
+        source: target,
+        job_id: `${target}-job`,
+      })
+      expect(chat.runningJobs[`${target}-job`]).toBeUndefined()
+      if (target === "bob") expect(chat.runningJobs["root-job"].tab).toBe("root")
+    }
+    expect(chat.runningJobs).toEqual({})
   })
 
   it("keeps a delayed older response cache-only and rejects materialization after history mutation", async () => {
@@ -166,14 +234,79 @@ describe("paged history consumers", () => {
     await chat.initHistoryPage("root")
     expect(chat.attentionByTab.root.pending).toEqual(new Set(["prompt"]))
     expect(chat._appliedMaxEventIdByTab.root).toBe(70)
+
+    chat._onMessage({ type: "ui_supersede", source: "root", event_id: "prompt" })
+    const favicon = document.createElement("link")
+    favicon.rel = "icon"
+    favicon.href = "/favicon.ico"
+    document.head.append(favicon)
+    const wrapper = mount(
+      defineComponent({
+        setup() {
+          useAttentionEffects()
+          return () =>
+            h(TabItem, { tab: { id: "attach:default", kind: "attach", target: "default" } })
+        },
+      }),
+    )
+    try {
+      const prompts = ["ask-replied", "ask-expired"].map((widgetId, index) =>
+        event(71 + index, "widget", {
+          widget_id: widgetId,
+          renderer: "kt.ask_text",
+          interactive: true,
+          spec: { prompt: widgetId },
+        }),
+      )
+      vi.mocked(terrariumAPI.getHistoryPage).mockResolvedValueOnce(page(prompts, { older: false }))
+      await chat.initHistoryPage("root")
+      await nextTick()
+      expect(wrapper.find('[title="pending attention"]').text()).toBe("!")
+      expect(decodeURIComponent(favicon.href)).toContain("#dc2626")
+
+      chat._ws = { readyState: WebSocket.OPEN, send: vi.fn() }
+      expect(chat.submitUIReply("root", "ask-replied", "submit", { text: "answer" })).toBe(true)
+      const closes = []
+      for (const [index, reason] of ["replied", "timeout"].entries()) {
+        const widgetId = prompts[index].widget_id
+        chat._onMessage({
+          type: "widget_close",
+          source: "root",
+          event_id: widgetId,
+          payload: { reason },
+        })
+        closes.push(event(73 + index, "widget_close", { widget_id: widgetId, reason }))
+        expect(chat.attentionSummary("root").pending).toBe(1 - index)
+        await nextTick()
+        expect(wrapper.find('[title="pending attention"]').exists()).toBe(index === 0)
+        if (index === 0) expect(decodeURIComponent(favicon.href)).toContain("#dc2626")
+      }
+      expect(chat.messagesByTab.root[0].replied).toBe(true)
+      expect(chat.messagesByTab.root[1].timedOut).toBe(true)
+      expect(favicon.getAttribute("href")).toBe("/favicon.ico")
+
+      vi.mocked(terrariumAPI.getHistoryPage).mockResolvedValueOnce(
+        page([...prompts, ...closes], { older: false }),
+      )
+      await chat.initHistoryPage("root")
+      await nextTick()
+      expect(chat.attentionSummary("root").pending).toBe(0)
+      expect(wrapper.find('[title="pending attention"]').exists()).toBe(false)
+      expect(favicon.getAttribute("href")).toBe("/favicon.ico")
+    } finally {
+      wrapper.unmount()
+      favicon.remove()
+    }
   })
 
   it("reuses the saved source for older reads, maps channel messages, and never starts saved jobs", async () => {
     const api = vi
       .spyOn(sessionAPI, "getHistoryPage")
-      .mockResolvedValueOnce(
-        page([{ _history_key: "c20", sender: "a", content: "new" }], { stream: "channel" }),
-      )
+      .mockResolvedValueOnce({
+        ...page([{ _history_key: "c20", sender: "a", content: "new" }], { stream: "channel" }),
+        live_job_ids: ["alice-job", "bob-job"],
+        is_processing: true,
+      })
       .mockResolvedValueOnce(
         page([{ _history_key: "c10", sender: "b", content: "old" }], {
           stream: "channel",
@@ -182,6 +315,8 @@ describe("paged history consumers", () => {
       )
     const live = vi.spyOn(terrariumAPI, "getHistoryPage")
     await chat.initHistoryPage("root", { kind: "saved", sessionName: "saved-one" })
+    expect(chat.runningJobs).toEqual({})
+    expect(chat.processingByTab.root).toBe(false)
     await chat.prefetchOlderHistory("root")
     chat.materializeOlderHistory("root")
     expect(content(chat)).toEqual(["old", "new"])
@@ -189,6 +324,16 @@ describe("paged history consumers", () => {
     expect(api.mock.calls[1].slice(0, 2)).toEqual(["saved-one", "root"])
     expect(live).not.toHaveBeenCalled()
     expect(chat.runningJobs).toEqual({})
+    api.mockResolvedValueOnce({
+      ...page([event(40, "text", { content: "saved reply" })], { older: false }),
+      live_job_ids: ["alice-job", "bob-job"],
+      is_processing: true,
+    })
+    await chat.initHistoryPage("root", { kind: "saved", sessionName: "saved-one" })
+    expect(content(chat)).toEqual(["saved reply"])
+    expect(chat.runningJobs).toEqual({})
+    expect(chat.processingByTab.root).toBe(false)
+    expect(live).not.toHaveBeenCalled()
   })
 
   it("uses explicit snapshot fallback only for an empty event source", async () => {
@@ -204,6 +349,33 @@ describe("paged history consumers", () => {
     await chat.initHistoryPage("root")
     expect(api.mock.calls[1][2]).toMatchObject({ stream: "snapshot", limit: 400 })
     expect(content(chat)).toEqual(["snapshot"])
+  })
+
+  it("a session that started empty reads events on refresh, so replies get their turn ids", async () => {
+    const turn = { turn_index: 1, branch_id: 1 }
+    const api = vi
+      .spyOn(terrariumAPI, "getHistoryPage")
+      .mockResolvedValueOnce(page([], { before: null, after: null, older: false }))
+      .mockResolvedValueOnce(
+        page([], { stream: "snapshot", before: null, after: null, older: false }),
+      )
+      .mockResolvedValueOnce(
+        page(
+          [
+            event(1, "user_input", { ...turn, content: "hi" }),
+            event(2, "processing_start", turn),
+            event(3, "text", { ...turn, content: "hello" }),
+            event(4, "processing_end", turn),
+          ],
+          { before: null, older: false },
+        ),
+      )
+    await chat.initHistoryPage("root")
+    expect(api.mock.calls[1][2]).toMatchObject({ stream: "snapshot" })
+    await chat.refreshHistoryHead("root")
+    expect(api.mock.calls[2][2].stream).toBeUndefined()
+    const reply = chat.messagesByTab.root.find((m) => m.role === "assistant")
+    expect(reply).toMatchObject({ turnIndex: 1, branchId: 1 })
   })
 
   it("preserves duplicate provenance and remaps an assistant boundary after older text merges", async () => {
@@ -325,6 +497,95 @@ describe("paged history consumers", () => {
     expect(chat.processingByTab.root).toBe(true)
     expect(chat.attentionByTab.root).toBe(attention)
     expect(chat.historyPageByTab.root.hasNewer).toBe(true)
+
+    const branches = [1, 2].map((branch) =>
+      event(600 + branch, "tool_call", {
+        turn_index: 20,
+        branch_id: branch,
+        name: "build",
+        job_id: `branch-${branch}`,
+        ts: 1,
+        args: {},
+      }),
+    )
+    const both = ["branch-1", "branch-2"]
+    chat.branchViewByTab.root = { 20: 1 }
+    api.mockResolvedValueOnce(page(branches, { live_job_ids: both, older: false }))
+    await chat.initHistoryPage("root")
+    expect(chat.runningJobCountForTab("root")).toBe(2)
+    expect(chat.runningJobs["branch-2"].startedAt).toBe(1000)
+    expect(
+      chat.messagesByTab.root
+        .flatMap((m) => m.parts || [])
+        .filter((p) => p.type === "tool")
+        .map((p) => p.jobId),
+    ).toEqual(["branch-1"])
+    expect(chat.selectBranch(20, 2, "root")).toBe(true)
+    expect(chat.runningJobCountForTab("root")).toBe(2)
+    expect(
+      chat.messagesByTab.root
+        .flatMap((m) => m.parts || [])
+        .filter((p) => p.type === "tool")
+        .map((p) => p.jobId),
+    ).toEqual(["branch-2"])
+    api.mockResolvedValueOnce(page([], { live_job_ids: both, older: false }))
+    await chat.refreshHistoryHead("root")
+    expect(chat.runningJobCountForTab("root")).toBe(2)
+    expect(chat.runningJobs["branch-2"].startedAt).toBe(1000)
+    api.mockResolvedValueOnce(page([], { live_job_ids: ["branch-2"], older: false }))
+    await chat.refreshHistoryHead("root")
+    expect(chat.runningJobCountForTab("root")).toBe(1)
+    expect(chat.runningJobs["branch-2"].startedAt).toBe(1000)
+    expect(chat.selectBranch(20, 1, "root")).toBe(true)
+    expect(chat.runningJobCountForTab("root")).toBe(1)
+    expect(
+      chat.messagesByTab.root
+        .flatMap((m) => m.parts || [])
+        .filter((p) => p.type === "tool")
+        .map((p) => [p.jobId, p.status]),
+    ).toEqual([["branch-1", "interrupted"]])
+    api.mockResolvedValueOnce(page([], { live_job_ids: [], older: false }))
+    await chat.refreshHistoryHead("root")
+    expect(chat.runningJobCountForTab("root")).toBe(0)
+
+    api.mockResolvedValueOnce(page([], { live_job_ids: ["outside-page"], older: true }))
+    const observed = []
+    const stop = subscribeAttention(() => observed.push(workForScope("default")))
+    try {
+      await chat.initHistoryPage("root")
+    } finally {
+      stop()
+    }
+    expect(observed.length).toBeGreaterThan(0)
+    expect(
+      observed.every((work) => work.busy && work.status === "running" && work.started === 0),
+    ).toBe(true)
+    expect(chat.runningJobCountForTab("root")).toBe(1)
+    expect(workForScope("default")).toMatchObject({ busy: true, status: "running", started: 0 })
+    api.mockResolvedValueOnce(
+      page(
+        [
+          event(800, "tool_call", { name: "build", job_id: "outside-page", ts: 2, args: {} }),
+          event(801, "tool_result", { name: "build", job_id: "other-job", output: "other result" }),
+        ],
+        { live_job_ids: ["outside-page"], older: false },
+      ),
+    )
+    await chat.initHistoryPage("root")
+    expect(chat.runningJobCountForTab("root")).toBe(1)
+    expect(chat.runningJobs["outside-page"].name).toBe("build")
+    expect(chat.runningJobs["outside-page"].startedAt).toBe(2000)
+    const rendered = chat.messagesByTab.root
+      .flatMap((m) => m.parts || [])
+      .filter((p) => p.type === "tool")
+    expect(rendered.map((p) => [p.jobId, p.status, p.result])).toEqual([
+      ["outside-page", "running", ""],
+      ["other-job", "done", "other result"],
+    ])
+    api.mockResolvedValueOnce(page([], { live_job_ids: [], older: false }))
+    await chat.initHistoryPage("root")
+    expect(chat.runningJobCountForTab("root")).toBe(0)
+    expect(workForScope("default").busy).toBe(false)
   })
 })
 

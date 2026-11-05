@@ -11,6 +11,7 @@ import {
   MAX_IMAGE_BYTES,
   validateAttachment,
 } from "@/utils/chatAttachments"
+import { snapshotContent } from "./contentSnapshot.js"
 import { useMessageActions } from "./messageActions.js"
 
 /** Extract plain text from content that may be a string or array of content parts. */
@@ -254,7 +255,7 @@ export function useMessageRowActions({ props, chat, messageTab, writeClipboard, 
     const capturedAttachments = state.editAttachments.map((item) => ({ ...item }))
     const capturedText = state.editText
     const capturedSource = Array.isArray(state.editSourceContent)
-      ? JSON.parse(JSON.stringify(state.editSourceContent))
+      ? snapshotContent(state.editSourceContent)
       : state.editSourceContent
     const viewIsCurrent = () =>
       alive &&

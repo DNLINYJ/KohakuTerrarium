@@ -20,8 +20,14 @@ import types
 
 import pytest
 
-from kohakuterrarium.cli import entry_cli, entry_tui
+from kohakuterrarium.cli.entry import cli as entry_cli
+from kohakuterrarium.cli.entry import tui as entry_tui
 from kohakuterrarium.cli import resume as resume_mod
+from kohakuterrarium.core.config.types import AgentConfig
+from kohakuterrarium.studio.identity.drive_settings.settings import save_settings
+from kohakuterrarium.terrarium.drive.config import DriveRuntimeConfig
+from kohakuterrarium.terrarium.engine.engine import Terrarium
+from kohakuterrarium.testing.llm import ScriptedLLM
 
 
 class _FakeEngine:
@@ -47,7 +53,7 @@ class _FakeStore:
 
 class _FakeTerrarium:
     @staticmethod
-    async def resume(store, *, pwd=None, llm=None):
+    async def resume(store, *, pwd=None, llm=None, **kwargs):
         return _FakeEngine()
 
 
@@ -69,6 +75,50 @@ def _install_run_fakes(monkeypatch) -> list:
 
 
 class TestResumeRunRouting:
+    @pytest.mark.parametrize("enabled", [False, True])
+    async def test_resume_uses_current_managed_drive_settings(
+        self, tmp_path, monkeypatch, enabled
+    ):
+        path = tmp_path / "resume.kohakutr"
+        async with Terrarium(drive_config=DriveRuntimeConfig(enabled=False)) as engine:
+            creature = await engine.add_creature(
+                AgentConfig(name="worker"),
+                session=path,
+                pwd=tmp_path,
+                llm=ScriptedLLM(["saved reply"]),
+                io="headless",
+                start=True,
+            )
+            assert (await creature.run("saved question")).text == "saved reply"
+
+        save_settings(
+            {
+                "runtime": {"enabled": enabled, "max_pending_per_graph": 23},
+                "registrations": {"generic": {"enabled": True}},
+            }
+        )
+        observed = []
+
+        async def inspect(engine, focus, store):
+            runtime = engine._drive_runtime
+            assert (runtime is not None) is enabled
+            if enabled:
+                assert runtime.config.max_pending_per_graph == 23
+                assert [r.descriptor.name for r in runtime.snapshot.entries] == [
+                    "generic"
+                ]
+            worker = engine.get_creature(focus)
+            assert (await worker.run("next question")).text == "resumed reply"
+            observed.append(store.get_events("worker"))
+
+        monkeypatch.setattr(resume_mod, "run_engine_with_rich_cli", inspect)
+        assert (
+            await resume_mod._run(path, None, ScriptedLLM(["resumed reply"]), "cli")
+            == 0
+        )
+        assert observed
+        assert any(e.get("content") == "saved question" for e in observed[0])
+
     @pytest.mark.parametrize("io_mode", ["cli", "plain"])
     def test_cli_and_plain_route_to_rich(self, monkeypatch, io_mode):
         calls = _install_run_fakes(monkeypatch)

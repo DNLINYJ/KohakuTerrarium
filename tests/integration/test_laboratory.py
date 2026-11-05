@@ -11,11 +11,17 @@ failure, push detection down into a unit test FIRST, then fix.
 """
 
 import asyncio
+import hashlib
 
 import pytest
 from fastapi import WebSocketDisconnect
 
 from kohakuterrarium.api.routes.identity.grok import grok_usage
+from kohakuterrarium.errors import ConflictError
+from kohakuterrarium.studio.sessions.creature.subagents import (
+    read_subagent_conversation_async,
+    send_to_subagent,
+)
 from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
 from kohakuterrarium.laboratory.config import ClientConfig, HostConfig
@@ -25,7 +31,7 @@ from kohakuterrarium.laboratory._internal.client import (
     RequestTimeoutError,
 )
 from kohakuterrarium.laboratory._internal.host import HostEngine
-from kohakuterrarium.laboratory._internal.transport_inproc import InProcTransport
+from kohakuterrarium.laboratory._internal.transport.inproc import InProcTransport
 from kohakuterrarium.laboratory.adapters import (
     StudioCatalogAdapter,
     StudioDeployAdapter,
@@ -42,17 +48,18 @@ from kohakuterrarium.laboratory.adapters import (
 )
 from kohakuterrarium.laboratory.adapters._worker_session import WorkerSessionAttacher
 from kohakuterrarium.laboratory.identity_cache import IdentityCache
-from kohakuterrarium.llm.api_keys import (
+from kohakuterrarium.laboratory.file_transfer import stream_write_path
+from kohakuterrarium.llm.profiles.api_keys import (
     clear_api_key_resolver,
     register_api_key_resolver,
 )
 from kohakuterrarium.studio.nodes import NodeMap
 from kohakuterrarium.studio.studio import Studio
 from kohakuterrarium.studio.sessions import lifecycle as session_lifecycle
-from kohakuterrarium.session.readonly import read_session_meta
-from kohakuterrarium.terrarium.graph_manifest import MANIFEST_KEY
+from kohakuterrarium.session.readonly.metadata import read_session_meta
+from kohakuterrarium.terrarium.graph.manifest import MANIFEST_KEY
 from kohakuterrarium.studio.attach.io import attach_io
-from kohakuterrarium.studio.catalog.packages import install_package_op
+from kohakuterrarium.studio.catalog.packages.packages import install_package_op
 from kohakuterrarium.terrarium import Terrarium
 from kohakuterrarium.terrarium.drive.config import (
     DriveRuntimeConfig,
@@ -63,10 +70,10 @@ from kohakuterrarium.terrarium.drive.errors import (
     DrivePermissionError,
 )
 from kohakuterrarium.terrarium.drive.models import ActorRef, DriveStatus
-from kohakuterrarium.terrarium.drive.multi_node import DriveHomeUnavailableError
+from kohakuterrarium.terrarium.drive.multi_node.homes import DriveHomeUnavailableError
 from kohakuterrarium.terrarium.drive.requests import CreateDriveRequest
-from kohakuterrarium.terrarium.multi_node_service import MultiNodeTerrariumService
-from kohakuterrarium.terrarium.service import LocalTerrariumService
+from kohakuterrarium.terrarium.multi_node.service import MultiNodeTerrariumService
+from kohakuterrarium.terrarium.service.service import LocalTerrariumService
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
 
 from tests.helpers.grok_usage_script import (
@@ -83,6 +90,11 @@ from tests.helpers.grok_usage_script import (
 pytestmark = pytest.mark.timeout(60)
 
 LAB_TOKEN = "lab-integration-token"
+
+
+class _ForkingLLM(ScriptedLLM):
+    def fork(self, **kwargs):
+        return _ForkingLLM(self.script)
 
 
 def _write_creature_config(root, name: str) -> str:
@@ -150,7 +162,7 @@ def scripted_llm(monkeypatch):
     }
 
     def _create(config, llm=None):
-        return ScriptedLLM(holder["script"])
+        return _ForkingLLM(holder["script"])
 
     monkeypatch.setattr(_bootstrap_llm_mod, "create_llm_provider", _create)
     monkeypatch.setattr(_agent_init_mod, "create_llm_provider", _create)
@@ -288,6 +300,35 @@ class TestLaboratoryMultiNodeService:
         service.add_remote("w2")
 
         try:
+            source = tmp_path / "stream-source.bin"
+            for payload in (b"", bytes(range(256)) * 3200):
+                source.write_bytes(payload)
+                checksum = hashlib.sha256(payload).hexdigest()
+                written = await stream_write_path(
+                    host_engine_lab,
+                    "w1",
+                    "config://",
+                    "resume/stream-probe.bin",
+                    source,
+                )
+                assert written == {"written": len(payload), "sha256": checksum}
+                remote_stat = await host_engine_lab.request(
+                    to_node="w1",
+                    namespace="terrarium.files",
+                    type="stat",
+                    body={"scope": "config://", "path": "resume/stream-probe.bin"},
+                    timeout=5,
+                )
+                assert remote_stat["stat"]["sha256"] == checksum
+                assert remote_stat["stat"]["size"] == len(payload)
+                deleted = await host_engine_lab.request(
+                    to_node="w1",
+                    namespace="terrarium.files",
+                    type="delete",
+                    body={"scope": "config://", "path": "resume/stream-probe.bin"},
+                    timeout=5,
+                )
+                assert deleted == {}
             with monkeypatch.context() as usage_patch:
                 grok_home = install_grok_home(tmp_path, usage_patch)
                 patch_cli_version_probe(usage_patch)
@@ -323,7 +364,7 @@ class TestLaboratoryMultiNodeService:
             # The service routes recipe spawn through the host engine.
             # In lab-host mode the API endpoint 501s, but the host engine
             # itself can still load + apply a recipe — exercising
-            # terrarium/recipe.py, terrarium/root.py, terrarium/config.py.
+            # terrarium/recipe/loader.py, terrarium/root.py, terrarium/config.py.
             from pathlib import Path
             from kohakuterrarium.terrarium.config import (
                 ChannelConfig,
@@ -387,7 +428,7 @@ class TestLaboratoryMultiNodeService:
             assert len(creatures) == 0
 
             # ── 5. add_creature on w1 (path-form via studio.deploy) ──
-            from kohakuterrarium.core.config import load_agent_config
+            from kohakuterrarium.core.config.load import load_agent_config
 
             with pytest.raises(KeyError, match="Package not installed"):
                 await service.add_creature("@missing/creatures/general", on_node="w1")
@@ -434,6 +475,61 @@ class TestLaboratoryMultiNodeService:
             with pytest.raises(ValueError):
                 await service.chat_history_page(
                     alpha_info.creature_id, before="malformed"
+                )
+
+            snapshot = await service.capture_context(alpha.creature_id)
+            assert snapshot.messages == alpha.capture_context().messages
+            assert snapshot.provenance == w1_engine.capture_context(alpha).provenance
+            parent_messages = alpha.agent.controller.conversation.to_messages()
+            side = await service.execute_command(
+                alpha.creature_id, "btw", "private worker question"
+            )
+            assert side["error"] is None
+            side_id = side["data"]["job_id"]
+            await alpha.agent.subagent_manager.wait_for(side_id)
+            side_read = await read_subagent_conversation_async(
+                service, "cluster-display-id", alpha.creature_id, job_id=side_id
+            )
+            assert side_read["session_id"] == "cluster-display-id"
+            assert side_read["meta"]["audience"] == "user"
+            assert side_read["can_receive"] is True
+            assert "private worker question" in str(side_read["messages"])
+            sent = await send_to_subagent(
+                service,
+                alpha.graph_id,
+                alpha.creature_id,
+                "fork",
+                "private followup",
+                job_id=side_id,
+            )
+            assert sent["job_id"] == side_id
+            await alpha.agent.subagent_manager.wait_for(side_id)
+            saved = alpha.agent.session_store.find_subagent_run(
+                side_id, parent=alpha.agent.subagent_manager._parent_name
+            )
+            assert saved["meta"]["audience"] == "user"
+            alpha.agent.subagent_manager._jobs.pop(side_id)
+            restored = await service.read_subagent_conversation(
+                alpha.creature_id, job_id=side_id
+            )
+            assert restored["live"] is False
+            assert restored["can_receive"] is True
+            assert "private followup" in str(restored["messages"])
+            await service.send_to_subagent(
+                alpha.creature_id, "fork", "reopened followup", job_id=side_id
+            )
+            await alpha.agent.subagent_manager.wait_for(side_id)
+            assert alpha.agent.controller.conversation.to_messages() == parent_messages
+            task_id = await alpha.agent.subagent_manager.spawn(
+                "fork", "ordinary task", background=False
+            )
+            with pytest.raises(ConflictError):
+                await service.send_to_subagent(
+                    alpha.creature_id, "fork", "must not restart", job_id=task_id
+                )
+            with pytest.raises(KeyError):
+                await service.read_subagent_conversation(
+                    alpha.creature_id, job_id="absent"
                 )
 
             b_cfg = load_agent_config(cfg_bravo)
@@ -558,8 +654,8 @@ class TestLaboratoryMultiNodeService:
             # Create two isolated host-side creatures with attached
             # session stores, then connect them so the engine
             # auto-merges + the SessionCoordinator copies / preserves
-            # session state.  Hits terrarium/session_coord.py paths.
-            from kohakuterrarium.core.config import load_agent_config
+            # session state.  Hits terrarium/session/coord.py paths.
+            from kohakuterrarium.core.config.load import load_agent_config
             from kohakuterrarium.session.store import SessionStore
             from pathlib import Path as _P
 
@@ -1027,9 +1123,9 @@ class TestLaboratoryDeepWorkflows:
         """
         from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
         from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
-        from kohakuterrarium.terrarium.engine import Terrarium
+        from kohakuterrarium.terrarium.engine.engine import Terrarium
         from kohakuterrarium.session.store import SessionStore
-        from kohakuterrarium.core.config import load_agent_config
+        from kohakuterrarium.core.config.load import load_agent_config
         from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
 
         sessions_dir = tmp_path / "sess"
@@ -1153,7 +1249,7 @@ class TestLaboratoryModulesViaAgent:
         from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
         from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
         from kohakuterrarium.core.agent import Agent
-        from kohakuterrarium.core.config_types import (
+        from kohakuterrarium.core.config.types import (
             AgentConfig,
             InputConfig,
             OutputConfig,
@@ -1294,7 +1390,7 @@ class TestLaboratoryModulesViaAgent:
         from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
         from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
         from kohakuterrarium.core.agent import Agent
-        from kohakuterrarium.core.config_types import (
+        from kohakuterrarium.core.config.types import (
             AgentConfig,
             InputConfig,
             OutputConfig,
@@ -1379,7 +1475,7 @@ class TestLaboratoryModulesViaAgent:
     async def test_output_router_state_machine(self, tmp_path):
         """OutputRouter routes parse events to the right output module.
         Mirrors test_modules.py::test_output_router_state_machine."""
-        from kohakuterrarium.modules.output.router import OutputRouter
+        from kohakuterrarium.modules.output.router.router import OutputRouter
         from kohakuterrarium.testing.output import OutputRecorder
 
         from kohakuterrarium.modules.output.event import OutputEvent
@@ -1405,13 +1501,13 @@ class TestLaboratoryModulesViaAgent:
         self, tmp_path, monkeypatch
     ):
         """Deep chat workflow exercising core/agent_messages,
-        core/conversation, core/tool_output, core/controller,
+        core/conversation, core/tools/output, core/controller,
         core/agent_handlers, core/agent_tools through multiple tool
         calls + tool result feedback into the controller."""
         from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
         from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
         from kohakuterrarium.core.agent import Agent
-        from kohakuterrarium.core.config_types import (
+        from kohakuterrarium.core.config.types import (
             AgentConfig,
             InputConfig,
             OutputConfig,
@@ -1538,7 +1634,7 @@ class TestLaboratoryModulesViaAgent:
         from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
         from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
         from kohakuterrarium.core.agent import Agent
-        from kohakuterrarium.core.config_types import (
+        from kohakuterrarium.core.config.types import (
             AgentConfig,
             InputConfig,
             OutputConfig,
@@ -1638,18 +1734,18 @@ class TestLaboratoryAdapterDirect:
         from kohakuterrarium.laboratory.config import ClientConfig, HostConfig
         from kohakuterrarium.laboratory._internal.client import ClientConnector
         from kohakuterrarium.laboratory._internal.host import HostEngine
-        from kohakuterrarium.laboratory._internal.transport_inproc import (
+        from kohakuterrarium.laboratory._internal.transport.inproc import (
             InProcTransport,
         )
         from kohakuterrarium.laboratory.adapters import (
             TerrariumEventsAdapter,
             TerrariumRuntimeAdapter,
         )
-        from kohakuterrarium.terrarium.engine import Terrarium
+        from kohakuterrarium.terrarium.engine.engine import Terrarium
         from kohakuterrarium.testing.llm import ScriptedLLM
         from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
         from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
-        from kohakuterrarium.core.config import load_agent_config
+        from kohakuterrarium.core.config.load import load_agent_config
 
         cdir = tmp_path / "evt_creature"
         cdir.mkdir(parents=True, exist_ok=True)
@@ -1703,7 +1799,7 @@ class TestLaboratoryAdapterDirect:
             try:
                 # Build the MultiNodeTerrariumService so the demux is
                 # constructed once and used by every RemoteTerrariumService.
-                from kohakuterrarium.terrarium.multi_node_service import (
+                from kohakuterrarium.terrarium.multi_node.service import (
                     MultiNodeTerrariumService,
                 )
 

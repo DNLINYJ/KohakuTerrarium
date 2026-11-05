@@ -2,8 +2,10 @@ import { mount } from "@vue/test-utils"
 import { defineComponent, nextTick } from "vue"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
-const { navigation, prefs, edgeState, i18n } = vi.hoisted(() => ({
+const { navigation, prefs, edgeState, i18n, shellState, submitReply } = vi.hoisted(() => ({
   navigation: vi.fn(),
+  shellState: {},
+  submitReply: vi.fn(),
   prefs: {
     systemNotifications: true,
     notifyWaiting: true,
@@ -37,11 +39,19 @@ vi.mock("@/stores/attention", async () => {
   }
 })
 vi.mock("@/stores/attentionPrefs", () => ({ useAttentionPrefs: () => ({ state: prefs }) }))
+vi.mock("@/composables/useShellSettings", () => ({
+  useShellSettings: () => ({ settings: { value: shellState } }),
+}))
+vi.mock("@/stores/chat", () => ({
+  useChatStore: (scope) => ({ submitUIReply: (...args) => submitReply(scope, ...args) }),
+}))
 vi.mock("@/utils/attentionNavigation", () => ({
   navigateToAttention: navigation,
   attentionTargetLabel: ({ scope, tab }) => `${scope}/${tab}`,
 }))
 vi.mock("@/utils/i18n", () => ({ useI18n: () => ({ t: i18n.t }) }))
+
+import { clearAttentionRegistry, createAttentionState, publishAttention } from "@/stores/attention"
 
 import { useAttentionEffects } from "./useAttentionEffects"
 
@@ -201,6 +211,265 @@ describe("useAttentionEffects", () => {
 
     expect(request).toHaveBeenCalledWith()
     expect(Notification).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  describe("approval buttons on the system notification", () => {
+    const gate = {
+      scope: "graph-a",
+      tab: "root",
+      kind: "waiting-input",
+      eventId: "gate1",
+      prompt: "Allow tool: bash?",
+      detail: "ls -la",
+      options: [
+        { id: "allow_once", label: "Allow once", style: "primary" },
+        { id: "allow_session", label: "Always allow", style: "secondary" },
+        { id: "deny", label: "Deny", style: "danger" },
+      ],
+    }
+
+    async function mountWithShell(shell, { toastShown = true } = {}) {
+      const toast = vi.fn().mockResolvedValue(toastShown)
+      const plain = vi.fn().mockResolvedValue(true)
+      window.pywebview = {
+        api: {
+          get_desktop_capabilities: vi.fn().mockResolvedValue({
+            surface: "desktop",
+            protocol: 1,
+            notifications: true,
+            notificationActions: shell.supported !== false,
+          }),
+          show_action_notification: toast,
+          show_notification: plain,
+        },
+      }
+      shellState.notifyActions = shell.enabled
+      const wrapper = mountEffects()
+      await nextTick()
+      await Promise.resolve()
+      return { toast, plain, wrapper }
+    }
+
+    beforeEach(() => {
+      submitReply.mockReset()
+      submitReply.mockReturnValue(true)
+      delete shellState.notifyActions
+    })
+
+    it("offers the primary and deny answers, and sends the pressed one to the prompt", async () => {
+      const { toast, plain, wrapper } = await mountWithShell({ enabled: true })
+
+      edgeState.listener(gate)
+      await Promise.resolve()
+
+      const [title, body, actions, token] = toast.mock.calls[0]
+      expect(title).toBe("Allow tool: bash?")
+      expect(body).toBe("graph-a/root · ls -la")
+      expect(actions).toEqual([
+        { id: "allow_once", label: "Allow once" },
+        { id: "deny", label: "Deny" },
+      ])
+      expect(plain).not.toHaveBeenCalled()
+
+      window.dispatchEvent(
+        new CustomEvent("kt:desktop-notification-action", { detail: { token, id: "deny" } }),
+      )
+      expect(submitReply).toHaveBeenCalledWith("graph-a", "root", "gate1", "deny")
+      expect(navigation).not.toHaveBeenCalled()
+      wrapper.unmount()
+    })
+
+    it("opens the prompt when the notification body is clicked or the reply cannot be sent", async () => {
+      const { toast, wrapper } = await mountWithShell({ enabled: true })
+
+      edgeState.listener(gate)
+      edgeState.listener({ ...gate, eventId: "gate2" })
+      await Promise.resolve()
+      const press = (call, id) =>
+        window.dispatchEvent(
+          new CustomEvent("kt:desktop-notification-action", {
+            detail: { token: toast.mock.calls[call][3], id },
+          }),
+        )
+      press(0, null)
+      expect(navigation).toHaveBeenCalledTimes(1)
+      expect(submitReply).not.toHaveBeenCalled()
+
+      submitReply.mockReturnValue(false)
+      press(1, "allow_once")
+      expect(navigation).toHaveBeenCalledTimes(2)
+      wrapper.unmount()
+    })
+
+    it("hides the tool's detail when previews are off", async () => {
+      prefs.notificationPreview = false
+      const { toast, wrapper } = await mountWithShell({ enabled: true })
+
+      edgeState.listener(gate)
+      await Promise.resolve()
+
+      expect(toast.mock.calls[0][1]).toBe("graph-a/root")
+      wrapper.unmount()
+    })
+
+    it("sends a plain notification when the setting is off, unsupported, or refused", async () => {
+      for (const shell of [{ enabled: false }, { enabled: true, supported: false }]) {
+        const { toast, plain, wrapper } = await mountWithShell(shell)
+        edgeState.listener(gate)
+        await Promise.resolve()
+        expect(toast).not.toHaveBeenCalled()
+        expect(plain).toHaveBeenCalledTimes(1)
+        wrapper.unmount()
+      }
+
+      const { toast, plain, wrapper } = await mountWithShell(
+        { enabled: true },
+        { toastShown: false },
+      )
+      edgeState.listener(gate)
+      await vi.waitFor(() => expect(plain).toHaveBeenCalledTimes(1))
+      expect(toast).toHaveBeenCalledTimes(1)
+      wrapper.unmount()
+    })
+
+    it("offers no buttons for a prompt that is not a confirm, nor for a completion", async () => {
+      const { toast, plain, wrapper } = await mountWithShell({ enabled: true })
+      prefs.notifyCompletion = true
+
+      edgeState.listener({ scope: "graph-a", tab: "root", kind: "waiting-input" })
+      edgeState.listener({ ...gate, kind: "completed" })
+      await Promise.resolve()
+
+      expect(toast).not.toHaveBeenCalled()
+      expect(plain).toHaveBeenCalledTimes(2)
+      wrapper.unmount()
+    })
+  })
+
+  it("sends enabled inactive edges to the shell's native notifications when it offers them", async () => {
+    const show = vi.fn().mockResolvedValue(true)
+    window.pywebview = {
+      api: {
+        get_desktop_capabilities: vi.fn().mockResolvedValue({
+          surface: "desktop",
+          protocol: 1,
+          notifications: true,
+        }),
+        show_notification: show,
+      },
+    }
+    const Notification = vi.fn()
+    Notification.permission = "granted"
+    vi.stubGlobal("Notification", Notification)
+    const wrapper = mountEffects()
+    await nextTick()
+    await Promise.resolve()
+
+    edgeState.listener({ scope: "graph-a", tab: "root", kind: "completed" })
+    edgeState.listener({ scope: "graph-a", tab: "root", kind: "waiting-input" })
+    await Promise.resolve()
+
+    expect(show).toHaveBeenCalledTimes(1)
+    expect(show).toHaveBeenCalledWith(
+      "attention.notify.waitingTitle",
+      "attention.notify.waitingBody: target=graph-a/root",
+    )
+    expect(Notification).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it("shows the attention counts on the shell's tray and opens the first waiting tab on request", async () => {
+    const setCount = vi.fn().mockResolvedValue(true)
+    window.pywebview = {
+      api: {
+        get_desktop_capabilities: vi
+          .fn()
+          .mockResolvedValue({ surface: "desktop", protocol: 1, trayBadge: true }),
+        set_attention_state: setCount,
+      },
+    }
+    clearAttentionRegistry()
+    const wrapper = mountEffects()
+    await nextTick()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(setCount).toHaveBeenLastCalledWith({ waiting: 0, failed: 0, running: 0, finished: 0 })
+
+    publishAttention("graph-a", "root", { ...createAttentionState(), completed: 2 })
+    publishAttention("graph-b", "helper", {
+      ...createAttentionState(),
+      pending: new Set(["ask-1"]),
+      processing: true,
+      errors: 1,
+    })
+    await Promise.resolve()
+    expect(setCount).toHaveBeenLastCalledWith({ waiting: 1, failed: 1, running: 1, finished: 2 })
+    const calls = setCount.mock.calls.length
+    publishAttention("graph-b", "helper", {
+      ...createAttentionState(),
+      pending: new Set(["ask-1"]),
+      processing: true,
+      errors: 1,
+    })
+    expect(setCount.mock.calls.length).toBe(calls)
+
+    window.dispatchEvent(new Event("kt:desktop-focus-attention"))
+    expect(navigation).toHaveBeenLastCalledWith({ scope: "graph-b", tab: "helper" })
+
+    clearAttentionRegistry()
+    window.dispatchEvent(new Event("kt:desktop-focus-attention"))
+    expect(navigation).toHaveBeenCalledTimes(1)
+    wrapper.unmount()
+    window.dispatchEvent(new Event("kt:desktop-focus-attention"))
+    expect(navigation).toHaveBeenCalledTimes(1)
+    clearAttentionRegistry()
+  })
+
+  it("does not touch the tray when the shell does not offer a badge", async () => {
+    const setCount = vi.fn().mockResolvedValue(true)
+    window.pywebview = {
+      api: {
+        get_desktop_capabilities: vi.fn().mockResolvedValue({ surface: "desktop", protocol: 1 }),
+        set_attention_state: setCount,
+      },
+    }
+    clearAttentionRegistry()
+    const wrapper = mountEffects()
+    await nextTick()
+    await Promise.resolve()
+    publishAttention("graph-a", "root", { ...createAttentionState(), completed: 1 })
+    await Promise.resolve()
+    expect(setCount).not.toHaveBeenCalled()
+    wrapper.unmount()
+    clearAttentionRegistry()
+  })
+
+  it("stays silent on the desktop when the shell has no notifications or the user opted out", async () => {
+    const show = vi.fn().mockResolvedValue(true)
+    window.pywebview = {
+      api: {
+        get_desktop_capabilities: vi
+          .fn()
+          .mockResolvedValue({ surface: "desktop", protocol: 1, notifications: false }),
+        show_notification: show,
+      },
+    }
+    const wrapper = mountEffects()
+    await nextTick()
+    await Promise.resolve()
+
+    edgeState.listener({ scope: "graph-a", tab: "root", kind: "waiting-input" })
+    prefs.systemNotifications = false
+    window.pywebview.api.get_desktop_capabilities.mockResolvedValue({
+      surface: "desktop",
+      protocol: 1,
+      notifications: true,
+    })
+    edgeState.listener({ scope: "graph-a", tab: "root", kind: "waiting-input" })
+    await Promise.resolve()
+
+    expect(show).not.toHaveBeenCalled()
     wrapper.unmount()
   })
 

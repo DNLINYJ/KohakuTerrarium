@@ -4,7 +4,9 @@ The plugin is implemented entirely through standard plugin hooks and the
 output-event bus. Empty ``gated_tools`` means every non-allowlisted tool.
 """
 
-from typing import Any
+from copy import deepcopy
+from types import SimpleNamespace
+from typing import Any, Callable
 from uuid import uuid4
 
 from kohakuterrarium.modules.output.event import OutputEvent
@@ -25,6 +27,7 @@ class PermGatePlugin(BasePlugin):
         "wait — configure ``gated_tools`` / ``allowlist`` to scope it."
     )
     priority = 100  # Approval sees the arguments after earlier plugins rewrite them.
+    inherit_fork_policy = True
 
     @classmethod
     def option_schema(cls) -> dict[str, dict[str, Any]]:
@@ -83,6 +86,32 @@ class PermGatePlugin(BasePlugin):
         # Session approvals intentionally disappear when the plugin instance ends.
         self._session_approvals: set[str] = set()
         self._context: PluginContext | None = None
+
+    def fork_tool_policy(self) -> Callable[..., Any]:
+        """Gate a fork with live options and approvals private to that child."""
+        approvals: set[str] = set()
+
+        async def gate(args: dict, **kwargs: Any) -> None:
+            policy = PermGatePlugin(**deepcopy(self.get_options()))
+            policy._session_approvals = self._session_approvals | approvals
+            tool_name = kwargs.get("tool_name", "")
+            if (
+                not policy._gates_tool(tool_name)
+                or tool_name in policy._session_approvals
+            ):
+                return
+            parent_context = self._context
+            host = parent_context.host_agent if parent_context is not None else None
+            router = getattr(host, "output_router", None)
+            if router is None:
+                raise PluginBlockError("permgate: fork approval output is unavailable")
+            policy._context = PluginContext(
+                _host_agent=SimpleNamespace(output_router=router)
+            )
+            await policy.pre_tool_execute(args, **kwargs)
+            approvals.update(policy._session_approvals - self._session_approvals)
+
+        return gate
 
     def refresh_options(self) -> None:
         """Re-derive cached fields from :attr:`options`."""

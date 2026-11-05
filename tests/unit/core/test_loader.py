@@ -110,6 +110,23 @@ class TestLoadFromPackage:
         cls = loader.load_class("collections", "OrderedDict", module_type="package")
         assert cls.__name__ == "OrderedDict"
 
+    def test_linked_package_root_is_made_importable(self, tmp_path, monkeypatch):
+        packages = tmp_path / "packages"
+        packages.mkdir()
+        root = tmp_path / "src" / "kt-linked"
+        (root / "zz_linked_pkg").mkdir(parents=True)
+        (root / "kohaku.yaml").write_text("name: kt-linked\nversion: 0.1.0\n")
+        (root / "zz_linked_pkg" / "__init__.py").write_text("")
+        (root / "zz_linked_pkg" / "tools.py").write_text("class T:\n    NAME = 't'\n")
+        monkeypatch.setattr(loc_mod, "PACKAGES_DIR", packages)
+        loc_mod.write_link("kt-linked", root)
+        monkeypatch.setattr(sys, "path", [p for p in sys.path if p != str(root)])
+        for mod in ("zz_linked_pkg", "zz_linked_pkg.tools"):
+            monkeypatch.delitem(sys.modules, mod, raising=False)
+        loader = ModuleLoader()
+        cls = loader.load_class("zz_linked_pkg.tools", "T", module_type="package")
+        assert cls.NAME == "t"
+
     def test_package_missing_raises(self):
         loader = ModuleLoader()
         with pytest.raises(ModuleLoadError, match="Cannot import package"):

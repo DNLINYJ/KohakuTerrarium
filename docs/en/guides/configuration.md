@@ -168,7 +168,7 @@ tools:
   - name: web_search
     backend: duckduckgo
     codex_model: gpt-5.6-luna
-    deepseek_model: deepseek-v4-flash
+    deepseek_model: deepseek-v4-pro
     fallback: none
 ```
 
@@ -176,8 +176,56 @@ tools:
 Codex subscription search, run `kt login codex`, then set `backend: codex` or
 use `/module set web_search backend codex`; this is independent of the
 creature's active LLM. To use DeepSeek, run `kt config key set deepseek`, then
-select `backend: deepseek`. Set `fallback: duckduckgo` when a transient failure
-of an explicitly selected Codex or DeepSeek backend should fall back.
+select `backend: deepseek_api` for the model-independent Search API.
+The legacy `backend: deepseek` uses Responses and defaults to `deepseek-v4-pro`.
+Saved Flash selections remain readable but return a migration hint because Flash
+ignores Responses search. Set `fallback: duckduckgo` to allow transient provider
+failures to fall back; authentication and balance errors do not fall back.
+
+```yaml
+tools:
+  - name: web_search
+    backend: deepseek_api
+    need_content: false
+    fallback: none
+  - name: web_fetch
+    backend: deepseek
+    fallback: none
+```
+
+Use `/module set web_search backend deepseek_api` and
+`/module set web_fetch backend deepseek` to switch a running creature.
+In the web and desktop GUI:
+
+- **Session Settings → Tools & Plugins** edits the selected creature's current
+  configuration. Changes save automatically, apply to subsequent calls, and
+  persist across save/resume.
+- **Global Settings → Tools & Plugins** sets defaults for new Studio sessions,
+  including terrarium members and sessions created on laboratory workers.
+  Explicit creature options and plugin enablement take precedence.
+
+Global defaults never change existing, resumed, or forked sessions. Session edits
+update only the selected creature and supplied fields. Other settings keep their
+existing behavior. Defaults configure available components; they do not add tools
+or install plugins. The global catalog lists configurable built-in tools and
+discovered plugins; session settings also include loaded configurable custom tools.
+
+Defaults are saved in `~/.kohakuterrarium/module-defaults.json` (under
+`KT_CONFIG_DIR` when set). Global saves require the admin token when enabled.
+In the Textual TUI, press **F2 → Tools**, select a tool, and choose **Save**.
+The Rich CLI also offers `/module edit web_search` and `/module edit web_fetch`.
+
+Search accepts `max_results` (1–50), `need_content`, and
+optional `ori_question` (1–128 characters). Its optional `localization` setting
+is an IP address, not a region code. Fetch accepts `max_length` (1–100000).
+The default Fetch backend remains `auto` (the existing extractor chain).
+`fallback: auto` explicitly enables that chain after transient DeepSeek failures;
+policy refusals and missing-page errors do not trigger it.
+
+Direct requests have a 30-second total deadline, at most three attempts, and
+process-local pacing per endpoint. Other processes share the account's remote
+quota. Search and Fetch are billed per successful request with results; see the
+[DeepSeek guide](https://api-docs.deepseek.com/zh-cn/guides/search/).
 
 The Codex search model can be selected independently, for example:
 
@@ -213,7 +261,7 @@ tools:
 
 See [Custom Modules](custom-modules.md) for the protocol.
 
-Provider-native tools can also appear automatically. For example, a
+Provider-offered tools can also appear automatically. For example, a
 Codex-backed creature gets `image_gen` injected unless you opt out:
 
 ```yaml
@@ -221,15 +269,15 @@ disable_provider_tools:
   - image_gen
 ```
 
-If you want to keep the provider-native tool but override its knobs, wire it
+If you want to keep the tool but override its knobs, wire it
 explicitly under `tools:`; the explicit entry wins over auto-injection.
 
 ## How do I add a sub-agent?
 
 ```yaml
 subagents:
-  - plan
-  - worker
+  - explore
+  - critic
   - name: my_critic
     type: custom
     module: ./subagents/critic.py
@@ -240,12 +288,28 @@ subagents:
       budget_inherit: true
 ```
 
-Built-ins: `worker`, `coordinator`, `explore`, `plan`, `research`, `critic`, `response`, `memory_read`, `memory_write`, `summarize`.
+Builtins: `explore`, `critic`, `fork`, `response`, `memory_read`, `memory_write`,
+`summarize`. Older builtin entries `worker`, `coordinator`, `plan`, and `research`
+warn and are skipped; use custom sub-agents or graph creatures for that work.
 
-Builtin sub-agents already opt into `default_plugins: ["auto-compact"]` and the
-unified `budget` plugin with minimal options: `turn_budget: [40, 60]`,
-`tool_call_budget: [75, 100]`, and no walltime limit. Override the `budget`
-plugin's `options` inline if a specialist needs a larger budget.
+`fork` is added automatically, even without a `subagents:` list. It uses a
+snapshot of parent context for bounded side tasks, while `explore` and `critic`
+still start fresh. An explicit entry named `fork` overrides the implicit preset.
+To disable context forks and reject `/btw` side questions:
+
+```yaml
+fork_enabled: false
+```
+
+The three inspection helpers use `read`, `glob`, `grep`, and `tree`, with
+soft/hard model-call budgets of 8/12, tool-call budgets of 24/40, an absolute
+14-call cap, a 600-second timeout, and no automatic compaction. `fork` inherits
+the parent's model through an isolated provider; providers unable to create a
+distinct instance are rejected. Service presets retain
+`default_plugins: ["auto-compact"]`, `turn_budget: [40, 60]`, and
+`tool_call_budget: [75, 100]`. See [Sub-agents](sub-agents.md) for limits and the
+`/btw` open/continue/stop commands. The existing `/fork` session-copy command is
+unchanged.
 
 For YAML-only specialists, use `type: custom` without `module`/`config` and put
 `SubAgentConfig` fields directly in the entry:

@@ -19,8 +19,8 @@ from kohakuterrarium.studio.sessions.registry import (
     registry_for,
     stores_for,
 )
-from kohakuterrarium.terrarium.engine import Terrarium
-from kohakuterrarium.terrarium.service import LocalTerrariumService
+from kohakuterrarium.terrarium.engine.engine import Terrarium
+from kohakuterrarium.terrarium.service.service import LocalTerrariumService
 
 
 class TestRegistryIsolation:

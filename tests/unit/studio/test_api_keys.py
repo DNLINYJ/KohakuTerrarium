@@ -11,6 +11,12 @@ from kohakuterrarium.studio.identity.api_keys import (
     set_key,
 )
 
+from tests.unit._fakes.package_backend import (
+    echo_backend,
+    install_backend_package,
+    kt_home,  # noqa: F401
+)
+
 
 class _FakeBackend:
     def __init__(self, backend_type="openai", api_key_env="OPENAI_KEY"):
@@ -54,6 +60,24 @@ def _mock_backend_layer(monkeypatch):
     monkeypatch.setattr(mod, "list_api_keys", list_api_keys)
     monkeypatch.setattr(mod, "_is_available", is_available)
     return state
+
+
+class TestPackageBackendCredentials:
+    def test_own_login_package_backend_has_no_key_row(
+        self, _mock_backend_layer, kt_home
+    ):
+        install_backend_package(
+            kt_home,
+            "p",
+            [echo_backend("echo-own", credentials="external"), echo_backend()],
+        )
+        _mock_backend_layer["backends"]["echo-own"] = _FakeBackend("echo-own", "")
+        _mock_backend_layer["backends"]["echo"] = _FakeBackend("echo", "")
+        providers = {row["provider"] for row in list_keys_payload()}
+        assert "echo" in providers
+        assert "echo-own" not in providers
+        with pytest.raises(LookupError):
+            set_key("echo-own", "k")
 
 
 # ── list_keys_payload ────────────────────────────────────────────

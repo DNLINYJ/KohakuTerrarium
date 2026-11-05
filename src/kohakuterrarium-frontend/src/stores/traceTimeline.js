@@ -13,7 +13,7 @@ import { defineStore } from "pinia"
 import { getCurrentInstance } from "vue"
 
 import { normalizeSpan } from "@/components/sessions/trace/traceTimeline"
-import { injectScope, registerScopeDisposer } from "@/composables/useScope"
+import { injectScope, disposeScopeStore, registerScopeDisposer } from "@/composables/useScope"
 import { sessionAPI } from "@/utils/api"
 
 const _traceTimelineOptions = {
@@ -39,8 +39,8 @@ const _traceTimelineOptions = {
       if (isSwitch) {
         this.records = []
         this.truncated = false
-        this.error = ""
       }
+      this.error = ""
       this.loading = true
       this.loadingGeneration = generation
       try {
@@ -92,9 +92,9 @@ function _factoryFor(scope) {
     useFn = defineStore(`traceTimeline:${key}`, _traceTimelineOptions)
     _traceTimelineFactories.set(key, useFn)
     if (scope) {
-      registerScopeDisposer(scope, () => {
+      registerScopeDisposer(scope, (pinia) => {
         try {
-          useFn().$dispose?.()
+          disposeScopeStore(useFn(pinia), pinia)
         } catch {
           /* swallow */
         }

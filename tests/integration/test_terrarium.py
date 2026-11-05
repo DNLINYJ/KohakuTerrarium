@@ -33,24 +33,24 @@ import pytest
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
 from kohakuterrarium.core.channel import ChannelMessage
-from kohakuterrarium.core.config_types import (
+from kohakuterrarium.core.config.types import (
     AgentConfig,
     InputConfig,
     OutputConfig,
 )
 from kohakuterrarium.modules.tool.base import ToolContext
-from kohakuterrarium.session.history import (
+from kohakuterrarium.session.history.replay import (
     normalize_resumable_events,
     replay_conversation,
 )
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.session.resource_gate import try_fast
-from kohakuterrarium.terrarium.drive.store_migration import _migrate_same_file_drives
+from kohakuterrarium.session.occupancy.gate import try_fast
+from kohakuterrarium.terrarium.drive.store.migration import _migrate_same_file_drives
 from kohakuterrarium.terrarium.drive.wire import pack_drive_record
-from kohakuterrarium.session.resume_target import resolve_resume_path
+from kohakuterrarium.session.resume.target import resolve_resume_path
 from kohakuterrarium.studio.persistence.viewer.exchanges import build_exchanges_payload
-import kohakuterrarium.terrarium.session_coord as _session_coord
-from kohakuterrarium.terrarium.drive.store import (
+import kohakuterrarium.terrarium.session.coord as _session_coord
+from kohakuterrarium.terrarium.drive.store.store import (
     DriveRepositoryClosedError,
     SqliteDriveRepository,
 )
@@ -65,32 +65,33 @@ from kohakuterrarium.terrarium.drive.config import (
     default_registrations,
 )
 from kohakuterrarium.terrarium.drive.models import ActorRef, DriveStatus
-from kohakuterrarium.terrarium.drive.registration import (
+from kohakuterrarium.terrarium.drive.registration.registration import (
     DriveRegistrationDescriptor,
     GenericDriveRegistration,
 )
 from kohakuterrarium.terrarium.drive.requests import CreateDriveRequest, DriveQuery
-from kohakuterrarium.llm.presets import get_all_presets
+from kohakuterrarium.llm.presets.catalog import get_all_presets
 from kohakuterrarium.testing.llm import ScriptEntry
-from kohakuterrarium.terrarium.creature_ops import build_runtime_graph_snapshot_for
-from kohakuterrarium.terrarium.engine import Terrarium
+from kohakuterrarium.terrarium.creature.ops import build_runtime_graph_snapshot_for
+from kohakuterrarium.terrarium.engine.engine import Terrarium
+from kohakuterrarium.terrarium.graph.manifest import load_manifest
 from kohakuterrarium.terrarium.events import EventFilter, EventKind
 from kohakuterrarium.terrarium.output_log import OutputLogCapture
-from kohakuterrarium.terrarium.service import LocalTerrariumService
-from kohakuterrarium.terrarium.tools_group_channel import GroupChannelTool
-from kohakuterrarium.terrarium.tools_group_lifecycle import (
+from kohakuterrarium.terrarium.service.service import LocalTerrariumService
+from kohakuterrarium.terrarium.tools.channel import GroupChannelTool
+from kohakuterrarium.terrarium.tools.lifecycle import (
     GroupAddNodeTool,
     GroupRemoveNodeTool,
     GroupSpawnChildTool,
     GroupStartNodeTool,
     GroupStopNodeTool,
 )
-from kohakuterrarium.terrarium.tools_group_send import (
+from kohakuterrarium.terrarium.tools.send import (
     GroupSendTool,
     SendChannelTool,
 )
-from kohakuterrarium.terrarium.tools_group_status import GroupStatusTool
-from kohakuterrarium.terrarium.tools_group_wire import GroupWireTool
+from kohakuterrarium.terrarium.tools.status import GroupStatusTool
+from kohakuterrarium.terrarium.tools.wire import GroupWireTool
 from kohakuterrarium.testing.llm import ScriptedLLM
 
 pytestmark = pytest.mark.timeout(60)
@@ -326,6 +327,25 @@ class TestTerrariumIntegration:
         assert channel_msgs[0].graph_id == gid
         assert channel_msgs[0].payload["content"] == "status: green"
         assert channel_msgs[0].payload["sender"] == "alice"
+
+        # --- a stopped-then-started listener still hears the channel ------
+        # Stopping clears the agent's triggers; start must re-install bob's
+        # listen trigger from the graph, or bob is silently deaf on ``ops``.
+        await service.stop_creature("bob")
+        assert "bob_ops" not in ops._subscribers
+        await service.start_creature("bob")
+        await _settle()
+        assert set(ops._subscribers) == {"bob_ops"}
+        assert [t["trigger_id"] for t in await service.list_triggers("bob")] == [
+            "channel_bob_ops"
+        ]
+        await ops.send(ChannelMessage(sender="alice", content="after restart"))
+        await asyncio.sleep(0.05)
+        bob_hist = await service.chat_history("bob")
+        delivered = [
+            m for m in bob_hist["messages"] if "after restart" in str(m.get("content"))
+        ]
+        assert len(delivered) == 1
 
         # --- the Protocol's topology / status read surface ---------------
         # ``list_channels`` reflects the declared channel; the per-graph
@@ -1158,6 +1178,36 @@ class TestTerrariumIntegration:
                     "after split resume",
                 ]
 
+        # Without an autosession directory, only the retained child persists.
+        async with Terrarium(
+            drive_config=DriveRuntimeConfig(enabled=False)
+        ) as explicit:
+            pair = [
+                await explicit.add_creature(
+                    _agent_config(name, tmp_path),
+                    start=True,
+                    io="headless",
+                    session=False,
+                )
+                for name in ("left", "right")
+            ]
+            await explicit.connect(*pair, channel="manual")
+            await explicit.attach_session(
+                pair[0].graph_id, tmp_path / "manual.kohakutr"
+            )
+            original = pair[0].agent.session_store
+            await explicit.disconnect(*pair, channel="manual")
+            retained = next(c for c in pair if c.graph_id in explicit._session_stores)
+            detached = next(c for c in pair if c is not retained)
+            assert detached.agent.session_store is None
+            await detached.run("without persistence", timeout=5)
+            assert original.get_events(detached.name) == []
+            await retained.run("with persistence", timeout=5)
+            assert any(
+                e.get("content") == "with persistence"
+                for e in original.get_events(retained.name)
+            )
+
     async def test_split_drive_lifecycle_no_repo_race(
         self, make_service, tmp_path, monkeypatch
     ):
@@ -1566,9 +1616,17 @@ class TestTerrariumIntegration:
         # working dir — get / set round-trip.
         wd = await service.get_working_dir("scout")
         assert wd
-        new_wd = await service.set_working_dir("scout", str(tmp_path))
-        assert new_wd == str(tmp_path)
-        assert await service.get_working_dir("scout") == str(tmp_path)
+        moved = tmp_path / "moved"
+        moved.mkdir()
+        new_wd = await service.set_working_dir("scout", str(moved))
+        assert new_wd == str(moved)
+        assert await service.get_working_dir("scout") == str(moved)
+        # The saved manifest follows, so a restart rebuilds scout there.
+        scout = engine.get_creature("scout")
+        assert scout.build_pwd == str(moved)
+        scout_store = engine._session_stores[scout.graph_id]
+        saved = {c.name: c.pwd for c in load_manifest(scout_store).creatures}
+        assert saved["scout"] == str(moved)
         # plugins / modules — every engine creature carries the built-in
         # cross-cutting plugins (sandbox / budget / permgate / compact).
         plugins = await service.list_plugins("scout")
@@ -1763,7 +1821,7 @@ class TestTerrariumIntegration:
         assert len(writer_log) == writer_pre + 2
         assert "are you there" in str(writer_log[-2])
         # Unknown targets fail closed at wiring time; no dead edge is stored.
-        from kohakuterrarium.terrarium.graph_identity import TargetNotFoundError
+        from kohakuterrarium.terrarium.graph.identity import TargetNotFoundError
 
         with pytest.raises(TargetNotFoundError):
             await service.wire_output(

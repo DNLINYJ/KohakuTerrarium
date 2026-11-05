@@ -18,6 +18,18 @@ under `examples/` and are loaded as custom modules when explicitly configured.
 
 `cli`, `cli_nonblocking`, `none`, `tui` (from `builtins.tui`)
 
+## Commands during a turn
+
+`CLIInput` and `TUIInput` keep reading while foreground work runs. Registered
+commands marked `safe_while_busy` (including `/btw`) execute without interrupting
+that work; other commands and ordinary messages retain their serial input order.
+The startup-settled barrier still waits for the startup turn.
+
+Plain CLI confirmation and selection prompts use the same stdin reader as normal
+input. While a prompt is open, the next line is its answer, including text that
+starts with `/btw`; slash dispatch resumes after the prompt closes. Cancelling or
+stopping a prompt releases its pending answer without cancelling side jobs.
+
 ## Dependencies
 
 - `kohakuterrarium.core.events` (TriggerEvent, create_user_input_event)

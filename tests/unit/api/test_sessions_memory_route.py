@@ -10,14 +10,14 @@ from httpx import ASGITransport, AsyncClient
 from kohakuterrarium.terrarium import LocalTerrariumService, Terrarium
 from kohakuterrarium.api.deps import get_service
 from kohakuterrarium.laboratory.config import HostConfig
-from kohakuterrarium.session.embedding import NullEmbedder
+from kohakuterrarium.session.memory.embedding import NullEmbedder
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.studio.sessions import memory_search as search_mod
-from kohakuterrarium.terrarium.multi_node_service import MultiNodeTerrariumService
+from kohakuterrarium.studio.sessions.memory import search as search_mod
+from kohakuterrarium.terrarium.multi_node.service import MultiNodeTerrariumService
 from kohakuterrarium.testing.llm import ScriptedLLM
 from kohakuterrarium.api.routes.sessions_v2 import memory as mem_mod
 from kohakuterrarium.laboratory._internal.host import HostEngine
-from kohakuterrarium.laboratory._internal.transport_inproc import InProcTransport
+from kohakuterrarium.laboratory._internal.transport.inproc import InProcTransport
 
 
 def _app() -> FastAPI:

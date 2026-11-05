@@ -1,0 +1,34 @@
+# {{name}}
+
+A KohakuTerrarium package that adds dashboard UI:
+
+- a **settings section** owned by the package (`{{module}}/ui_owner.py`);
+- a **chat side panel** owned by the `{{module}}_panel` plugin
+  (`{{module}}/plugin.py`), shown only when the focused creature loads it.
+
+Both components use `useOwner()` from `@kohakuterrarium/ui-sdk`.
+
+## Try it
+
+```bash
+kt install ./{{name}} -e          # editable install
+kt serve                          # open Settings → {{name}}
+```
+
+To see the panel, add the plugin to a creature's `config.yaml`:
+
+```yaml
+plugins:
+  - name: {{module}}_panel
+```
+
+then open the panel from the session layout's panel picker.
+
+## Test the UI
+
+```bash
+npm install && npm test
+```
+
+`ui/test/kt-sdk/` holds the SDK test double copied from your installed
+KohakuTerrarium. See `docs/en/guides/ui-extensions.md` for the full guide.

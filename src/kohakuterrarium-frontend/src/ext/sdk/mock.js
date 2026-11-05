@@ -1,0 +1,386 @@
+/**
+ * Test double of ``@kohakuterrarium/ui-sdk`` for extension unit tests.
+ *
+ * Exports the same names as the real SDK, backed by the most recently
+ * created mock host instead of a running dashboard. It imports only
+ * ``vue`` and its sibling files, so a package can alias the SDK to the
+ * copy ``kt extension new --ui`` places in ``ui/test/kt-sdk/``.
+ */
+
+import { computed, reactive, ref, shallowRef } from "vue"
+
+import {
+  FRAME_MESSAGES,
+  FRAME_PROTOCOL,
+  FRAME_SUPPORTED,
+  FrameIsolationUnsupportedError,
+  createFrameBridge,
+} from "./frameBridge.js"
+import { THEME_TOKENS } from "./theme.js"
+import { SDK_VERSION, satisfiesRange } from "./version.js"
+
+export {
+  FRAME_MESSAGES,
+  FRAME_PROTOCOL,
+  FRAME_SUPPORTED,
+  FrameIsolationUnsupportedError,
+  SDK_VERSION,
+  THEME_TOKENS,
+  createFrameBridge,
+  satisfiesRange,
+}
+
+export const ActionButton = {
+  props: {
+    type: { default: "button" },
+    disabled: Boolean,
+    variant: String,
+    size: String,
+    icon: String,
+  },
+  template: `<button :type="type" :disabled="disabled"><slot /></button>`,
+}
+export const SettingsGroup = {
+  props: ["title", "description"],
+  template: `<section><header><h3 v-if="title">{{ title }}</h3><p v-if="description">{{ description }}</p><slot name="action" /></header><div><slot /></div></section>`,
+}
+export const SettingsRow = {
+  props: ["title", "hint", "status", "tone", "inline"],
+  template: `<div><div>{{ title }}</div><p v-if="hint">{{ hint }}</p><slot name="detail" /><p v-if="status" data-row-status>{{ status }}</p><slot /></div>`,
+}
+
+let _current = null
+
+export class OwnerCallError extends Error {
+  constructor(code, message, status) {
+    super(message || code)
+    this.name = "OwnerCallError"
+    this.code = code
+    this.status = status
+  }
+}
+
+function current() {
+  if (!_current) throw new Error("createMockHost() must run before SDK calls in tests")
+  return _current
+}
+
+function interpolate(text, params = {}) {
+  return String(text).replace(/\{(\w+)\}/g, (_, name) => String(params[name] ?? `{${name}}`))
+}
+
+/**
+ * Create a mock dashboard. ``routes`` maps ``"METHOD /path"`` to a value
+ * or ``(request) => value``; unmatched calls reject with status 404.
+ * ``owner`` is ``{ state, actions: { name: (args) => result } }``, or
+ * ``null`` for an owner that is not loaded; ``host.emit(event, data)``
+ * pushes like the backend's ``ui_emit``.
+ */
+export function createMockHost(options = {}) {
+  const pkg = options.package || "test-pkg"
+  const state = reactive({
+    host: options.host || { id: null, name: "", url: "", sameOrigin: true },
+    session: options.session ?? null,
+    creature: options.creature ?? null,
+    events: options.events || [],
+    work: options.work ?? null,
+    locale: options.locale || "en",
+    dark: options.dark ?? false,
+    confirmAnswer: options.confirmAnswer ?? true,
+  })
+  const registered = {
+    tab: new Map(),
+    panel: new Map(),
+    rail: new Map(),
+    settings: new Map(),
+    "tool-renderer": new Map(),
+    "trigger-renderer": new Map(),
+    widget: new Map(),
+    overlay: new Map(),
+    command: new Map(),
+    "status-item": new Map(),
+    action: new Map(),
+    "message-renderer": new Map(),
+    "message-decorator": new Map(),
+    "tray-item": new Map(),
+    "notification-channel": new Map(),
+    "file-view": new Map(),
+    "graph-badge": new Map(),
+    "graph-panel": new Map(),
+  }
+  const overlayVisible = reactive({})
+  const storageData = new Map()
+  const requests = []
+  const notifications = []
+  const openedTabs = []
+  const messages = options.messages || {}
+  const routes = options.routes || {}
+
+  async function call(method, path, data, config) {
+    const clean = `/${String(path || "").replace(/^\/+/, "")}`
+    const request = { method, path: clean, data, config }
+    requests.push(request)
+    const handler = routes[`${method} ${clean}`]
+    if (handler === undefined) {
+      const error = new Error(`no mock route for ${method} ${clean}`)
+      error.response = { status: 404, data: { error: "not_found" } }
+      throw error
+    }
+    const result = typeof handler === "function" ? await handler(request) : handler
+    return { status: 200, data: result }
+  }
+
+  const provide =
+    (kind) =>
+    (id, component, opts = {}) =>
+      registered[kind].set(id, { component, options: opts })
+  const kt = {
+    package: pkg,
+    sdkVersion: SDK_VERSION,
+    registerTab: provide("tab"),
+    registerPanel: provide("panel"),
+    registerRailGroup: provide("rail"),
+    registerSettingsSection: provide("settings"),
+    registerToolRenderer: provide("tool-renderer"),
+    registerTriggerRenderer: provide("trigger-renderer"),
+    registerWidgetRenderer: provide("widget"),
+    registerOverlay: provide("overlay"),
+    registerCommand: provide("command"),
+    registerStatusItem: provide("status-item"),
+    registerAction: provide("action"),
+    registerMessageRenderer: provide("message-renderer"),
+    registerMessageDecorator: provide("message-decorator"),
+    registerTrayItem: provide("tray-item"),
+    registerNotificationChannel: provide("notification-channel"),
+    registerFileView: provide("file-view"),
+    registerGraphBadge: provide("graph-badge"),
+    registerGraphPanel: provide("graph-panel"),
+    storage: {
+      get: (key, fallback = null) => (storageData.has(key) ? storageData.get(key) : fallback),
+      set: (key, value) => storageData.set(key, value),
+      remove: (key) => storageData.delete(key),
+    },
+    showOverlay: (id) => (overlayVisible[id] = true),
+    hideOverlay: (id) => (overlayVisible[id] = false),
+    toggleOverlay: (id) => (overlayVisible[id] = !(overlayVisible[id] ?? true)),
+    api: {
+      request: (config = {}) =>
+        call((config.method || "GET").toUpperCase(), config.url, config.data, config),
+      get: (path, config) => call("GET", path, undefined, config),
+      delete: (path, config) => call("DELETE", path, undefined, config),
+      post: (path, data, config) => call("POST", path, data, config),
+      put: (path, data, config) => call("PUT", path, data, config),
+      patch: (path, data, config) => call("PATCH", path, data, config),
+    },
+    ws: (path) => ({
+      path,
+      sent: [],
+      send(data) {
+        this.sent.push(data)
+      },
+      close() {},
+      addEventListener() {},
+      removeEventListener() {},
+    }),
+    t(key, params) {
+      const text = messages[state.locale]?.[key] ?? messages.en?.[key]
+      return text == null ? key : interpolate(text, params)
+    },
+    assetUrl: (path) => `/mock-assets/${pkg}/${String(path).replace(/^\/+/, "")}`,
+    openTab: (id) => openedTabs.push(`${pkg}/${id}`),
+  }
+
+  const ownerSpec = options.owner === undefined ? { state: {}, actions: {} } : options.owner
+  const ownerState = shallowRef(ownerSpec ? ownerSpec.state : null)
+  const ownerStatus = ref(ownerSpec ? "ready" : "absent")
+  const ownerHandlers = new Map()
+  const ownerCalls = []
+  const owner = {
+    owner: options.ownerRef || `package:${pkg}`,
+    state: ownerState,
+    status: ownerStatus,
+    error: ref(""),
+    async refresh() {
+      return ownerState.value
+    },
+    async call(action, args = {}) {
+      ownerCalls.push({ action, args })
+      const fn = ownerSpec?.actions?.[action]
+      if (!ownerSpec) throw new OwnerCallError("owner_not_loaded", "owner is not loaded", 404)
+      if (!fn) throw new OwnerCallError("bad_request", `unknown action ${action}`, 400)
+      return fn(args)
+    },
+    on(event, handler) {
+      if (!ownerHandlers.has(event)) ownerHandlers.set(event, new Set())
+      ownerHandlers.get(event).add(handler)
+      return () => ownerHandlers.get(event)?.delete(handler)
+    },
+  }
+
+  const host = {
+    kt,
+    state,
+    registered,
+    requests,
+    notifications,
+    openedTabs,
+    openedExternal: [],
+    owner,
+    ownerCalls,
+    widget: options.widget || null,
+    block: options.block || null,
+    message: options.message || null,
+    file: options.file || null,
+    node: options.node || null,
+    said: [],
+    overlayId: options.overlayId || "overlay",
+    overlayVisible,
+    /** Push an owner event, as the backend's ``ui_emit`` would. */
+    emit(event, data) {
+      if (event === "state") ownerState.value = data
+      for (const handler of ownerHandlers.get(event) || []) handler(data)
+      for (const handler of ownerHandlers.get("*") || []) handler(event, data)
+    },
+    /** Run an entry's ``register(kt)`` against this host. */
+    async register(entry) {
+      const fn = typeof entry === "function" ? entry : entry?.default || entry?.register
+      await fn(kt)
+      return registered
+    },
+  }
+  _current = host
+  return host
+}
+
+export function defineExtension(register) {
+  return register
+}
+
+export function useExtension() {
+  return current().kt
+}
+
+export function useOwner() {
+  return current().owner
+}
+
+/** In tests, the ``{widget, host}`` the mock host was created with (``options.widget``). */
+export function useWidget() {
+  const widget = current().widget
+  if (!widget) throw new Error("useWidget() used outside a widget renderer")
+  return widget
+}
+
+/** In tests, the file given as ``createMockHost({ file: { path, content } })``, as a read-only ref. */
+export function useFileView() {
+  const host = current()
+  if (!host.file) throw new Error("useFileView() used outside a file view")
+  const path = host.file.path || "file.txt"
+  return ref({ name: path.split(/[\\/]/).pop(), content: "", language: "", ...host.file, path })
+}
+
+/** In tests, the node given as ``createMockHost({ node: { kind, id, name } })``, as a read-only ref. */
+export function useGraphNode() {
+  const host = current()
+  if (!host.node) throw new Error("useGraphNode() used outside a graph badge or panel")
+  return ref({ kind: "creature", id: "", name: "", sessionId: null, ...host.node })
+}
+
+/** In tests, the message given as ``createMockHost({ message: { id, role, text } })``, as a read-only ref. */
+export function useMessage() {
+  const host = current()
+  if (!host.message) throw new Error("useMessage() used outside a message decorator")
+  return ref({ id: null, role: "assistant", text: "", turn: null, tab: "", ...host.message })
+}
+
+/** In tests, the fenced block given as ``createMockHost({ block: { id, source } })``; `say` calls land in `host.said`. */
+export function useMessageBlock() {
+  const host = current()
+  if (!host.block) throw new Error("useMessageBlock() used outside a message renderer")
+  return {
+    id: host.block.id || "test.block",
+    source: ref(host.block.source || ""),
+    say: (text) => host.said.push(text),
+  }
+}
+
+/** In tests, controls the overlay named by ``createMockHost({ overlayId })``. */
+export function useOverlay() {
+  const host = current()
+  const id = host.overlayId
+  const bounds = ref({ left: 0, top: 0, width: 320, height: 240 })
+  return {
+    visible: computed(() => host.overlayVisible[id] ?? true),
+    bounds: computed(() => bounds.value),
+    show: () => host.kt.showOverlay(id),
+    hide: () => host.kt.hideOverlay(id),
+    toggle: () => host.kt.toggleOverlay(id),
+    move: (left, top) => (bounds.value = { ...bounds.value, left, top }),
+    resize: (width, height) => (bounds.value = { ...bounds.value, width, height }),
+    startDrag: () => {},
+  }
+}
+
+export function useHost() {
+  const host = current()
+  return computed(() => host.state.host)
+}
+
+export function useWorkContext() {
+  const host = current()
+  return computed(() => host.state.work)
+}
+
+export function useSession() {
+  const host = current()
+  return computed(() => host.state.session)
+}
+
+export function useCreature() {
+  const host = current()
+  return computed(() => host.state.creature)
+}
+
+export function useSessionEvents() {
+  const host = current()
+  return computed(() => host.state.events)
+}
+
+export function useLocale() {
+  const host = current()
+  return computed(() => host.state.locale)
+}
+
+export function useTheme() {
+  const host = current()
+  return { dark: computed(() => host.state.dark), tokens: THEME_TOKENS }
+}
+
+export function notify(message, type = "info") {
+  current().notifications.push({ message: String(message), type })
+}
+
+/** In tests, records the notification and reports the in-app fallback. */
+export async function notifyDesktop(title, body = "") {
+  current().notifications.push({ message: String(title), body: String(body), type: "desktop" })
+  return "toast"
+}
+
+export async function openExternal(url) {
+  current().openedExternal.push(String(url))
+  return true
+}
+
+export function hostInfo() {
+  return { kind: "browser" }
+}
+
+export async function confirm(message) {
+  const host = current()
+  host.notifications.push({ message: String(message), type: "confirm" })
+  return host.state.confirmAnswer
+}
+
+export function openTab(target) {
+  current().openedTabs.push(target)
+}

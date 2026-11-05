@@ -508,6 +508,25 @@ def _count_summary_reads(monkeypatch, store):
 
         return value
 
+    def many_reader(original):
+        def many(vault, keys, *args, **kwargs):
+            if vault is store.events:
+                for key in keys:
+                    text = key.decode() if isinstance(key, bytes) else key
+                    values[text.rsplit(":e", 1)[0]] += 1
+            return original(vault, keys, *args, **kwargs)
+
+        return many
+
+    def row_reader(original):
+        def rows(vault, *args, **kwargs):
+            for row in original(vault, *args, **kwargs):
+                if vault is store.events:
+                    values["<scan>"] += 1
+                yield row
+
+        return rows
+
     def dedupe(events):
         dedupes.append(len(events))
         return original_dedupe(events)
@@ -515,6 +534,9 @@ def _count_summary_reads(monkeypatch, store):
     monkeypatch.setattr(SessionStore, "get_events", read)
     monkeypatch.setattr(vault_type, "__getitem__", value_reader(vault_type.__getitem__))
     monkeypatch.setattr(vault_type, "get", value_reader(vault_type.get))
+    monkeypatch.setattr(vault_type, "get_many", many_reader(vault_type.get_many))
+    monkeypatch.setattr(vault_type, "items", row_reader(vault_type.items))
+    monkeypatch.setattr(vault_type, "values", row_reader(vault_type.values))
     monkeypatch.setattr(rollups_mod, "dedupe_adjacent_duplicate_events", dedupe)
     monkeypatch.setattr(
         summary_mod, "dedupe_adjacent_duplicate_events", dedupe, raising=False

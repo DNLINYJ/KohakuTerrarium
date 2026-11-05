@@ -7,8 +7,6 @@ capacity. The anonymous key preserves a shared-engine slot. A shared lock serial
 construction and registry mutation, while slow shutdown work runs after releasing it.
 """
 
-from __future__ import annotations
-
 import asyncio
 import threading
 import time
@@ -16,6 +14,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from kohakuterrarium.api.auth.db import connection
+from kohakuterrarium.api.auth.users import get_user_by_id
 from kohakuterrarium.utils.config_dir import config_dir
 from kohakuterrarium.utils.logging import get_logger
 
@@ -52,6 +52,21 @@ def user_id_for_session_dir(path: str | Path) -> tuple[bool, int | None]:
     return False, None
 
 
+def user_is_admin(user_id: int | None) -> bool:
+    """Return whether ``user_id`` is an active admin in the auth database."""
+    if user_id is None:
+        return False
+    try:
+        with connection() as conn:
+            user = get_user_by_id(conn, int(user_id))
+    except Exception as e:
+        logger.warning(
+            "engine_pool: user role lookup failed", user_id=user_id, error=str(e)
+        )
+        return False
+    return user is not None and user.is_active and user.role == "admin"
+
+
 class EnginePool:
     """Own per-user Terrarium instances from app startup through shutdown."""
 
@@ -60,11 +75,14 @@ class EnginePool:
         *,
         max_active: int = 10,
         drive_resolver: Callable[[], dict[str, Any]] | None = None,
+        admin_resolver: Callable[[int | None], bool] | None = None,
     ) -> None:
         self._max_active = max(1, int(max_active))
         # Resolve a fresh immutable Drive policy for each engine so users never
         # share registration or configuration instances.
         self._drive_resolver = drive_resolver
+        # Decides an engine's host_resources flag when the caller passes no role.
+        self._admin_resolver = admin_resolver
         self._engines: dict[str, Terrarium] = {}
         self._last_used: dict[str, float] = {}
         # A threading lock supports synchronous dependency and CLI callers without
@@ -75,9 +93,17 @@ class EnginePool:
 
     # Engine lookup and lifecycle operations.
 
-    def get_or_create(self, user_id: int | None) -> Terrarium:
-        """Return the user's engine, touching LRU state and evicting at capacity."""
+    def get_or_create(
+        self, user_id: int | None, *, is_admin: bool | None = None
+    ) -> "Terrarium":
+        """Return the user's engine, touching LRU state and evicting at capacity.
+
+        Only admin users' engines get ``host_resources=True``; ``is_admin=None``
+        asks the pool's admin resolver. The flag is refreshed on every call so
+        a role change applies to the live engine.
+        """
         key = self._key(user_id)
+        host_resources = self._host_resources_for(user_id, is_admin)
         engine_to_shut_down: Terrarium | None = None
         with self._lock:
             if key in self._engines:
@@ -85,7 +111,11 @@ class EnginePool:
                 # order; monotonic timestamps can repeat on some platforms.
                 del self._last_used[key]
                 self._last_used[key] = self._monotonic()
-                return self._engines[key]
+                engine = self._engines[key]
+                setter = getattr(engine, "set_host_resources", None)
+                if callable(setter):
+                    setter(host_resources)
+                return engine
 
             if len(self._engines) >= self._max_active:
                 engine_to_shut_down = self._evict_oldest_idle_locked()
@@ -95,7 +125,11 @@ class EnginePool:
             from kohakuterrarium import Terrarium
 
             drive_kwargs = self._drive_resolver() if self._drive_resolver else {}
-            engine = Terrarium(session_dir=str(session_dir), **drive_kwargs)
+            engine = Terrarium(
+                session_dir=str(session_dir),
+                host_resources=host_resources,
+                **drive_kwargs,
+            )
             self._engines[key] = engine
             self._last_used[key] = self._monotonic()
             logger.info(
@@ -109,6 +143,29 @@ class EnginePool:
             _try_shutdown_sync(engine_to_shut_down)
         return engine
 
+    def peek(self, user_id: int | None) -> "Terrarium | None":
+        """Return the user's live engine without creating or touching it."""
+        with self._lock:
+            return self._engines.get(self._key(user_id))
+
+    def _host_resources_for(self, user_id: int | None, is_admin: bool | None) -> bool:
+        if user_id is None:
+            return False
+        if is_admin is not None:
+            return bool(is_admin)
+        if self._admin_resolver is None:
+            return False
+        try:
+            return bool(self._admin_resolver(user_id))
+        except Exception as e:
+            logger.warning(
+                "engine_pool: admin resolver failed; denying host resources",
+                user_id=user_id,
+                error=str(e),
+                exc_info=True,
+            )
+            return False
+
     def evict(self, user_id: int | None) -> bool:
         """Force-evict an engine.  Returns True if one was torn down."""
         key = self._key(user_id)
@@ -119,7 +176,7 @@ class EnginePool:
         _try_shutdown_sync(engine)
         return True
 
-    def evict_others(self, keep: Terrarium | None) -> list[int | None]:
+    def evict_others(self, keep: "Terrarium | None") -> list[int | None]:
         """Evict all engines except ``keep`` so they rebuild with current policy.
 
         The returned identifiers include ``None`` for the anonymous shared slot.
@@ -163,7 +220,7 @@ class EnginePool:
             return _ANONYMOUS_KEY
         return str(int(user_id))
 
-    def _evict_oldest_idle_locked(self) -> Terrarium | None:
+    def _evict_oldest_idle_locked(self) -> "Terrarium | None":
         """Remove the least-recently-used engine that hosts no creatures.
 
         The caller shuts the engine down unlocked. When every engine hosts
@@ -179,7 +236,7 @@ class EnginePool:
             return None
         return self._evict_key_locked(min(idle, key=self._last_used.get))
 
-    def _evict_key_locked(self, key: str) -> Terrarium | None:
+    def _evict_key_locked(self, key: str) -> "Terrarium | None":
         engine = self._engines.pop(key, None)
         self._last_used.pop(key, None)
         if engine is not None:
@@ -191,7 +248,7 @@ class EnginePool:
         return engine
 
 
-def _try_shutdown_sync(engine: Terrarium) -> None:
+def _try_shutdown_sync(engine: "Terrarium") -> None:
     """Start sync or async engine shutdown without propagating cleanup failures."""
     shutdown = getattr(engine, "shutdown", None)
     if shutdown is None:  # pragma: no cover - production Terrarium always has shutdown
@@ -212,7 +269,7 @@ def _try_shutdown_sync(engine: Terrarium) -> None:
         logger.exception("engine_pool: shutdown raised")
 
 
-async def _try_shutdown_async(engine: Terrarium) -> None:
+async def _try_shutdown_async(engine: "Terrarium") -> None:
     """Await engine shutdown so lifecycle teardown completes before loop closure."""
     shutdown = getattr(engine, "shutdown", None)
     if shutdown is None:  # pragma: no cover - production Terrarium always has shutdown

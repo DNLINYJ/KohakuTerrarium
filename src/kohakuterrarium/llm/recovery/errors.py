@@ -1,0 +1,411 @@
+"""Provider-boundary recovery helpers for LLM calls.
+
+Share retry policy, error classification, backoff, and overflow reduction.
+"""
+
+import asyncio
+import random
+import time
+from dataclasses import dataclass, field
+from email.utils import mktime_tz, parsedate_tz
+from enum import Enum
+from typing import Any
+
+from kohakuterrarium.errors import MediaReferenceError
+from kohakuterrarium.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+class ErrorClass(Enum):
+    """Provider error categories used by framework-side recovery."""
+
+    USER_ERROR = "user_error"
+    OVERFLOW = "overflow"
+    # The server or a proxy refused the request for its byte size (HTTP 413, WS 1009).
+    OVERSIZE = "oversize"
+    # The provider refused part of the request body (media, field length, encoding).
+    CONTENT = "content"
+    RATE_LIMIT = "rate_limit"
+    SERVER = "server"
+    TRANSIENT = "transient"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """Framework retry policy for provider-boundary recovery."""
+
+    max_retries: int = 3
+    base_delay: float = 1.0
+    max_delay: float = 30.0
+    jitter: float = 0.25
+    retry_classes: frozenset[ErrorClass] = field(
+        default_factory=lambda: frozenset(
+            {
+                ErrorClass.RATE_LIMIT,
+                ErrorClass.SERVER,
+                ErrorClass.TRANSIENT,
+            }
+        )
+    )
+
+    @classmethod
+    def from_value(cls, value: "RetryPolicy | dict[str, Any] | None") -> "RetryPolicy":
+        """Build a policy from config data or return defaults."""
+        if isinstance(value, RetryPolicy):
+            return value
+        if not isinstance(value, dict):
+            return cls()
+        retry_classes = value.get("retry_classes")
+        converted: frozenset[ErrorClass] | None = None
+        if retry_classes is not None:
+            classes: set[ErrorClass] = set()
+            for item in retry_classes:
+                try:
+                    classes.add(
+                        item if isinstance(item, ErrorClass) else ErrorClass(str(item))
+                    )
+                except ValueError:
+                    logger.warning(
+                        "Unknown retry error class ignored", error_class=str(item)
+                    )
+            converted = frozenset(classes)
+        kwargs = {
+            "max_retries": int(value.get("max_retries", cls.max_retries)),
+            "base_delay": float(value.get("base_delay", cls.base_delay)),
+            "max_delay": float(value.get("max_delay", cls.max_delay)),
+            "jitter": float(value.get("jitter", cls.jitter)),
+        }
+        if converted is not None:
+            kwargs["retry_classes"] = converted
+        return cls(**kwargs)
+
+
+_OVERFLOW_MARKERS = (
+    "context_length_exceeded",
+    "context length",
+    "maximum context length",
+    "context window",
+    "token limit",
+    "too many tokens",
+    "input is too long",
+    "request too large",
+    # Anthropic Messages API wordings.
+    "prompt is too long",
+    "exceed context limit",
+    # OpenRouter ``error_type`` and Gemini wordings.
+    "token_limit_exceeded",
+    "input token count",
+    "exceeds the maximum number of tokens",
+)
+_CONTENT_MARKERS = (
+    # Media the provider could not accept.
+    "invalid_image",
+    "invalid image",
+    "image_parse_error",
+    "could not process image",
+    "unable to process image",
+    "unsupported image",
+    "unsupported_image_format",
+    "image too large",
+    "image_too_large",
+    "image is too large",
+    "image too small",
+    "image_too_small",
+    "image_download_failed",
+    "image exceeds",
+    "image dimensions",
+    "many-image requests",
+    "does not represent a valid image",
+    "maximum number of images",
+    "too many images",
+    "invalid base64",
+    # A single field over a schema length limit.
+    "string too long",
+    "string_too_long",
+    "string_above_max_length",
+)
+_OVERSIZE_MARKERS = (
+    "payload too large",
+    "payload_too_large",
+    "entity too large",
+    "content too large",
+    "body too large",
+    "message too big",
+    "request_too_large",
+    "exceeds the maximum allowed number of bytes",
+    "request size exceeds",
+    "maximum request size",
+)
+_RATE_LIMIT_MARKERS = (
+    "rate_limit",
+    "rate limit",
+    "too many requests",
+    "quota_exceeded",
+)
+_LOCAL_MEDIA_MARKERS = (
+    "allowed-local-media-path",
+    "cannot load local files",
+)
+_TRANSIENT_MARKERS = (
+    "connection reset",
+    "connection error",
+    "peer disconnected",
+    "peer closed connection",  # Typical httpx mid-stream disconnect text.
+    "server disconnected",
+    "timeout",
+    "timed out",
+    "temporarily unavailable",
+    # Upstream proxies can truncate a stream after the request succeeds.
+    "incomplete chunked read",
+    "incomplete read",
+    "remoteprotocolerror",
+    "remote protocol error",
+    "protocol error",
+    # SDK wrappers may expose only the underlying httpx exception class name.
+    "connecterror",
+    "readerror",
+    "writeerror",
+    "pooltimeout",
+)
+
+
+_PROGRAMMING_ERRORS = (TypeError, AttributeError, NameError, NotImplementedError)
+_RAW_BODY_LIMIT = 2000
+
+
+def classify_openai_error(exc: BaseException) -> ErrorClass:
+    """Classify SDK and compatible-provider errors without exact class coupling."""
+    if isinstance(exc, MediaReferenceError):
+        return ErrorClass.USER_ERROR
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return ErrorClass.TRANSIENT
+
+    status = getattr(exc, "status_code", None)
+    body = _extract_error_payload(exc)
+    metadata = body.get("metadata")
+    # OpenRouter puts the canonical category in ``metadata.error_type``.
+    error_type = metadata.get("error_type") if isinstance(metadata, dict) else None
+    code = " ".join(
+        str(value)
+        for value in (body.get("code"), body.get("type"), error_type)
+        if value
+    ).lower()
+    message = _stringify_error(exc, body).lower()
+
+    if _contains_any(code, _OVERFLOW_MARKERS) or _contains_any(
+        message, _OVERFLOW_MARKERS
+    ):
+        return ErrorClass.OVERFLOW
+    if (
+        status == 413
+        or getattr(exc, "oversize", False) is True
+        or _contains_any(code, _OVERSIZE_MARKERS)
+        or _contains_any(message, _OVERSIZE_MARKERS)
+    ):
+        return ErrorClass.OVERSIZE
+    if _contains_any(code, _CONTENT_MARKERS) or _contains_any(
+        message, _CONTENT_MARKERS
+    ):
+        return ErrorClass.CONTENT
+    if (
+        status == 429
+        or _contains_any(code, _RATE_LIMIT_MARKERS)
+        or _contains_any(message, _RATE_LIMIT_MARKERS)
+    ):
+        return ErrorClass.RATE_LIMIT
+    if _contains_any(code, _LOCAL_MEDIA_MARKERS) or _contains_any(
+        message, _LOCAL_MEDIA_MARKERS
+    ):
+        return ErrorClass.USER_ERROR
+    if isinstance(status, int) and 500 <= status <= 599:
+        return ErrorClass.SERVER
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", {})
+    if status in {408, 409} or headers.get("x-should-retry") == "true":
+        return ErrorClass.TRANSIENT
+    if isinstance(status, int) and status in {400, 401, 403, 404}:
+        return ErrorClass.USER_ERROR
+    if _contains_any(message, _TRANSIENT_MARKERS):
+        return ErrorClass.TRANSIENT
+    if isinstance(exc, _PROGRAMMING_ERRORS):
+        return ErrorClass.UNKNOWN
+    # Missing status means transport failure; unknown is reserved for server responses.
+    if not isinstance(status, int):
+        return ErrorClass.TRANSIENT
+    return ErrorClass.UNKNOWN
+
+
+def provider_error_text(exc: BaseException) -> str:
+    """The provider's own refusal text, including a non-JSON response body."""
+    return " ".join(_error_fragments(exc, _extract_error_payload(exc)))
+
+
+def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
+    return any(needle in text for needle in needles)
+
+
+def _extract_error_payload(exc: BaseException) -> dict[str, Any]:
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        return err if isinstance(err, dict) else body
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            data = response.json()
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            err = data.get("error")
+            return err if isinstance(err, dict) else data
+    return {}
+
+
+def _raw_body_text(exc: BaseException) -> str:
+    """The non-JSON response body an SDK error carries, as a bounded excerpt."""
+    raw = getattr(exc, "body", None)
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    if not isinstance(raw, str):
+        return ""
+    return raw[:_RAW_BODY_LIMIT]
+
+
+def _stringify_error(exc: BaseException, body: dict[str, Any]) -> str:
+    # The class name carries wrapped transport exceptions that have empty text.
+    return " ".join([*_error_fragments(exc, body), type(exc).__name__])
+
+
+def _error_fragments(exc: BaseException, body: dict[str, Any]) -> list[str]:
+    """What an SDK error says: its text, a non-JSON body, then the payload fields."""
+    pieces = [str(exc)]
+    # Proxy rejections answer with HTML pages, which newer SDKs keep only in ``body``.
+    if raw := _raw_body_text(exc):
+        pieces.append(raw)
+    for key in ("message", "code", "type"):
+        value = body.get(key)
+        if value:
+            pieces.append(str(value))
+    return pieces
+
+
+def backoff_delay(attempt: int, policy: RetryPolicy) -> float:
+    """Return capped exponential backoff with optional jitter."""
+    base = min(policy.max_delay, policy.base_delay * (2 ** max(attempt - 1, 0)))
+    if policy.jitter <= 0:
+        return base
+    spread = base * policy.jitter
+    return max(0.0, base + random.uniform(-spread, spread))
+
+
+def retry_delay(exc: BaseException, attempt: int, policy: RetryPolicy) -> float:
+    """Honor OpenAI-compatible retry headers up to 60 seconds, else use backoff."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", {})
+    delay = None
+    try:
+        delay = float(headers.get("retry-after-ms")) / 1000
+    except (TypeError, ValueError):
+        value = headers.get("retry-after")
+        try:
+            delay = float(value)
+        except (TypeError, ValueError):
+            if value:
+                try:
+                    date = parsedate_tz(value)
+                    if date is not None:
+                        delay = mktime_tz(date) - time.time()
+                except (TypeError, ValueError, OverflowError):
+                    pass
+    if delay is not None and 0 < delay <= 60:
+        return delay
+    return backoff_delay(attempt, policy)
+
+
+def _message_text_bytes(message: dict[str, Any]) -> int:
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        total = 0
+        for part in content:
+            if isinstance(part, dict):
+                total += len(str(part.get("text") or part.get("content") or part))
+            else:
+                total += len(str(part))
+        return total
+    return len(str(content))
+
+
+def _tool_names_from_calls(calls: list[dict[str, Any]]) -> list[str]:
+    names: list[str] = []
+    for call in calls:
+        fn = call.get("function") if isinstance(call, dict) else None
+        if isinstance(fn, dict) and fn.get("name"):
+            names.append(str(fn["name"]))
+        elif isinstance(call, dict) and call.get("name"):
+            names.append(str(call["name"]))
+    return names
+
+
+def format_drop_placeholder(count: int, bytes_count: int, tool_names: list[str]) -> str:
+    """Describe an emergency tool-round drop and suggest narrower retries."""
+    tools = ", ".join(f"`{name}`" for name in tool_names) or "(unknown)"
+    return (
+        "[tool-result truncated]\n\n"
+        "The previous tool round returned content too large to fit in the "
+        "model's context. "
+        f"{count} tool call(s) producing roughly {bytes_count} characters "
+        "were dropped to recover.\n\n"
+        "If you still need that information, retry with a more targeted "
+        "query — for example, a smaller `glob` pattern, a `grep` to narrow "
+        "content, a paginated `read` with offset/limit, or a tool parameter "
+        "that returns a summary.\n\n"
+        f"Tools that were dropped: {tools}"
+    )
+
+
+def drop_last_tool_round(
+    messages: list[dict[str, Any]],
+) -> tuple[int, list[dict[str, Any]]]:
+    """Splice out the most recent assistant tool-call round.
+
+    Returns ``(dropped_count, recovered_messages)``. The input list and
+    message dicts are not mutated.
+    """
+    if not messages:
+        return 0, messages
+
+    assistant_idx = -1
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            assistant_idx = idx
+            break
+    if assistant_idx < 0:
+        return 0, messages
+
+    end = assistant_idx + 1
+    while end < len(messages) and messages[end].get("role") == "tool":
+        end += 1
+    tool_messages = messages[assistant_idx + 1 : end]
+    calls = list(messages[assistant_idx].get("tool_calls") or [])
+    dropped_count = max(len(calls), len(tool_messages))
+    if dropped_count <= 0:
+        return 0, messages
+
+    bytes_count = sum(_message_text_bytes(m) for m in tool_messages)
+    tool_names = _tool_names_from_calls(calls)
+    if not tool_names:
+        tool_names = [str(m.get("name")) for m in tool_messages if m.get("name")]
+
+    placeholder = {
+        "role": "user",
+        "content": format_drop_placeholder(dropped_count, bytes_count, tool_names),
+    }
+    recovered = [dict(m) for m in messages[:assistant_idx]]
+    recovered.append(placeholder)
+    recovered.extend(dict(m) for m in messages[end:])
+    return dropped_count, recovered

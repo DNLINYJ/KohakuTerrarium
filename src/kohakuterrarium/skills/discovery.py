@@ -70,7 +70,7 @@ def load_skill_from_path(
             description=description,
             body=body,
             frontmatter=dict(frontmatter),
-            base_dir=skill_md.parent,
+            base_dir=skill_md.parent.resolve(),
             origin=origin,
             disable_model_invocation=disable_model,
             paths=paths,

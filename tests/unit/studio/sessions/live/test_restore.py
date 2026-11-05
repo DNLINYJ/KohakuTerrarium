@@ -1,7 +1,7 @@
 """Unit tests for :mod:`kohakuterrarium.studio.sessions.live.restore`."""
 
 import kohakuterrarium.session.run_state as rs
-from kohakuterrarium.session.resume_target import SUCCESSOR_KEY
+from kohakuterrarium.session.resume.target import SUCCESSOR_KEY
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.studio.sessions.live import live_sessions
 from kohakuterrarium.studio.sessions.live.restore import (
@@ -10,7 +10,7 @@ from kohakuterrarium.studio.sessions.live.restore import (
 )
 from kohakuterrarium.studio.sessions.lifecycle import start_creature
 from kohakuterrarium.terrarium import LocalTerrariumService, Terrarium
-from kohakuterrarium.utils.file_lock import FileLock
+from kohakuterrarium.utils.file.lock import FileLock
 
 
 async def _saved_creature_session(tmp_path, creature_dir, name="alpha"):

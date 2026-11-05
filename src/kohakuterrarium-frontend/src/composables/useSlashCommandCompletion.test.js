@@ -50,11 +50,12 @@ describe("useSlashCommandCompletion", () => {
     expect(completion.open.value).toBe(true)
   })
 
-  it("shows only inventory /goal and enabled skills outside the full command namespace", async () => {
+  it("shows inventory /goal, /btw and enabled skills outside the full command namespace", async () => {
     const chat = reactive({
       commandInventoryByTab: {
         kohaku: {
           commands: [
+            { name: "btw", aliases: [], description: "Ask a side question" },
             { name: "model", aliases: ["llm"], description: "Switch model" },
             { name: "goal", aliases: [], description: "Manage goals" },
             { name: "status", aliases: ["info"], description: "Show status" },
@@ -79,9 +80,19 @@ describe("useSlashCommandCompletion", () => {
     await nextTick()
 
     expect(completion.entries.value.map((entry) => `${entry.type}:${entry.name}`)).toEqual([
+      "command:btw",
       "command:goal",
       "skill:research",
     ])
+    inputText.value = "/bt"
+    await nextTick()
+    expect(completion.entries.value.map((entry) => entry.name)).toEqual(["btw"])
+    completion.choose(completion.entries.value[0])
+    expect(inputText.value).toBe("/btw ")
+    expect(chat.markSlashTarget).toHaveBeenLastCalledWith(
+      expect.objectContaining({ key: "kohaku" }),
+      expect.objectContaining({ type: "command", name: "btw" }),
+    )
   })
 
   it("does not synthesize /goal when the live inventory does not contain it", async () => {

@@ -18,6 +18,8 @@ logger = get_logger(__name__)
 class CLIInput(BaseInputModule):
     """Read terminal lines asynchronously and dispatch slash commands."""
 
+    supports_busy_commands = True
+
     def __init__(
         self,
         prompt: str = "> ",
@@ -29,11 +31,13 @@ class CLIInput(BaseInputModule):
         self.prompt = prompt
         self.exit_commands = exit_commands or ["/exit", "/quit", "exit", "quit"]
         self._exit_requested = False
+        self._input_closed = False
+        self._command_answer: asyncio.Future[str] | None = None
 
     @property
     def exit_requested(self) -> bool:
         """Return whether terminal input requested shutdown."""
-        return self._exit_requested
+        return self._exit_requested or self._input_closed
 
     async def _on_start(self) -> None:
         """Log that terminal input is ready."""
@@ -41,22 +45,30 @@ class CLIInput(BaseInputModule):
 
     async def _on_stop(self) -> None:
         """Log that terminal input has stopped."""
+        if self._command_answer is not None and not self._command_answer.done():
+            self._command_answer.cancel()
         logger.debug("CLI input stopped")
 
     async def get_input(self) -> TriggerEvent | None:
         """Return the next user event, or ``None`` after exit or EOF."""
-        if not self._running or self._exit_requested:
+        if not self._running or self.exit_requested:
             return None
 
         try:
             loop = asyncio.get_event_loop()
             line = await loop.run_in_executor(None, self._read_line)
 
+            answer = self._command_answer
             if line is None:
-                self._exit_requested = True
+                self._input_closed = True
+                if answer is not None and not answer.done():
+                    answer.set_result("")
                 return None
 
             line = line.strip()
+            if answer is not None and not answer.done():
+                answer.set_result(line)
+                return await self.get_input()
 
             # Raw exit words remain available when user commands are not installed.
             if not self._user_commands and line.lower() in self.exit_commands:
@@ -64,6 +76,10 @@ class CLIInput(BaseInputModule):
                 return None
 
             if line.startswith("/"):
+                if self.defer_command(line):
+                    event = create_user_input_event(line)
+                    event.context["deferred_input_command"] = True
+                    return event
                 result = await self.try_user_command(line)
                 if result is not None:
                     if result.error:
@@ -80,12 +96,24 @@ class CLIInput(BaseInputModule):
             return create_user_input_event(line)
 
         except (KeyboardInterrupt, EOFError):
-            self._exit_requested = True
+            self._input_closed = True
             return None
         except Exception as e:
-            self._exit_requested = True
+            self._input_closed = True
             logger.error("Error reading input", error=str(e))
             return None
+        finally:
+            answer = self._command_answer
+            if self.exit_requested and answer is not None and not answer.done():
+                answer.set_result("")
+
+    async def present_command_result(
+        self, result: UserCommandResult, name: str
+    ) -> None:
+        text = f"Error: {result.error}" if result.error else result.output
+        if text:
+            sys.stdout.write(str(text) + "\n")
+            sys.stdout.flush()
 
     def _read_line(self) -> str | None:
         """Read one blocking line from stdin."""
@@ -103,17 +131,34 @@ class CLIInput(BaseInputModule):
         except (KeyboardInterrupt, EOFError):
             return None
 
+    async def _read_command_answer(self, prompt: str) -> str:
+        """Read a modal answer through the active reader, or legacy raw input."""
+        if self.exit_requested:
+            return ""
+        loop = asyncio.get_running_loop()
+        if self.command_idle_waiter is None:
+            return await loop.run_in_executor(None, lambda: input(prompt).strip())
+        if self._command_answer is not None:
+            raise RuntimeError("A terminal command prompt is already open")
+        answer = loop.create_future()
+        self._command_answer = answer
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        try:
+            return await answer
+        finally:
+            self._command_answer = None
+
     async def render_command_data(
         self, result: UserCommandResult, command_name: str
     ) -> UserCommandResult | None:
         """Render confirm and select command payloads in a plain terminal."""
         data = result.data
         data_type = data.get("type", "")
-        loop = asyncio.get_event_loop()
 
         if data_type == "confirm":
             print(data.get("message", "Confirm?"))
-            answer = await loop.run_in_executor(None, lambda: input("[y/N]: ").strip())
+            answer = await self._read_command_answer("[y/N]: ")
             if answer.lower() in ("y", "yes"):
                 action = data.get("action", "")
                 args = data.get("action_args", "")
@@ -133,7 +178,7 @@ class CLIInput(BaseInputModule):
                 extra_str = f"  ({extra})" if extra else ""
                 print(f"  {i:>3}. {label}{extra_str}{marker}")
             print(f"  Enter number (1-{len(options)}) or name, empty to cancel:")
-            choice = await loop.run_in_executor(None, lambda: input("> ").strip())
+            choice = await self._read_command_answer("> ")
             if not choice:
                 return UserCommandResult(output="Cancelled.", consumed=True)
             selected = None

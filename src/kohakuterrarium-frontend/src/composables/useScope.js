@@ -36,6 +36,7 @@
  */
 
 import { getCurrentInstance, inject, provide } from "vue"
+import { getActivePinia } from "pinia"
 
 /** Inject key used by the macro shell to thread the active target
  *  through the descendant component tree. ``string`` (not ``Symbol``)
@@ -44,7 +45,7 @@ import { getCurrentInstance, inject, provide } from "vue"
 export const SCOPE_INJECT_KEY = "kt:scope"
 
 const _refCounts = new Map()
-/** scope -> Set<() => void> */
+/** scope -> Map<disposer, bound disposer> */
 const _disposers = new Map()
 
 /**
@@ -103,7 +104,7 @@ export function releaseScope(scope) {
   _refCounts.delete(scope)
   const set = _disposers.get(scope)
   if (!set) return
-  for (const fn of set) {
+  for (const fn of set.values()) {
     try {
       fn()
     } catch {
@@ -121,10 +122,17 @@ export function registerScopeDisposer(scope, fn) {
   if (!scope || typeof fn !== "function") return
   let set = _disposers.get(scope)
   if (!set) {
-    set = new Set()
+    set = new Map()
     _disposers.set(scope, set)
   }
-  set.add(fn)
+  const pinia = getActivePinia()
+  set.set(fn, () => fn(pinia))
+}
+
+/** Dispose an instance and remove its state from the owning Pinia. */
+export function disposeScopeStore(store, pinia) {
+  store.$dispose()
+  delete pinia.state.value[store.$id]
 }
 
 /**

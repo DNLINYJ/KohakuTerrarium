@@ -8,11 +8,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kohakuterrarium.core.channel import ChannelMessage
+from kohakuterrarium.modules.output.router.router import OutputRouter
+from kohakuterrarium.modules.output.widgets.service import WidgetRecord
 from kohakuterrarium.studio.attach import input_ops as input_ops_mod
 from kohakuterrarium.studio.attach import io as io_mod
 from kohakuterrarium.studio.attach import io_cluster as io_cluster_mod
+from kohakuterrarium.testing.output import OutputRecorder
 from kohakuterrarium.testing.terrarium import TestTerrariumBuilder
-from kohakuterrarium.terrarium.service import LocalTerrariumService
+from kohakuterrarium.terrarium.service.service import LocalTerrariumService
 
 
 class _FakeWebSocket:
@@ -27,6 +30,14 @@ class _FakeWebSocket:
 
     async def send_json(self, data):
         self.sent.append(data)
+
+
+class _SlowWebSocket(_FakeWebSocket):
+    """Yields before each frame so the forward task can send queued frames."""
+
+    async def receive_json(self):
+        await asyncio.sleep(0.01)
+        return await super().receive_json()
 
 
 # ── _normalize_input_content ────────────────────────────────
@@ -506,6 +517,60 @@ class TestAttachIoLocal:
         finally:
             await t.shutdown()
 
+    async def test_widget_frames_reach_the_targeted_creature(self):
+        t = await (
+            TestTerrariumBuilder().with_creature("alice").with_creature("bob").build()
+        )
+        svc = LocalTerrariumService(t)
+        try:
+            routers = {}
+            for cid in ("alice", "bob"):
+                ag = t.get_creature(cid).agent
+                router = OutputRouter(OutputRecorder())
+                router.widgets.bind_agent(ag)
+                router.widgets.registry.add(
+                    WidgetRecord(widget_id=f"w_{cid}", renderer="kt.ui")
+                )
+                ag.output_router = router
+                ag.config = SimpleNamespace(model="m", name=cid)
+                routers[cid] = router
+            hellos = []
+            routers["bob"].add_renderers_listener(lambda old, new: hellos.append(new))
+            ws = _SlowWebSocket(
+                frames=[
+                    {"type": "client_hello", "renderers": {"kt.ui": 1}},
+                    {
+                        "type": "widget_msg",
+                        "target": "bob",
+                        "event_id": "w_bob",
+                        "name": "submit",
+                        "data": {"v": 1},
+                        "origin": "app",
+                    },
+                    {
+                        "type": "widget_state",
+                        "target": "bob",
+                        "event_id": "w_bob",
+                        "state": {"tab": 2},
+                    },
+                    {"type": "widget_msg", "event_id": "w_alice", "name": ""},
+                ]
+            )
+            with pytest.raises(RuntimeError):
+                await io_mod.attach_io(ws, svc, "_", "alice")
+            await routers["bob"].widgets.drain()
+            acks = [f for f in ws.sent if f.get("type") == "widget_ack"]
+            assert [(a["event_id"], a["kind"], a["status"]) for a in acks] == [
+                ("w_bob", "message", "dropped"),
+                ("w_alice", "message", "unknown"),
+            ]
+            bob = routers["bob"].widgets.registry.get("w_bob")
+            assert bob.state == {"tab": 2}
+            assert hellos[0] == {"kt.ui": 1}, "the hello reached sibling outputs too"
+            assert hellos[-1] == {}, "detach removed the stream output"
+        finally:
+            await t.shutdown()
+
     async def test_input_routed_to_target_creature(self):
         t = await (
             TestTerrariumBuilder().with_creature("alice").with_creature("bob").build()
@@ -869,7 +934,7 @@ class TestAttachIoRemoteFallback:
         t = await TestTerrariumBuilder().build()
         svc = LocalTerrariumService(t)
         # Override service to make get_creature_info return a fake info.
-        from kohakuterrarium.terrarium.service import CreatureInfo
+        from kohakuterrarium.terrarium.service.service import CreatureInfo
 
         info = CreatureInfo(
             creature_id="remote-cid",
@@ -954,7 +1019,7 @@ class TestAttachIoLabHostNameResolution:
     ``creature '<name>' not found`` and the user can't attach."""
 
     async def test_attach_by_name_resolves_to_remote(self, monkeypatch):
-        from kohakuterrarium.terrarium.service import CreatureInfo
+        from kohakuterrarium.terrarium.service.service import CreatureInfo
 
         info = CreatureInfo(
             creature_id="alice_abc12345",
@@ -983,7 +1048,7 @@ class TestAttachIoLabHostNameResolution:
 
     async def test_attach_by_id_still_resolves(self, monkeypatch):
         # The id form must keep working alongside name resolution.
-        from kohakuterrarium.terrarium.service import CreatureInfo
+        from kohakuterrarium.terrarium.service.service import CreatureInfo
 
         info = CreatureInfo(
             creature_id="bob_def67890",

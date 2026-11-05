@@ -7,14 +7,17 @@ is the piece that was NOT wired before: the saved ``/history/{target}`` route
 only ever returned the full snapshot.
 """
 
-from __future__ import annotations
-
 import pytest
+from kohakuvault import KVault
 
 from kohakuterrarium.errors import NotFoundError
-from kohakuterrarium.session.history_paging import HistoryPagingError
+from kohakuterrarium.session.history.paging import HistoryPagingError
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.studio.persistence.history import history_page_from_store
+from kohakuterrarium.studio.persistence.history import (
+    history_index_from_store,
+    history_page_from_store,
+)
+from kohakuterrarium.studio.persistence.viewer.summary import build_summary_payload
 
 
 @pytest.fixture()
@@ -131,6 +134,68 @@ def test_saved_nonpositive_limit_rejected(store):
             stream="events",
             limit=0,
         )
+
+
+def test_index_viewer_agents_are_key_only_and_do_not_expand_history_targets(
+    store, monkeypatch
+):
+    store.init_meta(
+        "discovery",
+        "terrarium",
+        "/p",
+        "/w",
+        ["alice", "bob"],
+        terrarium_channels=[{"name": "ops"}],
+    )
+    attached = "alice:attached:review:0"
+    for name in ["alice", "bob", "worker", attached]:
+        store.append_event(name, "user_input", {"content": name})
+    store.save_channel_message("ops", {"sender": "alice", "content": "hello"})
+    store.set_viewer_default_agent(attached)
+    store.flush()
+    reads = []
+    original_get = KVault.get
+    original_item = KVault.__getitem__
+    original_many = KVault.get_many
+
+    def get(vault, key, *args, **kwargs):
+        if vault is store.events:
+            reads.append(key)
+        return original_get(vault, key, *args, **kwargs)
+
+    def item(vault, key):
+        if vault is store.events:
+            reads.append(key)
+        return original_item(vault, key)
+
+    def many(vault, keys, *args, **kwargs):
+        if vault is store.events:
+            reads.extend(keys)
+        return original_many(vault, keys, *args, **kwargs)
+
+    monkeypatch.setattr(KVault, "get", get)
+    monkeypatch.setattr(KVault, "__getitem__", item)
+    monkeypatch.setattr(KVault, "get_many", many)
+    index = history_index_from_store(store, "discovery")
+    assert index["viewer_agents"] == [attached, "alice", "bob", "worker"]
+    assert index["targets"] == ["alice", "bob", "worker", "ch:ops"]
+    assert index["meta"]["agents"] == ["alice", "bob", "worker"]
+    assert reads == []
+    assert (
+        build_summary_payload(store, "discovery", None)["agents"]
+        == index["viewer_agents"]
+    )
+    assert reads
+    with pytest.raises(NotFoundError):
+        history_page_from_store(
+            store, session_id="s", session_name="s", target=attached
+        )
+    assert (
+        history_page_from_store(
+            store, session_id="s", session_name="s", target="ch:ops"
+        )["messages"][0]["content"]
+        == "hello"
+    )
 
 
 def test_saved_unknown_target_is_not_an_empty_page(store):

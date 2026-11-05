@@ -138,6 +138,68 @@ Collision policy is intentionally mixed:
 - procedural skills are the exception: they are last-wins, with narrower scope
   (project/user/creature) overriding package-shipped copies.
 
+### Dashboard UI (`ui:`)
+
+A package can add settings sections, tabs, rail groups, plugin side panels
+and in-chat tool / trigger renderers to the web dashboard. Every
+contribution names its owner module, and its components talk to that owner
+with `useOwner()`. See [UI extensions](ui-extensions.md) for the schema;
+`kt extension new <name> --ui` scaffolds a working example.
+
+### Custom LLM backends (`llm_backends:`)
+
+A package can add a new backend type, a transport for talking to a model,
+next to the built-in `openai`, `anthropic`, `codex`, … types:
+
+```yaml
+llm_backends:
+  - name: my-transport              # becomes a valid backend_type
+    module: my_pack.provider
+    class: MyProvider
+    display_name: My transport      # optional, shown in Settings
+    description: One line for the settings page.
+    credentials: api_key            # api_key (default) | external | none
+
+llm_presets:
+  - name: my-model
+    provider: my-transport          # the backend name above
+    model: real-model-id
+    max_context: 200000
+```
+
+The class subclasses `kohakuterrarium.llm.base.BaseLLMProvider` and adds one
+classmethod that builds it from a resolved profile:
+
+```python
+from kohakuterrarium.llm.base import BaseLLMProvider, LLMConfig
+
+
+class MyProvider(BaseLLMProvider):
+    @classmethod
+    def from_profile(cls, profile):
+        return cls(LLMConfig(model=profile.model))
+
+    async def _stream_chat(self, messages, *, tools=None, **kwargs):
+        yield "..."
+
+    @classmethod
+    def doctor(cls) -> str:          # optional: shown by `kt doctor`
+        return "ready"
+```
+
+- Every path that builds a model uses it: `kt run`, YAML configs, Settings,
+  `/model` switching, the compaction model and sub-agents.
+- The installed package adds a provider record with the same name. It is not
+  written to your `llm_profiles.yaml`, and it goes away when the package is
+  uninstalled.
+- `credentials: external` (or `none`) means the backend handles its own
+  sign-in: KohakuTerrarium never asks for, stores or checks an API key for
+  it, and `kt login <name>` only prints a notice.
+- Discovery reads the manifest only; the module is imported the first time a
+  profile on that backend is built.
+- A name equal to a built-in backend type is ignored. Two packages declaring
+  the same name is an error.
+
 ## Install modes
 
 ### Marketplace spec (`@name`)

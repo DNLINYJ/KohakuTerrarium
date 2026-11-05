@@ -8,8 +8,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from kohakuterrarium.serving import desktop
-from kohakuterrarium.serving.desktop_palette import BACKGROUND, FOREGROUND
+from kohakuterrarium.serving.desktop import desktop
+from kohakuterrarium.serving.desktop.palette import BACKGROUND, FOREGROUND
+from kohakuterrarium.utils.desktop_launch import LAUNCH_ENV, launch_url
 
 ROOT = Path(__file__).resolve().parents[3]
 SRC = ROOT / "src"
@@ -18,8 +19,87 @@ SRC = ROOT / "src"
 @pytest.fixture(autouse=True)
 def _isolate_native_dpi(monkeypatch):
     monkeypatch.setattr(
-        "kohakuterrarium.serving.desktop_chrome._enable_per_monitor_dpi", lambda: None
+        "kohakuterrarium.serving.desktop.chrome._enable_per_monitor_dpi", lambda: None
     )
+    monkeypatch.setattr(desktop, "native_window_available", lambda: True)
+
+
+def test_webview_settings_allow_downloads_and_external_links():
+    webview = SimpleNamespace(settings={"ALLOW_DOWNLOADS": False, "OTHER": 1})
+
+    desktop.configure_webview_settings(webview)
+
+    assert webview.settings == {
+        "ALLOW_DOWNLOADS": True,
+        "OPEN_EXTERNAL_LINKS_IN_BROWSER": True,
+        "OTHER": 1,
+    }
+
+
+def test_webview_without_a_settings_table_is_left_alone():
+    desktop.configure_webview_settings(SimpleNamespace())
+
+
+def test_the_window_is_configured_before_it_is_created(monkeypatch):
+    seen = []
+    webview = _Webview([])
+    webview.settings = {}
+    original = webview.create_window
+    webview.create_window = lambda *a, **k: (
+        seen.append(dict(webview.settings)) or original(*a, **k)
+    )
+    monkeypatch.setattr(desktop, "configure_utf8_stdio", lambda **_k: None)
+    monkeypatch.setattr(desktop.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(desktop, "_load_webview", lambda: webview)
+    monkeypatch.setattr(desktop, "_start_server", lambda **_k: SimpleNamespace(pid=1))
+    monkeypatch.setattr(
+        desktop, "_wait_for_server", lambda *_a, **_k: {"status": "error", "error": "x"}
+    )
+    monkeypatch.setattr(desktop, "_stop_server_child", lambda *_a, **_k: None)
+
+    desktop.run_desktop_app(port=8001, log_level="ERROR")
+
+    assert seen and seen[0]["ALLOW_DOWNLOADS"] is True
+
+
+def test_without_a_native_backend_the_app_opens_in_the_browser(monkeypatch, capsys):
+    served = []
+    timers = []
+    monkeypatch.setattr(desktop, "native_window_available", lambda: False)
+    monkeypatch.setattr(
+        desktop.subprocess,
+        "Popen",
+        lambda *a, **k: pytest.fail("a window process was started"),
+    )
+
+    class _Timer:
+        def __init__(self, delay, function, args=()):
+            timers.append((delay, function, args))
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(desktop.threading, "Timer", _Timer)
+    monkeypatch.setattr(
+        desktop.importlib,
+        "import_module",
+        lambda name: type(
+            "Web",
+            (),
+            {"run_web_server": staticmethod(lambda **kw: served.append((name, kw)))},
+        ),
+    )
+
+    assert desktop.launch_desktop_app(port=8123, log_level="ERROR") is None
+
+    assert served == [
+        (
+            "kohakuterrarium.serving.web",
+            {"host": "127.0.0.1", "port": 8123, "dev": False, "log_level": "ERROR"},
+        )
+    ]
+    assert timers == [(2.0, desktop.webbrowser.open, ("http://127.0.0.1:8123/",))]
+    assert "No native webview backend" in capsys.readouterr().err
 
 
 class _Events:
@@ -94,7 +174,7 @@ def test_desktop_module_import_stays_lightweight():
         [
             sys.executable,
             "-c",
-            "import json, sys; import kohakuterrarium.serving.desktop; "
+            "import json, sys; import kohakuterrarium.serving.desktop.desktop; "
             "print(json.dumps(sorted(sys.modules)))",
         ],
         cwd=ROOT,
@@ -126,7 +206,11 @@ def test_launcher_detaches_lightweight_desktop_process(monkeypatch, tmp_path):
 
     assert result is child
     assert (tmp_path / "config" / "app.log").exists()
-    assert calls[0][0][:3] == [sys.executable, "-m", "kohakuterrarium.serving.desktop"]
+    assert calls[0][0][:3] == [
+        sys.executable,
+        "-m",
+        "kohakuterrarium.serving.desktop.desktop",
+    ]
     assert "8123" in calls[0][0]
 
 
@@ -248,7 +332,7 @@ def test_windows_startup_passes_window_icon_to_webview(monkeypatch):
 
     desktop.run_desktop_app(port=8001, log_level="ERROR")
 
-    expected = Path(desktop.__file__).parent.parent / "app_icons" / "window.ico"
+    expected = Path(desktop.__file__).parents[2] / "app_icons" / "window.ico"
     assert starts and starts[0].get("icon") == str(expected)
 
 
@@ -328,11 +412,14 @@ def test_server_start_overlaps_loading_window_startup(monkeypatch):
     monkeypatch.setattr(desktop, "configure_utf8_stdio", lambda **_kwargs: None)
     monkeypatch.setattr(desktop.threading, "Thread", _ImmediateThread)
     monkeypatch.setattr(desktop, "_load_webview", lambda: webview)
-    monkeypatch.setattr(
-        desktop,
-        "_start_server",
-        lambda **_kwargs: order.append("server") or SimpleNamespace(pid=42),
-    )
+    started = {}
+
+    def _start(**kwargs):
+        started.update(kwargs)
+        order.append("server")
+        return SimpleNamespace(pid=42)
+
+    monkeypatch.setattr(desktop, "_start_server", _start)
     monkeypatch.setattr(
         desktop, "_wait_for_server", lambda *_args, **_kwargs: messages[0]
     )
@@ -343,12 +430,14 @@ def test_server_start_overlaps_loading_window_startup(monkeypatch):
     expected = [
         "get_desktop_capabilities",
         "request_desktop_attention",
+        "open_external",
     ]
     if sys.platform == "win32":
         expected.append("set_desktop_theme")
     assert [function.__name__ for function in webview.window.exposed] == expected
     assert order[:2] == ["server", "shown"]
-    assert webview.window.loaded == ["http://127.0.0.1:8123"]
+    assert started["token"]
+    assert webview.window.loaded == [launch_url(8123, started["token"])]
     assert webview.created[0][1]["html"] == desktop.LOADING_HTML
     assert webview.created[0][1]["background_color"] == BACKGROUND
 
@@ -368,8 +457,11 @@ def test_server_fallback_port_drives_navigation(monkeypatch):
     monkeypatch.setattr(desktop, "configure_utf8_stdio", lambda **_kwargs: None)
     monkeypatch.setattr(desktop.threading, "Thread", _ImmediateThread)
     monkeypatch.setattr(desktop, "_load_webview", lambda: webview)
+    started = {}
     monkeypatch.setattr(
-        desktop, "_start_server", lambda **_kwargs: SimpleNamespace(pid=42)
+        desktop,
+        "_start_server",
+        lambda **kwargs: started.update(kwargs) or SimpleNamespace(pid=42),
     )
     monkeypatch.setattr(
         desktop,
@@ -380,7 +472,98 @@ def test_server_fallback_port_drives_navigation(monkeypatch):
 
     desktop.run_desktop_app(port=8001, log_level="ERROR")
 
-    assert webview.window.loaded == ["http://127.0.0.1:8002"]
+    assert webview.window.loaded == [launch_url(8002, started["token"])]
+
+
+def test_subprocess_server_receives_the_launch_token_only_through_its_environment(
+    monkeypatch, tmp_path
+):
+    calls = []
+    monkeypatch.setenv("KT_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.delenv(LAUNCH_ENV, raising=False)
+    monkeypatch.setattr(
+        desktop.subprocess,
+        "Popen",
+        lambda cmd, **kwargs: calls.append((cmd, kwargs)) or SimpleNamespace(pid=1),
+    )
+
+    desktop._start_subprocess_server(
+        port=8123, log_level="ERROR", state_path=tmp_path / "state.json", token="tok-1"
+    )
+
+    command, kwargs = calls[0]
+    assert kwargs["env"][LAUNCH_ENV] == "tok-1"
+    assert "tok-1" not in " ".join(command)
+    assert LAUNCH_ENV not in os.environ
+
+
+def test_in_process_server_publishes_the_launch_token_for_the_app_factory(
+    monkeypatch, tmp_path
+):
+    seen = {}
+
+    def _start(port, log_level):
+        seen["token"] = os.environ.get(LAUNCH_ENV)
+        return SimpleNamespace(should_exit=False), 8123
+
+    monkeypatch.delenv(LAUNCH_ENV, raising=False)
+    monkeypatch.setattr(
+        "kohakuterrarium.serving.desktop.server.start_desktop_server", _start
+    )
+
+    desktop._start_in_process_server(
+        port=8001, log_level="ERROR", state_path=tmp_path / "state.json", token="tok-2"
+    )
+
+    assert seen["token"] == "tok-2"
+    assert LAUNCH_ENV not in os.environ
+
+
+def test_in_process_server_clears_the_launch_token_when_startup_fails(
+    monkeypatch, tmp_path
+):
+    def _boom(port, log_level):
+        raise RuntimeError("bind failed")
+
+    monkeypatch.delenv(LAUNCH_ENV, raising=False)
+    monkeypatch.setattr(
+        "kohakuterrarium.serving.desktop.server.start_desktop_server", _boom
+    )
+
+    with pytest.raises(RuntimeError, match="bind failed"):
+        desktop._start_in_process_server(
+            port=8001,
+            log_level="ERROR",
+            state_path=tmp_path / "state.json",
+            token="tok-3",
+        )
+
+    assert LAUNCH_ENV not in os.environ
+
+
+def test_each_launch_gets_a_distinct_token(monkeypatch):
+    tokens = []
+    for _ in range(2):
+        webview = _Webview([])
+        monkeypatch.setattr(desktop, "configure_utf8_stdio", lambda **_kwargs: None)
+        monkeypatch.setattr(desktop.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(desktop, "_load_webview", lambda webview=webview: webview)
+        monkeypatch.setattr(
+            desktop,
+            "_start_server",
+            lambda **kwargs: tokens.append(kwargs["token"]) or SimpleNamespace(pid=1),
+        )
+        monkeypatch.setattr(
+            desktop,
+            "_wait_for_server",
+            lambda *_a, **_k: {"status": "ready", "port": 8002},
+        )
+        monkeypatch.setattr(
+            desktop, "_stop_server_child", lambda *_args, **_kwargs: None
+        )
+        desktop.run_desktop_app(port=8001, log_level="ERROR")
+
+    assert len(set(tokens)) == 2 and all(len(token) >= 32 for token in tokens)
 
 
 def test_server_error_replaces_loading_shell(monkeypatch):
@@ -456,14 +639,14 @@ def test_window_close_stops_server_child(monkeypatch):
 
 
 def test_server_child_publishes_ready_state(monkeypatch, tmp_path):
-    from kohakuterrarium.serving import desktop_server
+    from kohakuterrarium.serving.desktop import server as desktop_server
 
     state = tmp_path / "state.json"
     server = SimpleNamespace(should_exit=True)
     monkeypatch.setattr(
         desktop_server,
         "start_desktop_server",
-        lambda _port, _level: (server, 8002),
+        lambda _port, _level, *, source=False: (server, 8002),
     )
 
     assert desktop_server.run_server_child(8001, "ERROR", state) == 0
@@ -471,13 +654,15 @@ def test_server_child_publishes_ready_state(monkeypatch, tmp_path):
 
 
 def test_server_child_publishes_startup_error(monkeypatch, tmp_path):
-    from kohakuterrarium.serving import desktop_server
+    from kohakuterrarium.serving.desktop import server as desktop_server
 
     state = tmp_path / "state.json"
     monkeypatch.setattr(
         desktop_server,
         "start_desktop_server",
-        lambda _port, _level: (_ for _ in ()).throw(RuntimeError("bind failed")),
+        lambda _port, _level, *, source=False: (_ for _ in ()).throw(
+            RuntimeError("bind failed")
+        ),
     )
 
     assert desktop_server.run_server_child(8001, "ERROR", state) == 1
@@ -501,7 +686,7 @@ def test_in_process_server_waits_for_uvicorn_thread():
 
 
 def test_server_child_reports_runtime_exit(monkeypatch, tmp_path):
-    from kohakuterrarium.serving import desktop_server
+    from kohakuterrarium.serving.desktop import server as desktop_server
 
     state = tmp_path / "state.json"
     thread = SimpleNamespace(is_alive=lambda: False)
@@ -509,7 +694,7 @@ def test_server_child_reports_runtime_exit(monkeypatch, tmp_path):
     monkeypatch.setattr(
         desktop_server,
         "start_desktop_server",
-        lambda _port, _level: (server, 8002),
+        lambda _port, _level, *, source=False: (server, 8002),
     )
 
     assert desktop_server.run_server_child(8001, "ERROR", state) == 1
@@ -520,7 +705,7 @@ def test_server_child_reports_runtime_exit(monkeypatch, tmp_path):
 
 
 def test_windows_pid_probe_uses_process_handle(monkeypatch):
-    from kohakuterrarium.serving import desktop_server
+    from kohakuterrarium.serving.desktop import server as desktop_server
 
     calls = []
     kernel32 = SimpleNamespace(
@@ -542,7 +727,7 @@ def test_windows_pid_probe_uses_process_handle(monkeypatch):
 
 
 def test_server_child_exits_when_ui_parent_dies(monkeypatch, tmp_path):
-    from kohakuterrarium.serving import desktop_server
+    from kohakuterrarium.serving.desktop import server as desktop_server
 
     state = tmp_path / "state.json"
     joined = []
@@ -553,7 +738,7 @@ def test_server_child_exits_when_ui_parent_dies(monkeypatch, tmp_path):
     monkeypatch.setattr(
         desktop_server,
         "start_desktop_server",
-        lambda _port, _level: (server, 8002),
+        lambda _port, _level, *, source=False: (server, 8002),
     )
     monkeypatch.setattr(desktop_server, "_pid_alive", lambda _pid: False)
 
@@ -563,14 +748,14 @@ def test_server_child_exits_when_ui_parent_dies(monkeypatch, tmp_path):
 
 
 def test_server_child_honors_shutdown_state(monkeypatch, tmp_path):
-    from kohakuterrarium.serving import desktop_server
+    from kohakuterrarium.serving.desktop import server as desktop_server
 
     state = tmp_path / "state.json"
     server = SimpleNamespace(should_exit=False)
     monkeypatch.setattr(
         desktop_server,
         "start_desktop_server",
-        lambda _port, _level: (server, 8002),
+        lambda _port, _level, *, source=False: (server, 8002),
     )
 
     def request_shutdown(_seconds):

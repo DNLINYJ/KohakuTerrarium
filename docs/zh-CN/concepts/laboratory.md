@@ -169,7 +169,7 @@ msgpack body。两端按命名空间注册 *扩展处理器*；分发表是它�
 ## 透明化目标 1：Studio 只看到一套系统
 
 Studio 永远不知道某个生物是跑在进程内、还是远端机器上。
-`TerrariumService` Protocol（`src/kohakuterrarium/terrarium/service.py`）
+`TerrariumService` Protocol（`src/kohakuterrarium/terrarium/service/service.py`）
 有 `add_creature`、`list_creatures`、`chat`、`connect` 这些方法。
 有三个实现：
 
@@ -193,7 +193,7 @@ Studio 永远不知道某个生物是跑在进程内、还是远端机器上。
 （包括 worker-2 上的 listener），就像两个生物住在同一个进程里一
 样。Lab 通过两个机制实现这一点：
 
-- **跨节点 connect**（`terrarium/multi_node_replication.py`）。
+- **跨节点 connect**（`terrarium/multi_node/replication.py`）。
   当用户调用 `service.connect(creatureA, creatureB)`、两个生物
   住在不同的工作节点上时，主机会：
   1. 在两个工作节点的图上都添加该通道对象。
@@ -320,7 +320,7 @@ Resume 跑的还是它一直跑的那段 `engine.adopt_session(path)`，
 `_ensure_store_meta`（[`_worker_session.py`](_worker_session.py-line)）
 会通过 `pack_agent_config` 捕获完整的 `AgentConfig` 并把它存
 在 `meta["config_snapshot"]` 下。Resume 路径
-（`session/resume.py::_rebuild_agent`）在文件夹存在时优先用
+（`session/resume/resume.py::_rebuild_agent`）在文件夹存在时优先用
 `config_path`，否则 fallback 到 `unpack_agent_config(snapshot)`。
 
 ### 单生物 resume（CF-6 基线）
@@ -408,7 +408,7 @@ Resume 时，`_resume_terrarium_into_engine` 先重建 recipe 描述
 为快照是*完整的*（不是 delta log），用户的移除也被反映出来：
 任何被用户移除的东西就是不在快照里。
 
-实现：`src/kohakuterrarium/terrarium/topology_snapshot.py`。
+实现：`src/kohakuterrarium/terrarium/graph/snapshot.py`。
 测试：`tests/integration/test_runtime_topology_resume.py`。
 
 ### 当前已知的限制

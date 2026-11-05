@@ -1,0 +1,30 @@
+name: {{name}}
+version: 0.1.0
+description: "{{name}}: a KohakuTerrarium package with dashboard UI."
+
+plugins:
+  - name: {{module}}_panel
+    module: {{module}}.plugin
+    class: PanelPlugin
+    description: Counts turns and shows them in a chat side panel.
+
+ui:
+  sdk: ">=1,<2"
+  entry: ui/index.js
+  styles: [ui/style.css]
+  i18n:
+    en: ui/i18n/en.json
+  # Package-wide owner: one instance per host process (ui_state / ui_call).
+  handler: {{module}}.ui_owner:PackageUI
+  # Fallback only: raw routes under /api/ext/{{name}}/. Prefer the owner RPC.
+  api: {{module}}.api:router
+  contributes:
+    - kind: settings
+      id: settings
+      label: "{{name}}"
+      owner: package
+    - kind: panel
+      id: panel
+      label: "{{name}} panel"
+      owner: plugin:{{module}}_panel
+      description: Shown when the focused creature has the {{module}}_panel plugin.

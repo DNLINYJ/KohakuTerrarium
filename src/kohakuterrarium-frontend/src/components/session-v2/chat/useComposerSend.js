@@ -13,6 +13,7 @@ import { ElMessage, ElMessageBox } from "element-plus"
 import { computed, nextTick, ref, watch } from "vue"
 
 import { useV2T } from "@/components/session-v2/model/v2Strings"
+import { useSideConversation } from "@/composables/useSideConversation"
 import { useSlashCommandCompletion } from "@/composables/useSlashCommandCompletion"
 import { _parseSlashCommand } from "@/stores/chat"
 import { terrariumAPI } from "@/utils/api"
@@ -34,6 +35,7 @@ export function useComposerSend({ chat, tabKey, instance, attachments = ref([]),
   const composerRevision = ref(0)
   const submitInFlight = ref(false)
   const composerEl = ref(null)
+  const sideConversation = useSideConversation({ chat, tabKey })
 
   const slash = useSlashCommandCompletion({ chat, inputText, activeTabKey: tabKey })
 
@@ -51,7 +53,11 @@ export function useComposerSend({ chat, tabKey, instance, attachments = ref([]),
   watch(() => draftKey(), restoreDraft, { immediate: true })
   watch(inputText, persistDraft)
 
-  const processing = computed(() => (tabKey.value ? !!chat.processingByTab[tabKey.value] : false))
+  const processing = computed(() => {
+    if (!tabKey.value?.startsWith("ch:") && _parseSlashCommand(inputText.value)?.command === "btw")
+      return false
+    return tabKey.value ? !!chat.processingByTab[tabKey.value] : false
+  })
   const placeholder = computed(() => {
     const tab = tabKey.value
     if (!tab) return t("chat.selectTab")
@@ -119,6 +125,10 @@ export function useComposerSend({ chat, tabKey, instance, attachments = ref([]),
       return
     }
     const payload = response.data
+    if (payload?.type === "side_conversation") {
+      sideConversation.open(payload, target)
+      return
+    }
     if (payload?.type === "notify" && payload.message) {
       ;(ElMessage[payload.level || "info"] || ElMessage.info)(payload.message)
       return
@@ -162,6 +172,11 @@ export function useComposerSend({ chat, tabKey, instance, attachments = ref([]),
       }
       const sendText = inputText.value
       const sendAttachments = [...attachments.value]
+      const isBtw = !sendTab.startsWith("ch:") && _parseSlashCommand(sendText)?.command === "btw"
+      if (isBtw && sendAttachments.length) {
+        ElMessage.error("/btw accepts text only. Remove attachments first.")
+        return
+      }
       const revision = composerRevision.value
       const generation = chat._instanceGeneration
       const instId = chat._instanceId
@@ -224,7 +239,7 @@ export function useComposerSend({ chat, tabKey, instance, attachments = ref([]),
         inline,
         resultContext,
       }
-      const viaHttp = sendTab.startsWith("ch:") || inline
+      const viaHttp = sendTab.startsWith("ch:") || inline || isBtw
       if (!viaHttp && chat._ws?.readyState !== WebSocket.OPEN) {
         if (inline) chat.releaseCommandResultContext(sendTab, resultContext)
         clearOwnedSlashTarget()
@@ -241,7 +256,7 @@ export function useComposerSend({ chat, tabKey, instance, attachments = ref([]),
           persistDraft()
           nextTick(() => composerEl.value?.resetHeight?.())
         }
-        onSent?.()
+        if (!isBtw) onSent?.()
         if (viaHttp) outcome = await pending
         if (outcome?.handled === "command") {
           if (!sameSession()) chat.releaseCommandResultContext(target.tabKey, target.resultContext)
@@ -306,6 +321,7 @@ export function useComposerSend({ chat, tabKey, instance, attachments = ref([]),
   }
 
   return {
+    sideConversation,
     inputText,
     attachments,
     composerEl,

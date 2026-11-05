@@ -132,7 +132,7 @@ Tool args (shape; concrete syntax depends on your `tool_format`; default bracket
 [search_memory/]
 ```
 
-For RAG over *external* sources, build a custom tool or a [prompt plugin](plugins.md) that calls your vector store.
+For RAG over *external* sources, build a custom tool or a [plugin](plugins.md) that calls your vector store.
 
 ## Configuring memory in a creature
 
@@ -149,8 +149,8 @@ Agents with this block indexed automatically as events land; no `kt embedding` c
 
 ```python
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.session.memory import SessionMemory
-from kohakuterrarium.session.embedding import GeminiEmbedder
+from kohakuterrarium.session.memory.index import SessionMemory
+from kohakuterrarium.session.memory.embedding import GeminiEmbedder
 
 store = SessionStore("~/.kohakuterrarium/sessions/swe.kohakutr")
 embedder = GeminiEmbedder("gemini-embedding-004", api_key="...")

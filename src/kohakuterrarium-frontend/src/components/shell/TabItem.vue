@@ -1,5 +1,5 @@
 <template>
-  <div class="group h-8 flex items-center gap-1.5 pl-3 pr-1.5 text-xs border-r border-warm-200 dark:border-warm-700 cursor-pointer select-none shrink-0" :class="active ? 'bg-[var(--kt-shell-tab-active)] dark:bg-warm-950 text-warm-800 dark:text-warm-200 border-b-2 border-b-iolite' : 'text-warm-600 dark:text-warm-500 hover:bg-warm-300/40 dark:hover:bg-warm-800/40'" :draggable="true" @click="$emit('activate')" @mousedown.middle.prevent="onMiddleClick" @dragstart="onDragStart" @dragover.prevent @drop.stop.prevent="$emit('drop', $event)" @contextmenu.prevent="onContextMenu">
+  <div class="group h-8 flex items-center gap-1.5 pl-3 pr-1.5 text-xs border-r border-warm-200 dark:border-warm-700 cursor-pointer select-none shrink-0" :class="active ? 'bg-[var(--kt-shell-tab-active)] dark:bg-warm-950 text-warm-800 dark:text-warm-200 border-b-2 border-b-iolite' : 'text-warm-600 dark:text-warm-500 hover:bg-warm-300/40 dark:hover:bg-warm-800/40'" :draggable="true" @click="$emit('activate')" @mousedown.middle.prevent="onMiddleClick" @dragstart="onDragStart" @dragend="onDragEnd" @dragover.prevent @drop.stop.prevent="$emit('drop', $event)" @contextmenu.prevent="onContextMenu">
     <span :class="[iconClass, isDashboard ? 'text-iolite' : '']" class="text-sm shrink-0" />
     <span class="truncate max-w-32">{{ label }}</span>
     <span v-if="badge" class="text-xs font-bold" :title="badge === '!' ? 'pending attention' : 'completed attention'">{{ badge }}</span>
@@ -14,10 +14,16 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue"
 
 import TabContextMenu from "@/components/shell/TabContextMenu.vue"
+import { tabMenuItems } from "@/components/shell/tabMenu"
+import { runActionMenuId } from "@/ext/actions"
+import { nativeMenuSupported, showNativeMenu } from "@/utils/nativeMenu"
+import { dragOutPosition, endedOutsideWindow, moveTabToWindow } from "@/composables/useDesktopPopout"
 import { useSplitDrag } from "@/composables/useSplitDrag"
+import { extensionTabMeta } from "@/ext/registry"
 import { attentionForScope, subscribeAttention } from "@/stores/attention"
 import { useAttentionPrefs } from "@/stores/attentionPrefs"
 import { useTabsStore } from "@/stores/tabs"
+import { popoutWindowsSupported } from "@/utils/hostBridge"
 import { useI18n } from "@/utils/i18n"
 
 const { t } = useI18n()
@@ -70,7 +76,44 @@ function onDragStart(ev) {
   ev.dataTransfer.setData("text/plain", props.tab.id)
 }
 
-function onContextMenu(ev) {
+function onDragEnd(ev) {
+  if (props.tab.kind !== "attach" || !popoutWindowsSupported() || !endedOutsideWindow(ev)) return
+  void moveTabToWindow(props.tab, dragOutPosition(ev))
+}
+
+function runMenuChoice(id) {
+  const context = { id: props.tab.id, kind: props.tab.kind || "", label: props.tab.label || "" }
+  switch (id) {
+    case "refresh":
+      return onRefresh()
+    case "move":
+      return void moveTabToWindow(props.tab)
+    case "close":
+      return emit("close")
+    case "close-left":
+      return closeLeft()
+    case "close-right":
+      return closeRight()
+    case "close-others":
+      return closeOthers()
+    case "close-all":
+      return closeAll()
+    default:
+      return void runActionMenuId(id, context)
+  }
+}
+
+async function onContextMenu(ev) {
+  if (nativeMenuSupported()) {
+    const items = tabMenuItems({
+      tab: props.tab,
+      index: tabIndex.value,
+      total: totalTabs.value,
+      canPopOut: props.tab.kind === "attach" && popoutWindowsSupported(),
+      t,
+    })
+    if (await showNativeMenu(items, runMenuChoice)) return
+  }
   menuPos.value = { x: ev.clientX, y: ev.clientY }
   menuOpen.value = true
 }
@@ -116,7 +159,9 @@ const iconClass = computed(
       settings: "i-carbon-settings",
       "code-editor": "i-carbon-code",
       graph: "i-carbon-network-3",
-    })[props.tab.kind] ?? "i-carbon-circle",
+    })[props.tab.kind] ??
+    extensionTabMeta(props.tab.kind)?.icon ??
+    "i-carbon-circle",
 )
 
 const label = computed(() => {
@@ -151,7 +196,7 @@ const label = computed(() => {
     case "graph":
       return tab.config_name ? `${tab.config_name} · ${t("graph.tab.suffix")}` : t("graph.tab.title")
     default:
-      return tab.kind
+      return extensionTabMeta(tab.kind)?.label ?? tab.label ?? tab.kind
   }
 })
 </script>

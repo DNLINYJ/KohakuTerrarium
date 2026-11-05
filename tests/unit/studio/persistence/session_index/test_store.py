@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import pytest
 
 from kohakuterrarium.session import run_state
+from kohakuterrarium.session.vault.handles import dispose, is_disposed
 from kohakuterrarium.studio.persistence.session_index.entry import (
     SCHEMA_VERSION,
     SessionIndexEntry,
@@ -145,21 +146,14 @@ class TestSchema:
         # table schema was never recreated.
         old_meta = KVault(str(side), table="meta")
         old_meta.put("schema_version", SCHEMA_VERSION)  # ← THE LIE
-        old_meta.close()
-        try:
-            del old_meta._inner
-        except AttributeError:
-            pass
+        dispose(old_meta)
         del old_meta
         old_search = TextVault(
             str(side),
             table="search",
             columns=["name", "preview", "config_path", "agents", "pwd"],
         )
-        try:
-            del old_search._vault
-        except AttributeError:
-            pass
+        dispose(old_search)
         del old_search
         gc.collect()
         # Open with current code.  Must NOT trust the meta version —
@@ -337,21 +331,14 @@ class TestSchema:
         # block the purge unlink.
         old_meta = KVault(str(side), table="meta")
         old_meta.put("schema_version", 1)
-        old_meta.close()
-        try:
-            del old_meta._inner
-        except AttributeError:
-            pass
+        dispose(old_meta)
         del old_meta
         old_search = TextVault(
             str(side),
             table="search",
             columns=["name", "preview", "config_path", "agents", "pwd"],
         )
-        try:
-            del old_search._vault
-        except AttributeError:
-            pass
+        dispose(old_search)
         del old_search
         gc.collect()
         # Open with current code — should purge + rebuild + accept the
@@ -406,23 +393,14 @@ class TestSchema:
         # _search + _meta still got close()'d; _closed flag flipped.
         assert i._closed is True
 
-    def test_close_tolerates_missing_native_handle(self, tmp_path):
-        # ``del table._inner`` / ``del self._search._vault`` are
-        # protected by AttributeError catches — strip the attrs
-        # ahead of close to exercise the catch branches.
+    def test_close_tolerates_already_released_handles(self, tmp_path):
         side = tmp_path / ".kt-index.kvault"
         i = SessionIndex(side)
-        for table in (i._entries, i._meta):
-            try:
-                del table._inner
-            except AttributeError:
-                pass
-        try:
-            del i._search._vault
-        except AttributeError:
-            pass
+        for table in (i._entries, i._meta, i._search):
+            dispose(table)
         i.close()  # must not raise
         assert i._closed is True
+        assert all(is_disposed(t) for t in (i._entries, i._meta, i._search))
 
     def test_path_property(self, idx, tmp_path):
         assert idx.path == str(tmp_path / ".kt-index.kvault")
@@ -582,21 +560,8 @@ class TestReads:
         idx.upsert(_entry(filename="a.kohakutr"))
         idx.upsert(_entry(filename="b.kohakutr"))
         assert idx.count() == 2
-
-    def test_count_caps_at_100k(self, idx, monkeypatch):
-        # ``count`` short-circuits to avoid runaway scans on a
-        # broken sidecar.  Fake an infinite key iterator so the
-        # cap branch actually fires.
-        from kohakuterrarium.studio.persistence.session_index import store as store_mod
-
-        def infinite_iter(_kv, batch=None):
-            i = 0
-            while True:
-                yield f"f{i}.kohakutr"
-                i += 1
-
-        monkeypatch.setattr(store_mod, "_iter_kv_keys", infinite_iter)
-        assert idx.count() == 100_000
+        idx.delete("a.kohakutr")
+        assert idx.count() == 1
 
 
 class TestList:

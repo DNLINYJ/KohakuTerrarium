@@ -17,7 +17,7 @@
 
 import { getCurrentInstance } from "vue"
 
-import { injectScope, registerScopeDisposer } from "@/composables/useScope"
+import { injectScope, disposeScopeStore, registerScopeDisposer } from "@/composables/useScope"
 
 const _options = {
   state: () => ({
@@ -145,10 +145,10 @@ function _factoryFor(scope) {
     useFn = defineStore(`status:${key}`, _options)
     _factories.set(key, useFn)
     if (scope) {
-      registerScopeDisposer(scope, () => {
+      registerScopeDisposer(scope, (pinia) => {
         try {
-          useFn()._clearElapsedTimer?.()
-          useFn().$dispose?.()
+          useFn(pinia)._clearElapsedTimer?.()
+          disposeScopeStore(useFn(pinia), pinia)
         } catch {
           /* swallow */
         }

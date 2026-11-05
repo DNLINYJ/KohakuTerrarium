@@ -16,6 +16,7 @@
 <script setup>
 import { computed, ref } from "vue"
 import MarkdownIt from "markdown-it"
+import markdownItCjkFriendly from "markdown-it-cjk-friendly"
 
 import { applyExternalLinkRule } from "@/utils/externalLinks"
 
@@ -29,7 +30,7 @@ const md = new MarkdownIt({
   html: false,
   linkify: true,
   breaks: true,
-})
+}).use(markdownItCjkFriendly)
 
 // Model-authored links must not navigate the shell away from the app.
 applyExternalLinkRule(md)

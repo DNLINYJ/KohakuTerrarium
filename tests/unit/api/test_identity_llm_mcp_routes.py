@@ -5,7 +5,13 @@ from fastapi.testclient import TestClient
 
 from kohakuterrarium.api.routes.identity import llm as llm_mod
 from kohakuterrarium.api.routes.identity import mcp as mcp_mod
-from kohakuterrarium.llm import profiles
+from kohakuterrarium.llm.profiles import resolve as profiles
+
+from tests.unit._fakes.package_backend import (
+    echo_backend,
+    install_backend_package,
+    kt_home,  # noqa: F401
+)
 
 
 def _app(*routers) -> FastAPI:
@@ -69,6 +75,14 @@ class TestLlmBackendsRoutes:
         resp = client.get("/backends")
         assert resp.status_code == 200
         assert resp.json()["backends"][0]["name"] == "openai"
+
+    def test_backend_types_include_package_types(self, kt_home):
+        install_backend_package(kt_home, "pkg-x", [echo_backend()])
+        client = TestClient(_app(llm_mod.router))
+        rows = client.get("/backend-types").json()["backend_types"]
+        package_rows = [r for r in rows if r["source"] == "package"]
+        assert [(r["name"], r["package"]) for r in package_rows] == [("echo", "pkg-x")]
+        assert "openai" in {r["name"] for r in rows}
 
     def test_create_backend(self, monkeypatch):
         captured = {}

@@ -29,7 +29,11 @@ class TestMediaPolicy:
     def test_defaults_persist_and_pin(self):
         policy = MediaPolicy()
         assert policy.persist is True and policy.pinned is True
-        assert policy.to_dict() == {"persist": True, "pinned": True}
+        assert policy.to_dict() == {
+            "persist": True,
+            "pinned": True,
+            "inline_fallback": False,
+        }
 
     def test_coerce_accepts_policy_mapping_and_nothing(self):
         base = MediaPolicy(persist=False, pinned=False)
@@ -61,3 +65,12 @@ class TestMediaPolicy:
 
     def test_objects_without_a_policy_get_the_default(self):
         assert resolve_media_policy(object(), {}) == MediaPolicy()
+
+    def test_inline_fallback_round_trips_and_can_be_overridden(self):
+        policy = MediaPolicy(pinned=False, inline_fallback=True)
+        assert MediaPolicy.coerce(policy.to_dict()) == policy
+        assert MediaPolicy.coerce({"pinned": True}, policy).inline_fallback is True
+        assert MediaPolicy.coerce({"inline_fallback": False}, policy) == MediaPolicy(
+            pinned=False
+        )
+        assert MediaPolicy.coerce(MediaPolicy().to_dict(), policy) == MediaPolicy()

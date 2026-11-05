@@ -91,7 +91,8 @@ A terrarium composes multiple creatures horizontally through channels, lifecycle
 - **Built-in session persistence and resume.** The engine mints and owns session files (`session=` / `Terrarium(session_dir=)`); resume hours later with `kt resume` or `Terrarium.resume`. `SessionReader` replays any finished run offline.
 - **Searchable session history.** Every event is indexed. `kt search` and the `search_memory` tool let you (and the agent) look up past work.
 - **Non-blocking context compaction.** Long-running agents keep working while context compacts in the background.
-- **Comprehensive built-in tools and sub-agents.** File, shell, web, JSON, notebook, search, editing, planning, review, research, plus the `group_*` graph-editor tools on privileged nodes.
+- **Comprehensive built-in tools and sub-agents.** File, shell, web, JSON, notebook, search, editing, bounded exploration and review, plus the `group_*` graph-editor tools on privileged nodes.
+- **Context-aware side conversations.** The default-on inspection-only `fork` helper and `/btw` use an isolated snapshot of parent context. Ask, reopen, and continue a side question without feeding it or its answer into the main task; opt out with `fork_enabled: false`. [Guide](docs/en/guides/sub-agents.md#context-forks-and-btw).
 - **MCP support.** Connect stdio / streamable-HTTP MCP servers per-agent or globally; four meta-tools keep the prompt small no matter how many servers you attach.
 - **Package system + marketplace.** `kt install @name` resolves through [TerrariumMarket](https://github.com/Kohaku-Lab/TerrariumMarket); `kohakuterrarium.packages.ensure("@name")` is the idempotent script-side primitive.
 - **Composition algebra.** `>>`, `&`, `|`, `*`, `.iterate` operators for stitching agents into pipelines.
@@ -290,7 +291,7 @@ A creature has six conceptual modules. **Five are user-extensible**: you swap th
 | **Trigger** | Generates automatic events | Timer, scheduler, channel watcher |
 | **Sub-agent** | Delegated task execution | Planning, code review, research |
 
-Plus **plugins**, which modify the connections *between* modules without forking them (prompt plugins, lifecycle hooks, gating). See the [plugins guide](docs/en/guides/plugins.md).
+Plus **plugins**, which modify the connections *between* modules without forking them (lifecycle hooks, prompt contributions, gating). See the [plugins guide](docs/en/guides/plugins.md).
 
 ### Environment and session
 

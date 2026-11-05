@@ -1,7 +1,11 @@
-import { createPinia, setActivePinia } from "pinia"
+import { createPinia, getActivePinia, setActivePinia } from "pinia"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
-import { disposeEventStreamStore, useEventStreamStore } from "@/stores/eventStream"
+import {
+  disposeEventStreamStore,
+  useEventStreamStore,
+  useEphemeralEventStreamStore,
+} from "@/stores/eventStream"
 import { sessionAPI } from "@/utils/api"
 
 vi.mock("@/utils/api", () => ({
@@ -17,6 +21,23 @@ function deferred() {
 }
 
 describe("event stream store", () => {
+  it("releases transient state and ignores pending responses after reopen", async () => {
+    const pinia = getActivePinia()
+    const request = deferred()
+    sessionAPI.getEvents.mockReturnValueOnce(request.promise)
+    const old = useEphemeralEventStreamStore("trace:disposed")
+    const loading = old.loadTurn("session", { turnIndex: 1 })
+    disposeEventStreamStore("trace:disposed")
+    expect(Object.hasOwn(pinia.state.value, old.$id)).toBe(false)
+    const fresh = useEphemeralEventStreamStore("trace:disposed")
+    request.resolve({ events: [{ event_id: 123 }], next_cursor: null })
+    await loading
+    expect(fresh.events).toEqual([])
+    expect(old.events).toEqual([])
+    expect(fresh.turnIndex).toBeNull()
+    disposeEventStreamStore("trace:disposed")
+  })
+
   beforeEach(() => {
     setActivePinia(createPinia())
     sessionAPI.getEvents.mockReset()

@@ -242,17 +242,25 @@ class TestPatchAndroidRequirements:
         rc = postcreate.patch_android_requirements(gen)
         assert rc == 0
 
-    def test_version_extracted_from_pyproject(self, tmp_path, postcreate, monkeypatch):
+    @pytest.mark.parametrize("spec", ["kohakuvault>=1.2.3", "kohakuvault>=1.2.3,<2"])
+    def test_version_extracted_from_pyproject(
+        self, tmp_path, postcreate, monkeypatch, spec
+    ):
         gen = _build_fake_generated(tmp_path)
         fake_repo = tmp_path / "fake_repo"
         fake_repo.mkdir()
-        self._seed_pyproject(fake_repo, "kohakuvault>=1.2.3")
+        self._seed_pyproject(fake_repo, spec)
         self._seed_requirements(gen, "kohakuvault>=1.2.3\n")
         monkeypatch.setattr(postcreate, "REPO_ROOT", fake_repo)
         postcreate.patch_android_requirements(gen)
         text = (gen / "requirements.txt").read_text(encoding="utf-8")
         assert "/releases/download/v1.2.3/" in text
         assert "kohakuvault-1.2.3-cp313-cp313-android_24_arm64_v8a.whl" in text
+
+    def test_real_pyproject_floor_is_parsed(self, postcreate):
+        version = postcreate._kohakuvault_version_from_pyproject()
+        text = (postcreate.REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        assert version and f'"kohakuvault>={version}' in text
 
     def test_drops_pymupdf_line(self, tmp_path, postcreate, monkeypatch):
         # pymupdf has no Chaquopy wheel and our consumers
