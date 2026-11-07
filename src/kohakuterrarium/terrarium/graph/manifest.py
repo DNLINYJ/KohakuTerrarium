@@ -355,9 +355,13 @@ def _capture_config(creature: Any) -> dict[str, Any]:
             f"Creature {creature.name!r} ({creature.creature_id}) has no "
             "declarative AgentConfig reconstruction provenance"
         )
-    config = getattr(getattr(creature, "agent", None), "config", None)
+    agent = getattr(creature, "agent", None)
+    config = getattr(agent, "config", None)
     if isinstance(config, AgentConfig):
         snapshot = pack_agent_config(config)
+        selector = getattr(agent, "_llm_selector", None)
+        if isinstance(selector, str) and selector:
+            snapshot["llm_profile"] = selector
         stable_name = getattr(creature, "config_name", "")
         if stable_name:
             snapshot["name"] = stable_name
