@@ -13,6 +13,8 @@ survive resume.
 """
 
 import asyncio
+import json
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,6 +25,11 @@ from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
 from kohakuterrarium.core.agent.history import compact as _agent_compact
 from kohakuterrarium.core.agent import model as _agent_model
+from kohakuterrarium.core.config.types import AgentConfig
+from kohakuterrarium.llm.presets.catalog import get_all_presets
+from kohakuterrarium.llm.profiles.backends import save_yaml_store
+from kohakuterrarium.llm.profiles.resolve import resolve_controller_llm
+from kohakuterrarium.modules.tool.base import ToolContext
 from kohakuterrarium.terrarium.graph import checkpoint as graph_checkpoint
 from kohakuterrarium.terrarium.config import load_terrarium_config
 from kohakuterrarium.terrarium.drive.config import (
@@ -41,6 +48,7 @@ from kohakuterrarium.session.readonly.metadata import read_session_meta
 from kohakuterrarium.terrarium.engine.engine import Terrarium
 from kohakuterrarium.terrarium.graph.manifest import MANIFEST_KEY
 from kohakuterrarium.terrarium.service.service import LocalTerrariumService
+from kohakuterrarium.terrarium.tools.lifecycle import GroupSpawnChildTool
 from kohakuterrarium.testing.llm import ScriptedLLM
 
 pytestmark = pytest.mark.timeout(60)
@@ -176,8 +184,20 @@ class TestRuntimeTopologyResume:
     close → cold-reopen + adopt_session → verify channel + wiring."""
 
     async def test_runtime_added_channel_and_wiring_survive_resume(
-        self, patched_llm, tmp_path
+        self, patched_llm, tmp_path, monkeypatch
     ):
+        def profiled_llm(config, llm=None):
+            provider = ScriptedLLM(["ack"])
+            profile = resolve_controller_llm(
+                _bootstrap_llm._extract_controller_data(config), llm
+            )
+            if profile:
+                provider._profile_max_context = profile.max_context
+                provider.reasoning_effort = profile.reasoning_effort
+            return provider
+
+        monkeypatch.setattr(_bootstrap_llm, "create_llm_provider", profiled_llm)
+        monkeypatch.setattr(_agent_init, "create_llm_provider", profiled_llm)
         recipe_path = _write_recipe(tmp_path)
         recipe = load_terrarium_config(str(recipe_path))
         sess_dir = tmp_path / "sessions"
@@ -209,6 +229,39 @@ class TestRuntimeTopologyResume:
 
         service = LocalTerrariumService(engine1)
 
+        selector = "codex/gpt-6-astra@context=400k,reasoning=low,speed=normal"
+        parent = await engine1.add_creature(
+            AgentConfig(name="selector-root"),
+            graph=gid,
+            llm=selector,
+            pwd=str(tmp_path),
+            is_privileged=True,
+            io="headless",
+        )
+        child_path = tmp_path / "inheriting.yaml"
+        child_path.write_text(
+            "name: inheriting\ninput: {type: none}\noutput: {type: none}\n",
+            encoding="utf-8",
+        )
+        result = await GroupSpawnChildTool()._execute(
+            {"config_ref": str(child_path), "name": "inherited-worker"},
+            context=ToolContext(
+                agent_name=parent.name,
+                session=parent.agent.session,
+                working_dir=str(tmp_path),
+                environment=engine1.environment(gid),
+                creature_id=parent.creature_id,
+            ),
+        )
+        assert result.error is None, result.error
+        child_id = json.loads(result.output)["creature_id"]
+        child = engine1.get_creature(child_id)
+        assert child.agent.llm_identifier() == selector
+        assert child.agent.llm.reasoning_effort == "low"
+        assert child.agent.compact_manager.config.max_tokens == 400000
+        assert not child.is_privileged
+        assert store.state.get("inherited-worker:model_selection") is None
+
         # Runtime mutation — the thing the user is asking about.
         await service.add_channel(gid, "manual_chat", "user-added at runtime")
         await service.connect("alice", "bob", channel="manual_chat")
@@ -236,6 +289,12 @@ class TestRuntimeTopologyResume:
         info_alice2 = await service2.get_creature_info("alice")
         info_bob2 = await service2.get_creature_info("bob")
 
+        for cid in (parent.creature_id, child_id):
+            restored = engine2.get_creature(cid).agent
+            assert restored.llm_identifier() == selector
+            assert restored.llm.reasoning_effort == "low"
+            assert restored.compact_manager.config.max_tokens == 400000
+
         await engine2.shutdown()
 
         # THE GAP: pre-fix, "manual_chat" disappears and alice / bob
@@ -254,6 +313,10 @@ class TestRuntimeTopologyResume:
             f"{info_bob2.listen_channels!r}"
         )
 
+        preset = deepcopy(get_all_presets()[("codex", "gpt-6-astra")])
+        preset["variation_groups"]["context"]["400k"]["max_context"] = 450000
+        save_yaml_store({"version": 2, "presets": {"codex": {"gpt-6-astra": preset}}})
+
         # --- phase 3: SECOND cold resume off the same store -------------
         # The first replay used to overwrite the saved snapshot mid-
         # restore (channels written while edges were still empty), so
@@ -265,6 +328,12 @@ class TestRuntimeTopologyResume:
         chans3 = {c.name for c in await service3.list_channels(sid3)}
         info_alice3 = await service3.get_creature_info("alice")
         info_bob3 = await service3.get_creature_info("bob")
+
+        for cid in (parent.creature_id, child_id):
+            restored = engine3.get_creature(cid).agent
+            assert restored.llm_identifier() == selector
+            assert restored.llm.reasoning_effort == "low"
+            assert restored.compact_manager.config.max_tokens == 450000
 
         await engine3.shutdown()
 
