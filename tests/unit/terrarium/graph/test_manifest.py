@@ -11,6 +11,7 @@ from kohakuterrarium.errors import (
     SessionNotResumableError,
 )
 from kohakuterrarium.terrarium.creature.host import Creature
+from kohakuterrarium.terrarium.engine.engine import Terrarium
 from kohakuterrarium.terrarium.graph.manifest import (
     MANIFEST_KEY,
     GraphManifest,
@@ -110,6 +111,31 @@ def _runtime_creature(
 
 
 class TestGraphManifest:
+    @pytest.mark.parametrize("privileged", [False, True])
+    @pytest.mark.parametrize("start", [False, True])
+    async def test_capture_preserves_runtime_model_without_mutating_config(
+        self, tmp_path, privileged, start
+    ):
+        selector = "codex/gpt-6-astra@context=400k,reasoning=low,speed=normal"
+        config = AgentConfig(
+            name="worker", llm_profile="codex/gpt-6-astra", reasoning_effort="high"
+        )
+        async with Terrarium() as engine:
+            creature = await engine.add_creature(
+                config,
+                llm=selector,
+                pwd=str(tmp_path),
+                io="headless",
+                start=start,
+                is_privileged=privileged,
+            )
+            captured = capture_manifest(engine, creature.graph_id)
+            saved = captured.creatures[0].unpack_config()
+            assert saved.llm_profile == selector
+            assert saved.reasoning_effort == "high"
+            assert creature.agent.config.llm_profile == "codex/gpt-6-astra"
+            assert config.llm_profile == "codex/gpt-6-astra"
+
     def test_round_trip_and_canonical_sort(self):
         raw = _raw_manifest(
             creatures=[
