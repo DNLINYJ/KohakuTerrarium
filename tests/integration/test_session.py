@@ -1268,6 +1268,135 @@ class TestSessionIntegration:
             forked_session.store.close()
         host_store.close()
 
+        peer_path = tmp_path / "peer-resume.kohakutr"
+        peer_store = _new_store(peer_path, config_path=config_path, agents=["scribe"])
+        peer_messages = [
+            {"role": "system", "content": "Preserve the peer workspace."},
+            {
+                "role": "assistant",
+                "content": "[Previous context summary (compact round 1)] earlier peer work",
+                "metadata": {"compact_summary": True},
+            },
+            {
+                "role": "user",
+                "content": "peer export task",
+                "metadata": {"turn_index": 0, "branch_id": 0, "origin_known": True},
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "provider-bg",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "provider-bg",
+                "name": "bash",
+                "content": "[bash] Running in background — task delegated.",
+                "metadata": {"job_id": "bg", "tool_result_phase": "pending"},
+            },
+            {
+                "role": "user",
+                "content": "resume after restart",
+                "metadata": {"turn_index": 1, "branch_id": 1},
+            },
+            {"role": "assistant", "content": "latest export changes"},
+        ]
+        try:
+            peer_store.append_event(
+                "scribe",
+                "tool_call",
+                {
+                    "name": "bash",
+                    "call_id": "bg",
+                    "tool_call_id": "provider-bg",
+                    "args": {},
+                },
+            )
+            peer_store.append_event(
+                "scribe",
+                "tool_result",
+                {
+                    "name": "bash",
+                    "call_id": "bg",
+                    "output": "export test failed",
+                    "exit_code": 1,
+                },
+            )
+            peer_store.append_event(
+                "scribe",
+                "user_message",
+                {"content": "resume after restart"},
+                turn_index=1,
+                branch_id=1,
+                parent_branch_path=[],
+            )
+            peer_store.append_event(
+                "scribe",
+                "assistant_message",
+                {"content": "latest export changes"},
+                turn_index=1,
+                branch_id=1,
+                parent_branch_path=[],
+            )
+            peer_store.save_branch_snapshot(
+                "scribe",
+                peer_messages,
+                branch={"turn_index": 1, "branch_id": 1, "parent_branch_path": []},
+                watermark=peer_store.max_event_id("scribe"),
+                compact_state={"compact_count": 1, "last_compact_time": 0.0},
+            )
+        finally:
+            peer_store.close(update_status=False)
+        for cycle in range(2):
+            peer_agent, peer_store = await resume_agent_async(
+                peer_path, llm=ScriptedLLM(["continued peer work"])
+            )
+            try:
+                messages = peer_agent.controller.conversation.to_messages(
+                    include_metadata=True
+                )
+                contents = [m.get("content") for m in messages]
+                assert "peer export task" in contents
+                assert "latest export changes" in contents
+                assert peer_messages[1]["content"] in contents
+                settled = [
+                    m
+                    for m in messages
+                    if m.get("role") == "tool"
+                    and m.get("tool_call_id") == "provider-bg"
+                ]
+                assert len(settled) == 1
+                assert settled[0]["content"] == "export test failed"
+                assert settled[0]["metadata"]["tool_result_phase"] == "final"
+                await peer_agent.start()
+                assert peer_agent.compact_manager._compact_count == 1
+                if cycle == 0:
+                    result = await peer_agent.run(
+                        "continue without re-running export", timeout=10
+                    )
+                    assert result.text == "continued peer work"
+                else:
+                    assert "continued peer work" in contents
+                assert (
+                    len(
+                        [
+                            e
+                            for e in peer_store.get_events("scribe")
+                            if e["type"] == "tool_call" and e.get("call_id") == "bg"
+                        ]
+                    )
+                    == 1
+                )
+            finally:
+                await peer_agent.stop()
+                peer_store.close(update_status=False)
+
     async def test_memory_index_and_search_finds_exact_turn(
         self, patched_llm, tmp_path
     ):

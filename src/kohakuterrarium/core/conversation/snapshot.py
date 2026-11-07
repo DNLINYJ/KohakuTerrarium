@@ -103,7 +103,12 @@ def _prefix(
             continue
         if role == "user" and metadata.get("kind") != "tool_results":
             turn, branch = metadata.get("turn_index"), metadata.get("branch_id")
-            if type(turn) is not int or type(branch) is not int:
+            if (
+                type(turn) is not int
+                or type(branch) is not int
+                or turn <= 0
+                or branch <= 0
+            ):
                 if not lineage:
                     return None
             elif (turn, branch) not in pairs:
@@ -203,6 +208,87 @@ def _replay_context(
     )
 
 
+def _repair_checkpoint_results(
+    messages: list[dict],
+    events: list[dict],
+    selected: dict[int, int],
+    live_ids: set[int],
+    covered: set[int],
+    cutoff: int,
+    watermark: int,
+    replay: Callable,
+) -> None:
+    """Replace unambiguous pending tool slots with their checkpointed results."""
+    calls, results, slots, announcements = {}, {}, {}, {}
+    delivered = delivered_jobs(messages)
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            identity = call.get("id")
+            announcements[identity] = announcements.get(identity, 0) + 1
+    for index, message in enumerate(messages):
+        metadata = message.get("metadata") or {}
+        job = metadata.get("job_id") or metadata.get("call_id")
+        if (
+            message.get("role") == "tool"
+            and metadata.get("tool_result_phase") == "pending"
+            and job
+            and job not in delivered
+        ):
+            slots.setdefault(job, []).append(index)
+    if not slots:
+        return
+    for event in events:
+        job = event.get("call_id") or event.get("job_id")
+        if job not in slots:
+            continue
+        if event.get("type") == "tool_call":
+            calls.setdefault(job, []).append(event)
+        elif event.get("type") == "tool_result":
+            results.setdefault(job, []).append(event)
+    for job, indices in slots.items():
+        if (
+            len(indices) != 1
+            or len(calls.get(job, [])) != 1
+            or len(results.get(job, [])) != 1
+        ):
+            continue
+        call, result = calls[job][0], results[job][0]
+        call_id, result_id = call.get("event_id"), result.get("event_id")
+        if (
+            type(call_id) is not int
+            or type(result_id) is not int
+            or call_id not in live_ids
+            or call_id in covered
+            or result_id in covered
+            or not cutoff < call_id <= result_id <= watermark
+        ):
+            continue
+        index = indices[0]
+        provider_id = call.get("tool_call_id") or job
+        if (
+            messages[index].get("tool_call_id") != provider_id
+            or announcements.get(provider_id) != 1
+        ):
+            continue
+        settled = [
+            message
+            for message in replay(
+                [call, result],
+                branch_view=selected,
+                include_metadata=True,
+                resumable=True,
+            )
+            if message.get("role") == "tool"
+            and message.get("tool_call_id") == provider_id
+            and (message.get("metadata") or {}).get("job_id") == job
+            and (message.get("metadata") or {}).get("result_event_id") == result_id
+        ]
+        if len(settled) == 1:
+            messages[index] = settled[0]
+
+
 def prepare_snapshot(
     store: Any,
     namespace: str,
@@ -218,9 +304,9 @@ def prepare_snapshot(
 ) -> dict | None:
     """Restore a checkpoint prefix; supplied paths match unchanged raw events and order.
 
-    ``keep_delivered_pending`` accepts a background placeholder whose completion
-    the checkpoint already delivers; only a whole-conversation restore may, since
-    truncating callers would cut the delivery and keep the placeholder.
+    ``keep_delivered_pending`` preserves already-delivered background placeholders
+    and repairs unambiguous completed slots in a whole checkpoint. Truncating
+    callers still require replay of pending results.
     """
     if records is None:
         records = load_records(store, namespace)
@@ -329,10 +415,21 @@ def prepare_snapshot(
             for event in tail
         ):
             continue
+        if keep_delivered_pending and whole:
+            _repair_checkpoint_results(
+                messages,
+                events,
+                selected,
+                live_ids,
+                covered,
+                cutoff,
+                record["watermark"],
+                replay,
+            )
         pending = {
-            message.get("metadata", {}).get("job_id")
+            (message.get("metadata") or {}).get("job_id")
             for message in messages
-            if message.get("metadata", {}).get("tool_result_phase") == "pending"
+            if (message.get("metadata") or {}).get("tool_result_phase") == "pending"
         }
         if keep_delivered_pending:
             pending -= delivered_jobs(messages)

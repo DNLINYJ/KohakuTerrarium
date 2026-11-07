@@ -100,7 +100,7 @@ def _background_messages(delivered: bool) -> list[dict]:
 
 @pytest.mark.parametrize(
     ("delivered", "resume", "accepted"),
-    [(True, True, True), (False, True, False), (True, False, False)],
+    [(True, True, True), (False, True, True), (True, False, False)],
 )
 def test_background_result_delivered_in_checkpoint_keeps_it(
     store: SessionStore, delivered: bool, resume: bool, accepted: bool
@@ -120,9 +120,166 @@ def test_background_result_delivered_in_checkpoint_keeps_it(
         # caller could cut the delivery and keep only the placeholder.
         assert prepared is None
         return
+    if not delivered:
+        assert prepared["messages"][2]["content"] == "tunnel up"
+        assert prepared["messages"][2]["metadata"]["tool_result_phase"] == "final"
+        assert prepared["messages"][:2] == messages[:2]
+        assert prepared["messages"][3:] == messages[3:]
+        assert store.load_conversation("alice") == messages
+        return
     assert [m["content"] for m in prepared["messages"]] == [
         m["content"] for m in messages
     ]
+
+
+@pytest.mark.parametrize("marker", [(0, 0), (0, 1), (1, 0), (-1, 1)])
+def test_exact_checkpoint_keeps_pre_turn_peer_messages(store, marker):
+    messages = [
+        _SUMMARY,
+        _user("peer task", marker[0], branch_id=marker[1], origin_known=True),
+        {"role": "assistant", "content": "peer task finished"},
+        _user("resume work", 1),
+        {"role": "assistant", "content": "latest work"},
+    ]
+    store.save_branch_snapshot(
+        "alice",
+        messages,
+        branch={"turn_index": 1, "branch_id": 1, "parent_branch_path": []},
+        watermark=2,
+    )
+    events = [
+        _event(1, "user_message", 1, content="resume work"),
+        _event(2, "text", 1, content="latest work"),
+    ]
+    prepared = _prepare(store, events, {1: 1})
+    assert prepared["messages"] == messages
+    assert store.load_conversation("alice") == messages
+
+
+def test_completed_slot_in_a_later_turn_keeps_its_checkpoint(store):
+    later = _background_messages(False)
+    later[0]["metadata"]["turn_index"] = 2
+    messages = [
+        _user("first task", 1),
+        {"role": "assistant", "content": "first done"},
+        *later,
+    ]
+    events = [
+        _event(1, "user_message", 1, content="first task"),
+        _event(2, "text", 1, content="first done"),
+    ]
+    events.extend(
+        {
+            **event,
+            "event_id": event["event_id"] + 2,
+            "turn_index": 2,
+            "parent_branch_path": [[1, 1]],
+        }
+        for event in _BACKGROUND_EVENTS
+    )
+    store.save_branch_snapshot(
+        "alice",
+        messages,
+        branch={"turn_index": 2, "branch_id": 1, "parent_branch_path": [[1, 1]]},
+        watermark=6,
+    )
+    prepared = _prepare(store, events, {1: 1, 2: 1})
+    assert prepared is not None
+    assert len(prepared["messages"]) == len(messages)
+    assert prepared["messages"][4]["content"] == "tunnel up"
+    assert prepared["messages"][4]["metadata"]["result_event_id"] == 5
+
+
+@pytest.mark.parametrize("mode", ["other_branch", "truncate"])
+def test_unknown_origin_checkpoint_is_not_reused_on_divergence(store, mode):
+    messages = [
+        _SUMMARY,
+        _user("private peer work", 0, branch_id=0),
+        _user("original input", 1),
+        {"role": "assistant", "content": "original answer"},
+    ]
+    store.save_branch_snapshot(
+        "alice",
+        messages,
+        branch={"turn_index": 1, "branch_id": 1, "parent_branch_path": []},
+        watermark=2,
+    )
+    events = [
+        _event(1, "user_message", 1, content="original input"),
+        _event(2, "text", 1, content="original answer"),
+        {**_event(3, "user_message", 1, content="edited input"), "branch_id": 2},
+    ]
+    prepared = prepare_snapshot(
+        store,
+        "alice",
+        events,
+        {1: 2} if mode == "other_branch" else {1: 1},
+        before_turn=1 if mode == "truncate" else None,
+        replay=replay_with_settled_tools,
+        needs_replay=snapshot_needs_settled_tool_replay,
+        keep_delivered_pending=True,
+    )
+    assert prepared is None
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "unselected_call",
+        "missing_call",
+        "wrong_provider_id",
+        "non_assistant_announcement",
+        "duplicate_call",
+        "duplicate_result",
+        "after_watermark",
+        "covered_result",
+    ],
+)
+def test_pending_result_repair_requires_unambiguous_checkpoint_evidence(store, unsafe):
+    messages = [_SUMMARY, *_background_messages(False)]
+    events = copy.deepcopy(_BACKGROUND_EVENTS)
+    if unsafe == "unselected_call":
+        events[1]["branch_id"] = 2
+    elif unsafe == "missing_call":
+        events.pop(1)
+    elif unsafe == "wrong_provider_id":
+        messages[3]["tool_call_id"] = "wrong"
+    elif unsafe == "non_assistant_announcement":
+        messages[2]["role"] = "user"
+    elif unsafe == "duplicate_call":
+        events.insert(2, {**events[1], "event_id": 5})
+    elif unsafe == "duplicate_result":
+        events.insert(3, {**events[2], "event_id": 5})
+    elif unsafe == "after_watermark":
+        events[2]["event_id"] = 6
+    elif unsafe == "covered_result":
+        events.append(
+            _event(
+                5,
+                "compact_complete",
+                1,
+                summary="older work",
+                round=1,
+                replaced_from_event_id=3,
+                replaced_to_event_id=3,
+                compact_path=[[1, 1]],
+                compact_result_event_ids=[3],
+            )
+        )
+    store.save_branch_snapshot(
+        "alice",
+        messages,
+        branch={"turn_index": 1, "branch_id": 1, "parent_branch_path": []},
+        watermark=(
+            5
+            if unsafe in {"duplicate_call", "duplicate_result", "covered_result"}
+            else 4
+        ),
+    )
+    prepared = _prepare(store, events, {1: 1})
+    if prepared is not None:
+        assert prepared["messages"][3] == messages[3]
+    assert store.load_conversation("alice") == messages
 
 
 def _userless_events(turn_two: str) -> list[dict]:
