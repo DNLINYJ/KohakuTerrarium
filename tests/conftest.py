@@ -26,6 +26,13 @@ from pathlib import Path
 
 import pytest
 
+try:
+    import kohakutui  # noqa: F401  (ktui's renderer: a source install until 0.2.0 ships)
+except ImportError:
+    # kohakutui is not a dependency yet (see terrarium/engine/cli/ktui_support.py); without
+    # it the ktui suites cannot import, so they are not collected
+    collect_ignore = ["integration/test_ktui.py", "unit/builtins/ktui"]
+
 # Ensure ``src/`` is on the import path even outside the editable
 # install — some CI configurations don't run ``pip install -e .`` first.
 _ROOT = Path(__file__).resolve().parents[1]
@@ -66,6 +73,7 @@ from kohakuterrarium.testing.llm_seam import (  # noqa: E402
     forbid_real_providers,
     install_llm_seam,
 )
+from tests.helpers import real_config_guard  # noqa: E402
 
 _LOOPBACK_NAMES = {"localhost", "localhost.localdomain", "ip6-localhost", ""}
 _NETWORK_GUARD = {"blocked": False}
@@ -105,7 +113,47 @@ def _network_audit(event, args):
 
 sys.addaudithook(_network_audit)
 
-# ``-n auto`` resolves to this many xdist workers unless KT_TEST_WORKERS is set.
+_REAL_CONFIG_SNAPSHOT: dict[str, str | None] | None = None
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_sessionstart(session):
+    """Capture the real-config baseline once in the pytest controller."""
+    global _REAL_CONFIG_SNAPSHOT
+    if hasattr(session.config, "workerinput"):
+        return
+    _REAL_CONFIG_SNAPSHOT = real_config_guard.snapshot()
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session, exitstatus):
+    """Check the real-config net change after the complete test session."""
+    if _REAL_CONFIG_SNAPSHOT is None or hasattr(session.config, "workerinput"):
+        return
+    leaks = real_config_guard.find_leaks(
+        _REAL_CONFIG_SNAPSHOT, real_config_guard.snapshot()
+    )
+    if not leaks:
+        return
+    daemon = real_config_guard.running_daemon_pid()
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if daemon is not None:
+        if reporter is not None:
+            reporter.write_line(
+                f"real-config pollution guard skipped: daemon pid {daemon} is running; "
+                "its writes cannot be distinguished from test writes",
+                yellow=True,
+            )
+        return
+    if reporter is not None:
+        reporter.write_line(
+            "tests wrote to the operator's real ~/.kohakuterrarium/:\n"
+            + "\n".join(leaks),
+            red=True,
+        )
+    session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
 LOCAL_TEST_WORKERS = 16
 MAX_TEST_WORKERS = 64
 _E2E_DIR = _ROOT / "tests" / "e2e"
