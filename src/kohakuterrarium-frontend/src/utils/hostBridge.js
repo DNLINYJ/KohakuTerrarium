@@ -330,6 +330,26 @@ export function startFileDrag(paths) {
   return callBoolean("start_file_drag", paths)
 }
 
+/** Ask for confirmation in the host window. An unavailable dialog returns undefined. */
+export async function confirmNative(title, message) {
+  try {
+    if (hostKind() === KIND_TAURI) {
+      const result = await window.__TAURI_INTERNALS__.invoke("plugin:dialog|message", {
+        title,
+        message,
+        kind: "warning",
+        buttons: "OkCancel",
+      })
+      return result === "Ok"
+    }
+    if (hostSupports("confirm_action"))
+      return (await call("confirm_action", title, message)) === true
+  } catch {
+    // Older desktop shells may expose the bridge without this dialog permission.
+  }
+  return undefined
+}
+
 /** Whether the shell can show the operating system's own file and folder dialogs. */
 export function nativeDialogsSupported() {
   return hostKind() === KIND_TAURI && hostSupports("pick_folder")

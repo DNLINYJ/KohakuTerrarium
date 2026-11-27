@@ -370,6 +370,11 @@ def run_desktop_app(port: int = 8001, log_level: str = "INFO") -> None:
         confirm_close=True,
         background_color=BACKGROUND,
     )
+
+    def confirm_action(title: str, message: str) -> bool:
+        return window.create_confirmation_dialog(title, message)
+
+    window.expose(confirm_action)
     expose_desktop_attention(window)
     links = AppLinks(window)
     links.attach()

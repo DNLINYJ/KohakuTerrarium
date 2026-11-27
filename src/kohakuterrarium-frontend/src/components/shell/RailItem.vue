@@ -18,7 +18,7 @@
 
 <script setup>
 import { computed, ref } from "vue"
-import { ElMessage } from "element-plus"
+import { ElMessage, ElMessageBox } from "element-plus"
 
 import RailContextMenu from "@/components/shell/RailContextMenu.vue"
 import { railMenuItems } from "@/components/shell/railMenu"
@@ -26,7 +26,7 @@ import { popOutInstance } from "@/composables/useDesktopPopout"
 import { runActionMenuId } from "@/ext/actions"
 import { useConversationsStore } from "@/stores/conversations"
 import { useTabsStore } from "@/stores/tabs"
-import { popoutWindowsSupported } from "@/utils/hostBridge"
+import { confirmNative, popoutWindowsSupported } from "@/utils/hostBridge"
 import { useI18n } from "@/utils/i18n"
 import { nativeMenuSupported, showNativeMenu } from "@/utils/nativeMenu"
 
@@ -128,13 +128,30 @@ function onDetach() {
 }
 
 async function endConversation() {
-  if (!window.confirm(t("shell.rail.endConfirm"))) return
+  const instance = props.instance
+  const target = runtimeTarget.value
+  const action = t("shell.rail.endConversation")
+  const title = instance.config_name ? `${action} — ${instance.config_name}` : action
+  const message = t("shell.rail.endConfirm")
+  const confirmed = await confirmNative(title, message)
+  if (confirmed === undefined) {
+    try {
+      await ElMessageBox.confirm(message, title, {
+        type: "warning",
+        confirmButtonText: action,
+        cancelButtonText: t("common.cancel"),
+      })
+    } catch {
+      return
+    }
+  } else if (!confirmed) return
+
   try {
-    await conversations.endConversation(props.instance)
-    if (runtimeTarget.value) tabs.detach(runtimeTarget.value)
+    await conversations.endConversation(instance)
+    if (target) tabs.detach(target)
   } catch (error) {
     console.error(t("shell.rail.endError"), error)
-    window.alert(t("shell.rail.endError"))
+    ElMessage.error(t("shell.rail.endError"))
   }
 }
 </script>

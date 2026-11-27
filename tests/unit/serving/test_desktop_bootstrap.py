@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 from types import SimpleNamespace
 
 import pytest
@@ -427,7 +428,21 @@ def test_server_start_overlaps_loading_window_startup(monkeypatch):
 
     desktop.run_desktop_app(port=8001, log_level="ERROR")
 
+    confirm = next(
+        fn for fn in webview.window.exposed if fn.__name__ == "confirm_action"
+    )
+    for answer in (True, False):
+        native = Mock(return_value=answer)
+        monkeypatch.setattr(
+            webview.window, "create_confirmation_dialog", native, raising=False
+        )
+        assert confirm("End conversation", "History will remain available.") is answer
+        native.assert_called_once_with(
+            "End conversation", "History will remain available."
+        )
+
     expected = [
+        "confirm_action",
         "get_desktop_capabilities",
         "request_desktop_attention",
         "open_external",

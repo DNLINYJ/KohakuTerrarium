@@ -8,6 +8,7 @@
   },
   "permissions": [
     "core:event:default",
+    "dialog:allow-message",
     "allow-get-desktop-capabilities",
     "allow-desktop-window-focused",
     "allow-request-desktop-attention",
