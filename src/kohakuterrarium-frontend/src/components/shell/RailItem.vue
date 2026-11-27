@@ -12,7 +12,9 @@
     <button class="w-5 h-5 flex items-center justify-center rounded text-[10px] font-mono shrink-0 disabled:cursor-wait" :disabled="resuming" :class="chatOpen ? 'bg-iolite text-white' : 'text-warm-400 hover:text-warm-700 hover:bg-warm-300 dark:hover:bg-warm-700'" :title="chatOpen ? t('shell.rail.closeChat') : t('shell.rail.openChat')" @click.stop="toggleChat">C</button>
     <button class="w-5 h-5 flex items-center justify-center rounded text-[10px] font-mono shrink-0 disabled:cursor-wait" :disabled="resuming" :class="inspectorOpen ? 'bg-iolite text-white' : 'text-warm-400 hover:text-warm-700 hover:bg-warm-300 dark:hover:bg-warm-700'" :title="inspectorOpen ? t('shell.rail.closeInspector') : t('shell.rail.openInspector')" @click.stop="toggleInspector">I</button>
 
-    <RailContextMenu v-if="showMenu" :instance="instance" :chat-open="chatOpen" :inspector-open="inspectorOpen" @close="showMenu = false" @toggle-chat="toggleChat" @toggle-inspector="toggleInspector" @detach="onDetach" @end="endConversation" />
+    <Teleport to="body">
+      <RailContextMenu v-if="menuPosition" :position="menuPosition" :instance="instance" :chat-open="chatOpen" :inspector-open="inspectorOpen" @close="menuPosition = null" @toggle-chat="toggleChat" @toggle-inspector="toggleInspector" @detach="onDetach" @end="endConversation" />
+    </Teleport>
   </div>
 </template>
 
@@ -34,7 +36,7 @@ const props = defineProps({ instance: { type: Object, required: true } })
 const tabs = useTabsStore()
 const conversations = useConversationsStore()
 const { t } = useI18n()
-const showMenu = ref(false)
+const menuPosition = ref(null)
 
 const runtimeTarget = computed(() => (props.instance.is_live ? props.instance.runtime_id : null))
 const surfaces = computed(() => (runtimeTarget.value ? tabs.surfaceTabsForTarget(runtimeTarget.value) : {}))
@@ -71,7 +73,8 @@ function runMenuChoice(id) {
   }
 }
 
-async function onContextMenu() {
+async function onContextMenu(event) {
+  const position = { x: event.clientX, y: event.clientY }
   if (nativeMenuSupported()) {
     const items = railMenuItems({
       instance: props.instance,
@@ -82,7 +85,7 @@ async function onContextMenu() {
     })
     if (await showNativeMenu(items, runMenuChoice)) return
   }
-  showMenu.value = true
+  menuPosition.value = position
 }
 
 async function onRowClick() {
@@ -124,7 +127,7 @@ async function openSurface(surface) {
 
 function onDetach() {
   if (runtimeTarget.value) tabs.detach(runtimeTarget.value)
-  showMenu.value = false
+  menuPosition.value = null
 }
 
 async function endConversation() {

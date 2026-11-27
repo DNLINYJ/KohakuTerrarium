@@ -2,6 +2,7 @@ import { mount } from "@vue/test-utils"
 import { createPinia, setActivePinia } from "pinia"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
+import RailItem from "@/components/shell/RailItem.vue"
 import RailContextMenu from "@/components/shell/RailContextMenu.vue"
 import TabContextMenu from "@/components/shell/TabContextMenu.vue"
 import { useTabsStore } from "@/stores/tabs"
@@ -61,9 +62,34 @@ describe("tab context menu", () => {
 describe("rail context menu", () => {
   const instance = { id: "i1", graph_id: "graph-1", config_name: "alpha" }
 
+  it("opens at the clicked row and dismisses without activating the row", async () => {
+    const wrapper = mount(RailItem, {
+      props: { instance: { ...instance, is_live: true, runtime_id: "graph-1" } },
+      global: { stubs },
+    })
+    const tabs = useTabsStore()
+    const open = vi.spyOn(tabs, "openSurface")
+    const activate = vi.spyOn(tabs, "activateTab")
+    try {
+      await wrapper.trigger("contextmenu", { clientX: 43, clientY: 611 })
+      const menu = wrapper.getComponent(RailContextMenu)
+      expect(menu.props("position")).toEqual({ x: 43, y: 611 })
+      expect(document.body.contains(menu.element)).toBe(true)
+      await menu.trigger("click")
+      expect(wrapper.findComponent(RailContextMenu).exists()).toBe(false)
+      expect(open).not.toHaveBeenCalled()
+      expect(activate).not.toHaveBeenCalled()
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
   it("opens a session in a window of its own and keeps it open here", async () => {
     const invoke = tauri()
-    const wrapper = mount(RailContextMenu, { props: { instance }, global: { stubs } })
+    const wrapper = mount(RailContextMenu, {
+      props: { instance, position: { x: 40, y: 80 } },
+      global: { stubs },
+    })
 
     await wrapper.get('[data-test="rail-open-in-window"]').trigger("click")
     expect(invoke).toHaveBeenCalledWith("open_popout_window", {
@@ -73,7 +99,10 @@ describe("rail context menu", () => {
   })
 
   it("offers nothing in a browser", () => {
-    const wrapper = mount(RailContextMenu, { props: { instance }, global: { stubs } })
+    const wrapper = mount(RailContextMenu, {
+      props: { instance, position: { x: 40, y: 80 } },
+      global: { stubs },
+    })
     expect(wrapper.find('[data-test="rail-open-in-window"]').exists()).toBe(false)
   })
 })

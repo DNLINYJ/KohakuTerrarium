@@ -1,6 +1,6 @@
 <template>
   <div class="fixed inset-0 z-40" @click="$emit('close')" @contextmenu.prevent="$emit('close')">
-    <div class="absolute z-50 w-48 bg-warm-50 dark:bg-warm-900 border border-warm-200 dark:border-warm-700 rounded shadow-lg py-1 text-xs" :style="{ left: '60px', top: '100px' }" @click.stop>
+    <div class="rail-menu absolute left-0 top-0 z-50 w-48 bg-warm-50 dark:bg-warm-900 border border-warm-200 dark:border-warm-700 rounded shadow-lg py-1 text-xs" :style="{ '--x': position.x + 'px', '--y': position.y + 'px' }" @click.stop>
       <div class="px-3 py-1 text-warm-400 truncate text-[10px] uppercase tracking-wider border-b border-warm-200 dark:border-warm-700 mb-1">
         {{ instance.config_name }}
       </div>
@@ -44,6 +44,7 @@ import { useI18n } from "@/utils/i18n"
 
 const props = defineProps({
   instance: { type: Object, required: true },
+  position: { type: Object, required: true },
   chatOpen: { type: Boolean, default: false },
   inspectorOpen: { type: Boolean, default: false },
 })
@@ -65,3 +66,14 @@ function emitAndClose(name) {
   emit("close")
 }
 </script>
+
+<style scoped>
+.rail-menu {
+  --gap: 4px;
+  box-sizing: border-box;
+  max-width: calc(100vw - 2 * var(--gap));
+  max-height: calc(100vh - 2 * var(--gap));
+  overflow: auto;
+  transform: translate(clamp(var(--gap), var(--x), calc(100vw - 100% - var(--gap))), clamp(var(--gap), var(--y), calc(100vh - 100% - var(--gap))));
+}
+</style>
