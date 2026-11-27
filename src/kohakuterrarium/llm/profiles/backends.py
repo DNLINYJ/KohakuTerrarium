@@ -263,6 +263,7 @@ def legacy_provider_from_data(data: dict[str, Any]) -> str:
         "OPENROUTER_API_KEY",
         "ANTHROPIC_API_KEY",
         "GEMINI_API_KEY",
+        "DEEPSEEK_API_KEY",
         "MIMO_API_KEY",
         "KIMI_CODE_API_KEY",
         "GLM_CODING_API_KEY",

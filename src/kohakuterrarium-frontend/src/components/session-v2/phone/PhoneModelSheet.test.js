@@ -55,6 +55,34 @@ const switchBtn = (w) => w.find("[data-test='phone-model-switch']")
 const selector = (w) => w.find("footer code").text()
 
 describe("PhoneModelSheet", () => {
+  it("combines DeepSeek context and reasoning choices when switching a model", async () => {
+    __inventory.models.value = [
+      ...MODELS,
+      {
+        provider: "deepseek",
+        name: "deepseek-flash",
+        model: "deepseek-flash",
+        available: true,
+        max_context: 1048576,
+        context_window: 1048576,
+        variation_groups: {
+          reasoning: { none: {}, low: {}, high: {}, max: {} },
+        },
+      },
+    ]
+    const selected = "deepseek/deepseek-flash@reasoning=max,context=400000"
+    terrariumAPI.switchCreatureModel.mockResolvedValue({ model: selected })
+    const { wrapper } = mountInSession(PhoneModelSheet, { props: { initialAgent: "lead" } })
+    await flushPromises()
+    await wrapper.find("[data-test='phone-provider-deepseek']").trigger("click")
+    await wrapper.find("[data-test='phone-model-context-input']").setValue("400k")
+    await wrapper.find("[data-test='phone-var-reasoning-max']").trigger("click")
+    expect(selector(wrapper)).toBe(selected)
+    await switchBtn(wrapper).trigger("click")
+    await flushPromises()
+    expect(terrariumAPI.switchCreatureModel).toHaveBeenCalledWith("g1", "lead", selected)
+  })
+
   it("starts on the given agent and its current model, variation included", async () => {
     const { wrapper } = mountInSession(PhoneModelSheet, { props: { initialAgent: "lead" } })
     await flushPromises()

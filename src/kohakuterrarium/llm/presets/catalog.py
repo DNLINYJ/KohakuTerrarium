@@ -9,6 +9,7 @@ may be lower than the vendor-advertised maximum for reliability.
 
 from typing import Any
 
+from kohakuterrarium.llm.deepseek_presets import PRESETS as DEEPSEEK_PRESETS
 from kohakuterrarium.llm.antigravity.presets import PRESETS as AGY_PRESETS
 from kohakuterrarium.llm.codex.presets import PRESETS as GPT6_CODEX_PRESETS
 
@@ -61,6 +62,7 @@ __all__ = [
 logger = get_logger(__name__)
 
 PRESETS: dict[str, dict[str, Any]] = {
+    **DEEPSEEK_PRESETS,
     # ═══════════════════════════════════════════════════════
     #  OpenAI via Codex OAuth (ChatGPT subscription auth)
     #  reasoning_effort is a top-level field consumed directly

@@ -83,7 +83,6 @@ ALIASES: dict[str, tuple[str, str]] = {
     "argon": ("gemini", "gemini-4-argon"),
     "ripple": ("openrouter", "ripple-65b-preview"),
     "muse": ("openrouter", "muse-ember"),
-    "deepseek": ("openrouter", "deepseek-v4.1-flash"),
     "hy": ("openrouter", "hy4"),
     "gemma": ("openrouter", "gemma-4-31b"),
     "gemma-4": ("openrouter", "gemma-4-31b"),
@@ -98,6 +97,10 @@ ALIASES: dict[str, tuple[str, str]] = {
     "mimo": ("mimo", "mimo-v2.6-pro"),
     # The unqualified model id previously resolved to OpenRouter alone.
     "mimo-v2.6-pro": ("openrouter", "mimo-v2.6-pro"),
+    "deepseek": ("deepseek", "deepseek-v4-pro"),
+    "deepseek-pro": ("deepseek", "deepseek-v4-pro"),
+    "deepseek-v4-flash": ("deepseek", "deepseek-flash"),
+    "deepseek-v4-flash-vision-exp": ("deepseek", "deepseek-flash"),
     "glm": ("openrouter", "glm-5.3"),
     "glm-code": ("glm-coding", "glm-5.2"),
     "glm-coding": ("glm-coding", "glm-5.2"),
